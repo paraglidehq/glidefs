@@ -1,271 +1,95 @@
-use super::error::{CommandError, CommandResult, NBDError, Result};
-use super::protocol::{
-    NBD_INFO_EXPORT, NBD_READDIR_DEFAULT_LIMIT, NBD_REP_ACK, NBD_REP_ERR_INVALID,
-    NBD_REP_ERR_UNKNOWN, NBD_REP_INFO, NBD_REP_SERVER, NBD_ZERO_CHUNK_SIZE, NBDInfoExport,
-    TRANSMISSION_FLAGS,
-};
-use crate::fs::ZeroFS;
-use crate::fs::errors::FsError;
-use crate::fs::inode::Inode;
-use crate::fs::types::AuthContext;
+//! NBD protocol handlers for block I/O operations.
+//!
+//! This module provides:
+//! - `NBDBlockHandler`: Thin handler that uses WriteCache for all I/O
+//! - `NBDDevice`: Device descriptor used during NBD transmission phase
+
+use super::block_store::S3BlockStore;
+use super::error::{CommandError, CommandResult};
+use super::state::Active;
+use super::write_cache::WriteCache;
 use bytes::Bytes;
-use deku::DekuContainerWrite;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::debug;
 
-/// Response to send back for an option
-pub struct OptionReply {
-    pub reply_type: u32,
-    pub data: Vec<u8>,
-}
-
-impl OptionReply {
-    pub fn new(reply_type: u32, data: Vec<u8>) -> Self {
-        Self { reply_type, data }
-    }
-
-    pub fn ack() -> Self {
-        Self::new(NBD_REP_ACK, Vec::new())
-    }
-
-    pub fn error(reply_type: u32) -> Self {
-        Self::new(reply_type, Vec::new())
-    }
-}
-
-/// Result of processing an option - may return device if negotiation complete
-pub enum OptionResult {
-    /// Continue negotiation, send these replies
-    Continue(Vec<OptionReply>),
-    /// Negotiation complete, use this device
-    Done(NBDDevice, Vec<OptionReply>),
-    /// Error during processing
-    Error(NBDError, Vec<OptionReply>),
-}
-
-/// NBD device descriptor
+/// NBD device descriptor used during transmission phase.
 #[derive(Clone)]
 pub struct NBDDevice {
     pub name: Vec<u8>,
     pub size: u64,
-    pub inode: u64,
 }
 
-impl NBDDevice {
-    pub fn info_export(&self) -> NBDInfoExport {
-        NBDInfoExport {
-            info_type: NBD_INFO_EXPORT,
-            size: self.size,
-            transmission_flags: TRANSMISSION_FLAGS,
-        }
-    }
+/// Handler for NBD protocol operations using write-behind cache.
+///
+/// This is a thin layer that delegates all I/O to the WriteCache.
+/// The key performance benefit: `flush()` only syncs to local SSD,
+/// not to S3 (which happens asynchronously in the background).
+///
+/// Reads use read-through caching: if a block isn't present locally,
+/// it's fetched from S3 on demand.
+pub struct NBDBlockHandler {
+    /// The write-behind cache (must be in Active state)
+    cache: Arc<WriteCache<Active>>,
+
+    /// S3 block store for read-through caching
+    s3_store: Arc<S3BlockStore>,
+
+    /// Device size in bytes
+    device_size: u64,
+
+    /// Whether this export is readonly (rejects writes)
+    /// Uses AtomicBool so promote_export can change it safely
+    readonly: AtomicBool,
 }
 
-/// Handler for NBD protocol operations
-pub struct NBDHandler {
-    filesystem: Arc<ZeroFS>,
-}
-
-impl NBDHandler {
-    pub fn new(filesystem: Arc<ZeroFS>) -> Self {
-        Self { filesystem }
-    }
-
-    /// Get the .nbd directory inode
-    async fn nbd_dir_inode(&self) -> Result<u64> {
-        self.filesystem
-            .directory_store
-            .get(0, b".nbd")
-            .await
-            .map_err(NBDError::from)
-    }
-
-    /// List all available NBD devices
-    pub async fn list_devices(&self) -> Result<Vec<NBDDevice>> {
-        let auth = AuthContext::default();
-        let nbd_dir_inode = self.nbd_dir_inode().await?;
-
-        let entries = self
-            .filesystem
-            .readdir(&auth, nbd_dir_inode, 0, NBD_READDIR_DEFAULT_LIMIT)
-            .await?;
-
-        let mut devices = Vec::new();
-        for entry in &entries.entries {
-            let name = &entry.name;
-            if name == b"." || name == b".." {
-                continue;
-            }
-
-            let inode = self.filesystem.inode_store.get(entry.fileid).await?;
-
-            if let Inode::File(file_inode) = inode {
-                devices.push(NBDDevice {
-                    name: name.to_vec(),
-                    size: file_inode.size,
-                    inode: entry.fileid,
-                });
-            }
-        }
-
-        Ok(devices)
-    }
-
-    /// Rreturns list of all devices
-    pub async fn list(&self) -> OptionResult {
-        match self.list_devices().await {
-            Ok(devices) => {
-                let mut replies = Vec::new();
-                for device in devices {
-                    let mut reply_data = Vec::new();
-                    reply_data.extend_from_slice(&(device.name.len() as u32).to_be_bytes());
-                    reply_data.extend_from_slice(&device.name);
-                    replies.push(OptionReply::new(NBD_REP_SERVER, reply_data));
-                }
-                replies.push(OptionReply::ack());
-                OptionResult::Continue(replies)
-            }
-            Err(e) => OptionResult::Error(e, vec![]),
-        }
-    }
-
-    /// Returns device info without completing negotiation
-    pub async fn info(&self, data: &[u8]) -> OptionResult {
-        if data.len() < 4 {
-            return OptionResult::Continue(vec![OptionReply::error(NBD_REP_ERR_INVALID)]);
-        }
-
-        let name_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if data.len() < 4 + name_len + 2 {
-            return OptionResult::Error(
-                NBDError::Protocol("Invalid INFO option length".to_string()),
-                vec![OptionReply::error(NBD_REP_ERR_INVALID)],
-            );
-        }
-
-        let name = &data[4..4 + name_len];
-        debug!(
-            "INFO option: requested export name '{}' (name_len: {})",
-            String::from_utf8_lossy(name),
-            name_len
-        );
-
-        match self.get_device(name).await {
-            Ok(device) => match device.info_export().to_bytes() {
-                Ok(info_bytes) => OptionResult::Continue(vec![
-                    OptionReply::new(NBD_REP_INFO, info_bytes),
-                    OptionReply::ack(),
-                ]),
-                Err(e) => OptionResult::Error(
-                    NBDError::Protocol(format!("Failed to serialize info: {:?}", e)),
-                    vec![],
-                ),
-            },
-            Err(e) => {
-                debug!(
-                    "INFO option: device '{}' not found: {:?}",
-                    String::from_utf8_lossy(name),
-                    e
-                );
-                OptionResult::Continue(vec![OptionReply::error(NBD_REP_ERR_UNKNOWN)])
-            }
-        }
-    }
-
-    /// Returns device info and completes negotiation
-    pub async fn go(&self, data: &[u8]) -> OptionResult {
-        if data.len() < 4 {
-            return OptionResult::Error(
-                NBDError::Protocol("Invalid GO option".to_string()),
-                vec![OptionReply::error(NBD_REP_ERR_INVALID)],
-            );
-        }
-
-        let name_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if data.len() < 4 + name_len + 2 {
-            return OptionResult::Error(
-                NBDError::Protocol("Invalid GO option length".to_string()),
-                vec![OptionReply::error(NBD_REP_ERR_INVALID)],
-            );
-        }
-
-        let name = &data[4..4 + name_len];
-        debug!(
-            "GO option: requested export name '{}' (name_len: {})",
-            String::from_utf8_lossy(name),
-            name_len
-        );
-        debug!(
-            "GO option data length: {}, expected minimum: {}",
-            data.len(),
-            4 + name_len + 2
-        );
-
-        match self.get_device(name).await {
-            Ok(device) => match device.info_export().to_bytes() {
-                Ok(info_bytes) => OptionResult::Done(
-                    device,
-                    vec![
-                        OptionReply::new(NBD_REP_INFO, info_bytes),
-                        OptionReply::ack(),
-                    ],
-                ),
-                Err(e) => OptionResult::Error(
-                    NBDError::Protocol(format!("Failed to serialize info: {:?}", e)),
-                    vec![],
-                ),
-            },
-            Err(e) => {
-                debug!(
-                    "GO option: device '{}' not found: {:?}",
-                    String::from_utf8_lossy(name),
-                    e
-                );
-                OptionResult::Error(
-                    NBDError::DeviceNotFound(name.to_vec()),
-                    vec![OptionReply::error(NBD_REP_ERR_UNKNOWN)],
-                )
-            }
-        }
-    }
-
-    /// Get a specific NBD device by name
-    pub async fn get_device(&self, name: &[u8]) -> Result<NBDDevice> {
-        let nbd_dir_inode = self.nbd_dir_inode().await?;
-
-        let device_inode = self
-            .filesystem
-            .directory_store
-            .get(nbd_dir_inode, name)
-            .await
-            .map_err(|e| match e {
-                FsError::NotFound => NBDError::DeviceNotFound(name.to_vec()),
-                e => NBDError::Filesystem(e),
-            })?;
-
-        let inode = self.filesystem.inode_store.get(device_inode).await?;
-
-        match inode {
-            Inode::File(file_inode) => Ok(NBDDevice {
-                name: name.to_vec(),
-                size: file_inode.size,
-                inode: device_inode,
-            }),
-            _ => Err(NBDError::Protocol(format!(
-                "NBD device '{}' is not a regular file",
-                String::from_utf8_lossy(name)
-            ))),
-        }
-    }
-
-    pub async fn read(
-        &self,
-        inode: u64,
-        offset: u64,
-        length: u32,
+impl NBDBlockHandler {
+    /// Create a new block handler.
+    ///
+    /// # Arguments
+    /// * `cache` - Write-behind cache in Active state
+    /// * `s3_store` - S3 block store for read-through caching
+    /// * `device_size` - Size of the block device in bytes
+    /// * `readonly` - Whether this export rejects writes
+    pub fn new(
+        cache: Arc<WriteCache<Active>>,
+        s3_store: Arc<S3BlockStore>,
         device_size: u64,
-    ) -> CommandResult<Bytes> {
-        if offset + length as u64 > device_size {
+        readonly: bool,
+    ) -> Self {
+        Self {
+            cache,
+            s3_store,
+            device_size,
+            readonly: AtomicBool::new(readonly),
+        }
+    }
+
+    /// Check if this handler is readonly.
+    pub fn is_readonly(&self) -> bool {
+        self.readonly.load(Ordering::Relaxed)
+    }
+
+    /// Set the readonly flag.
+    /// Used by promote_export to allow writes after migration.
+    pub fn set_readonly(&self, readonly: bool) {
+        self.readonly.store(readonly, Ordering::Relaxed);
+    }
+
+    /// Get the device size.
+    #[inline]
+    pub fn device_size(&self) -> u64 {
+        self.device_size
+    }
+
+    // ========================================================================
+    // Block I/O Operations
+    // ========================================================================
+
+    /// Read data from the cache, fetching from S3 if not present locally.
+    ///
+    /// Uses read-through caching: blocks not present locally are fetched from S3.
+    pub async fn read(&self, offset: u64, length: u32) -> CommandResult<Bytes> {
+        if offset + length as u64 > self.device_size {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -273,44 +97,50 @@ impl NBDHandler {
             return Ok(Bytes::new());
         }
 
-        let auth = AuthContext::default();
-        let (data, _) = self
-            .filesystem
-            .read_file(&auth, inode, offset, length)
+        let data = self
+            .cache
+            .read_with_fetch(offset, length as usize, &self.s3_store)
             .await?;
         Ok(data)
     }
 
-    pub async fn write(
-        &self,
-        inode: u64,
-        offset: u64,
-        data: &Bytes,
-        fua: bool,
-    ) -> CommandResult<()> {
+    /// Write data to the cache.
+    ///
+    /// Writes go to local SSD immediately. S3 sync happens in background.
+    /// Returns error if the export is readonly.
+    pub fn write(&self, offset: u64, data: &[u8], fua: bool) -> CommandResult<()> {
+        if self.is_readonly() {
+            return Err(CommandError::ReadOnly);
+        }
+
+        if offset + data.len() as u64 > self.device_size {
+            return Err(CommandError::NoSpace);
+        }
+
         if data.is_empty() {
             return Ok(());
         }
 
-        let auth = AuthContext::default();
-        self.filesystem.write(&auth, inode, offset, data).await?;
+        self.cache.write(offset, data)?;
 
         if fua {
-            self.flush().await?;
+            self.flush()?;
         }
 
         Ok(())
     }
 
-    pub async fn trim(
-        &self,
-        inode: u64,
-        offset: u64,
-        length: u32,
-        fua: bool,
-        device_size: u64,
-    ) -> CommandResult<()> {
-        if offset + length as u64 > device_size {
+    /// Trim (discard) a range of blocks.
+    ///
+    /// Writes zeros to the specified range using optimized platform-specific
+    /// methods (fallocate on Linux, static buffer fallback elsewhere).
+    /// Returns error if the export is readonly.
+    pub fn trim(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
+        if self.is_readonly() {
+            return Err(CommandError::ReadOnly);
+        }
+
+        if offset + length as u64 > self.device_size {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -318,27 +148,28 @@ impl NBDHandler {
             return Ok(());
         }
 
-        let auth = AuthContext::default();
-        self.filesystem
-            .trim(&auth, inode, offset, length as u64)
-            .await?;
+        self.cache.zero_range(offset, length as u64)?;
 
         if fua {
-            self.flush().await?;
+            self.flush()?;
         }
 
         Ok(())
     }
 
-    pub async fn write_zeroes(
-        &self,
-        inode: u64,
-        offset: u64,
-        length: u32,
-        fua: bool,
-        device_size: u64,
-    ) -> CommandResult<()> {
-        if offset + length as u64 > device_size {
+    /// Write zeros to a range.
+    ///
+    /// Uses optimized platform-specific methods:
+    /// - Linux: fallocate(FALLOC_FL_ZERO_RANGE) - no data written, kernel marks as zeros
+    /// - Other: Static zero buffer to avoid per-call allocation
+    ///
+    /// Returns error if the export is readonly.
+    pub fn write_zeroes(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
+        if self.is_readonly() {
+            return Err(CommandError::ReadOnly);
+        }
+
+        if offset + length as u64 > self.device_size {
             return Err(CommandError::NoSpace);
         }
 
@@ -346,48 +177,218 @@ impl NBDHandler {
             return Ok(());
         }
 
-        let auth = AuthContext::default();
-        let zero_chunk = Bytes::from(vec![0u8; NBD_ZERO_CHUNK_SIZE.min(length as usize)]);
-
-        // Write zeros in chunks to avoid huge allocations
-        let mut remaining = length as usize;
-        let mut current_offset = offset;
-
-        while remaining > 0 {
-            let chunk_size = remaining.min(NBD_ZERO_CHUNK_SIZE);
-            let chunk_data = if chunk_size == zero_chunk.len() {
-                &zero_chunk
-            } else {
-                &zero_chunk.slice(..chunk_size)
-            };
-
-            self.filesystem
-                .write(&auth, inode, current_offset, chunk_data)
-                .await?;
-
-            remaining -= chunk_size;
-            current_offset += chunk_size as u64;
-        }
+        self.cache.zero_range(offset, length as u64)?;
 
         if fua {
-            self.flush().await?;
+            self.flush()?;
         }
 
         Ok(())
     }
 
-    pub async fn cache(&self, offset: u64, length: u32, device_size: u64) -> CommandResult<()> {
-        if offset + length as u64 > device_size {
+    /// Cache hint - no-op for our implementation.
+    pub fn cache(&self, offset: u64, length: u32) -> CommandResult<()> {
+        if offset + length as u64 > self.device_size {
             return Err(CommandError::InvalidArgument);
         }
         Ok(())
     }
 
-    pub async fn flush(&self) -> CommandResult<()> {
-        self.filesystem
-            .flush_coordinator
-            .flush()
-            .await
-            .map_err(|_| CommandError::IoError)
+    /// Flush data to durable storage.
+    ///
+    /// **CRITICAL**: This only flushes to local SSD, not to S3!
+    /// This is the key performance optimization - ZFS snapshots/clones
+    /// return in <100ms instead of 8-15 seconds.
+    ///
+    /// S3 sync happens asynchronously in the background via the sync worker.
+    pub fn flush(&self) -> CommandResult<()> {
+        self.cache.flush().map_err(|_| CommandError::IoError)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nbd::write_cache::WriteCacheConfig;
+    use object_store::memory::InMemory;
+    use tempfile::TempDir;
+
+    fn test_handler() -> (NBDBlockHandler, TempDir) {
+        test_handler_with_readonly(false)
+    }
+
+    fn test_handler_with_readonly(readonly: bool) -> (NBDBlockHandler, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "test".to_string(),
+            device_size: 1024 * 1024, // 1MB
+            block_size: 4096,
+        };
+
+        // Create in-memory S3 store for tests
+        let object_store = Arc::new(InMemory::new());
+        let s3_store = Arc::new(S3BlockStore::new(object_store, "test", 4096, None));
+
+        // open() returns WriteCache<Recovering>
+        let cache = WriteCache::open(config, None).unwrap();
+        // Skip recovery for test - go straight to active
+        let cache = cache.skip_recovery_for_test();
+        let handler = NBDBlockHandler::new(
+            Arc::new(cache),
+            s3_store,
+            1024 * 1024,
+            readonly,
+        );
+
+        (handler, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_read_write() {
+        let (handler, _temp) = test_handler();
+
+        let data = vec![42u8; 4096];
+        handler.write(0, &data, false).unwrap();
+
+        let read_data = handler.read(0, 4096).await.unwrap();
+        assert_eq!(read_data.as_ref(), &data[..]);
+    }
+
+    #[tokio::test]
+    async fn test_read_unwritten_returns_zeros() {
+        let (handler, _temp) = test_handler();
+
+        // Unwritten blocks should fetch from S3 (empty) and return zeros
+        let data = handler.read(0, 1024).await.unwrap();
+        assert!(data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_write_beyond_device_size() {
+        let (handler, _temp) = test_handler();
+
+        let data = vec![42u8; 4096];
+        let result = handler.write(1024 * 1024, &data, false);
+        assert!(matches!(result, Err(CommandError::NoSpace)));
+    }
+
+    #[test]
+    fn test_readonly_rejects_write() {
+        let (handler, _temp) = test_handler_with_readonly(true);
+
+        let data = vec![42u8; 4096];
+        let result = handler.write(0, &data, false);
+        assert!(matches!(result, Err(CommandError::ReadOnly)));
+    }
+
+    #[test]
+    fn test_readonly_rejects_trim() {
+        let (handler, _temp) = test_handler_with_readonly(true);
+
+        let result = handler.trim(0, 4096, false);
+        assert!(matches!(result, Err(CommandError::ReadOnly)));
+    }
+
+    #[test]
+    fn test_readonly_rejects_write_zeroes() {
+        let (handler, _temp) = test_handler_with_readonly(true);
+
+        let result = handler.write_zeroes(0, 4096, false);
+        assert!(matches!(result, Err(CommandError::ReadOnly)));
+    }
+
+    #[tokio::test]
+    async fn test_readonly_allows_read() {
+        let (handler, _temp) = test_handler_with_readonly(true);
+
+        // Reads should still work on readonly exports
+        let result = handler.read(0, 1024).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_promote_readonly_to_readwrite() {
+        let (handler, _temp) = test_handler_with_readonly(true);
+
+        // Initially readonly - writes fail
+        let data = vec![42u8; 4096];
+        assert!(matches!(
+            handler.write(0, &data, false),
+            Err(CommandError::ReadOnly)
+        ));
+
+        // Promote to read-write
+        handler.set_readonly(false);
+        assert!(!handler.is_readonly());
+
+        // Now writes work
+        assert!(handler.write(0, &data, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_read_beyond_device_size() {
+        let (handler, _temp) = test_handler();
+
+        let result = handler.read(1024 * 1024, 4096).await;
+        assert!(matches!(result, Err(CommandError::InvalidArgument)));
+    }
+
+    #[tokio::test]
+    async fn test_flush() {
+        let (handler, _temp) = test_handler();
+
+        let data = vec![42u8; 4096];
+        handler.write(0, &data, false).unwrap();
+        handler.flush().unwrap();
+
+        // Verify data persists
+        let read_data = handler.read(0, 4096).await.unwrap();
+        assert_eq!(read_data.as_ref(), &data[..]);
+    }
+
+    #[tokio::test]
+    async fn test_write_with_fua() {
+        let (handler, _temp) = test_handler();
+
+        let data = vec![42u8; 4096];
+        // FUA flag should trigger flush
+        handler.write(0, &data, true).unwrap();
+
+        let read_data = handler.read(0, 4096).await.unwrap();
+        assert_eq!(read_data.as_ref(), &data[..]);
+    }
+
+    #[tokio::test]
+    async fn test_write_zeroes() {
+        let (handler, _temp) = test_handler();
+
+        // Write some data
+        let data = vec![42u8; 4096];
+        handler.write(0, &data, false).unwrap();
+
+        // Write zeros over it
+        handler.write_zeroes(0, 4096, false).unwrap();
+
+        // Verify zeros
+        let read_data = handler.read(0, 4096).await.unwrap();
+        assert!(read_data.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn test_trim() {
+        let (handler, _temp) = test_handler();
+
+        // Write some data
+        let data = vec![42u8; 4096];
+        handler.write(0, &data, false).unwrap();
+
+        // Trim the region
+        handler.trim(0, 4096, false).unwrap();
+
+        // Verify zeros
+        let read_data = handler.read(0, 4096).await.unwrap();
+        assert!(read_data.iter().all(|&b| b == 0));
+    }
+
 }

@@ -1,0 +1,282 @@
+//! HTTP API for dynamic export management.
+//!
+//! Provides REST endpoints for creating, draining, promoting, and removing exports.
+//! Used by orchestrators for microVM scale-to-zero and live migration.
+
+use crate::config::ExportConfig;
+use crate::nbd::router::{ExportRouter, RouterError};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
+
+/// Request to create a new export.
+#[derive(Debug, Deserialize)]
+pub struct CreateExportRequest {
+    pub name: String,
+    pub size_gb: f64,
+    #[serde(default)]
+    pub s3_prefix: Option<String>,
+    #[serde(default)]
+    pub readonly: bool,
+}
+
+/// Response for export info.
+#[derive(Debug, Serialize)]
+pub struct ExportInfoResponse {
+    pub name: String,
+    pub size_bytes: u64,
+    pub readonly: bool,
+}
+
+/// Response for list exports.
+#[derive(Debug, Serialize)]
+pub struct ListExportsResponse {
+    pub exports: Vec<ExportInfoResponse>,
+}
+
+/// Generic API response.
+#[derive(Debug, Serialize)]
+pub struct ApiResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ApiResponse {
+    fn success(message: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            message: Some(message.into()),
+            error: None,
+        }
+    }
+
+    fn error(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            message: None,
+            error: Some(error.into()),
+        }
+    }
+}
+
+type BoxBody = http_body_util::Full<Bytes>;
+
+fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<BoxBody> {
+    let json = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(json)))
+        .unwrap()
+}
+
+fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
+    json_response(status, &ApiResponse::error(message))
+}
+
+/// Handle API requests.
+async fn handle_request(
+    router: Arc<ExportRouter>,
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody>, Infallible> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    let response = match (method, path_parts.as_slice()) {
+        // GET /api/exports - List all exports
+        (Method::GET, ["api", "exports"]) => {
+            let exports = router.list_exports().await;
+            let response = ListExportsResponse {
+                exports: exports
+                    .into_iter()
+                    .map(|e| ExportInfoResponse {
+                        name: e.name,
+                        size_bytes: e.size,
+                        readonly: e.readonly,
+                    })
+                    .collect(),
+            };
+            json_response(StatusCode::OK, &response)
+        }
+
+        // POST /api/exports - Create new export
+        (Method::POST, ["api", "exports"]) => {
+            let body = match req.collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+
+            let create_req: CreateExportRequest = match serde_json::from_slice(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid JSON: {}", e),
+                    ))
+                }
+            };
+
+            let config = ExportConfig {
+                name: create_req.name.clone(),
+                size_gb: create_req.size_gb,
+                s3_prefix: create_req.s3_prefix,
+            };
+
+            match router.create_export(config, create_req.readonly).await {
+                Ok(()) => json_response(
+                    StatusCode::CREATED,
+                    &ApiResponse::success(format!("Export '{}' created", create_req.name)),
+                ),
+                Err(RouterError::ExportExists(name)) => {
+                    error_response(StatusCode::CONFLICT, &format!("Export '{}' already exists", name))
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/exports/{name} - Get export info
+        (Method::GET, ["api", "exports", name]) => {
+            let exports = router.list_exports().await;
+            match exports.into_iter().find(|e| e.name == *name) {
+                Some(export) => json_response(
+                    StatusCode::OK,
+                    &ExportInfoResponse {
+                        name: export.name,
+                        size_bytes: export.size,
+                        readonly: export.readonly,
+                    },
+                ),
+                None => error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name)),
+            }
+        }
+
+        // POST /api/exports/{name}/drain - Drain export to S3
+        (Method::POST, ["api", "exports", name, "drain"]) => {
+            match router.drain_export(name).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &ApiResponse::success(format!("Export '{}' drained", name)),
+                ),
+                Err(RouterError::ExportNotFound(name)) => {
+                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // POST /api/exports/{name}/promote - Promote readonly to read-write
+        (Method::POST, ["api", "exports", name, "promote"]) => {
+            match router.promote_export(name).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &ApiResponse::success(format!("Export '{}' promoted to read-write", name)),
+                ),
+                Err(RouterError::ExportNotFound(name)) => {
+                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // DELETE /api/exports/{name} - Remove export
+        (Method::DELETE, ["api", "exports", name]) => {
+            // Check for ?purge=true query param
+            let purge = req
+                .uri()
+                .query()
+                .map(|q| q.contains("purge=true"))
+                .unwrap_or(false);
+
+            match router.remove_export(name, purge).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &ApiResponse::success(format!("Export '{}' removed", name)),
+                ),
+                Err(RouterError::ExportNotFound(name)) => {
+                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // Health check
+        (Method::GET, ["health"]) => {
+            json_response(StatusCode::OK, &ApiResponse::success("healthy"))
+        }
+
+        // 404 for everything else
+        _ => error_response(StatusCode::NOT_FOUND, "Not found"),
+    };
+
+    Ok(response)
+}
+
+/// HTTP API server for export management.
+pub struct ApiServer {
+    router: Arc<ExportRouter>,
+    addr: SocketAddr,
+}
+
+impl ApiServer {
+    /// Create a new API server.
+    pub fn new(router: Arc<ExportRouter>, addr: SocketAddr) -> Self {
+        Self { router, addr }
+    }
+
+    /// Start the API server.
+    pub async fn start(self, shutdown: CancellationToken) -> std::io::Result<()> {
+        let listener = TcpListener::bind(self.addr).await?;
+        info!("HTTP API server listening on {}", self.addr);
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("API server shutting down");
+                    break;
+                }
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _addr)) => {
+                            let router = Arc::clone(&self.router);
+                            let io = TokioIo::new(stream);
+
+                            tokio::spawn(async move {
+                                let service = service_fn(move |req| {
+                                    let router = Arc::clone(&router);
+                                    handle_request(router, req)
+                                });
+
+                                if let Err(e) = http1::Builder::new()
+                                    .serve_connection(io, service)
+                                    .await
+                                {
+                                    error!("HTTP connection error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept connection: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}

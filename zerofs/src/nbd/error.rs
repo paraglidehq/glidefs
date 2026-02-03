@@ -1,4 +1,4 @@
-use crate::fs::errors::FsError;
+use super::write_cache::CacheError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -18,8 +18,8 @@ pub enum NBDError {
     #[error("Deku parsing error: {0}")]
     Deku(#[from] deku::DekuError),
 
-    #[error("Filesystem error: {0}")]
-    Filesystem(#[from] FsError),
+    #[error("Cache error: {0}")]
+    Cache(#[from] CacheError),
 }
 
 pub type Result<T> = std::result::Result<T, NBDError>;
@@ -33,6 +33,8 @@ pub enum CommandError {
     IoError,
     /// No space left (ENOSPC)
     NoSpace,
+    /// Read-only device (EROFS)
+    ReadOnly,
 }
 
 impl CommandError {
@@ -41,12 +43,13 @@ impl CommandError {
             CommandError::InvalidArgument => super::protocol::NBD_EINVAL,
             CommandError::IoError => super::protocol::NBD_EIO,
             CommandError::NoSpace => super::protocol::NBD_ENOSPC,
+            CommandError::ReadOnly => super::protocol::NBD_EROFS,
         }
     }
 }
 
-impl From<FsError> for CommandError {
-    fn from(_: FsError) -> Self {
+impl From<CacheError> for CommandError {
+    fn from(_: CacheError) -> Self {
         CommandError::IoError
     }
 }

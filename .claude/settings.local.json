@@ -14,7 +14,8 @@
       "Bash(gh search:*)",
       "WebFetch(domain:utcc.utoronto.ca)",
       "WebFetch(domain:www.open-e.com)",
-      "WebFetch(domain:klarasystems.com)"
+      "WebFetch(domain:klarasystems.com)",
+      "Bash(cargo search:*)"
     ]
   }
 }

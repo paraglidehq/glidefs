@@ -3,27 +3,13 @@ use std::io::BufRead;
 
 mod block_transformer;
 mod bucket_identity;
-mod cache;
-mod checkpoint_manager;
 mod cli;
 mod config;
-mod db;
-mod deku_bytes;
-mod fs;
 mod key_management;
 mod nbd;
-mod nfs;
-mod ninep;
 mod parse_object_store;
-mod rpc;
 mod storage_compatibility;
 mod task;
-
-#[cfg(test)]
-mod test_helpers;
-
-#[cfg(test)]
-mod posix_tests;
 
 #[cfg(feature = "failpoints")]
 mod failpoints;
@@ -76,59 +62,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        cli::Commands::Run {
-            config,
-            read_only,
-            checkpoint,
-            no_compactor,
-        } => {
-            cli::server::run_server(config, read_only, checkpoint, no_compactor).await?;
+        cli::Commands::Run { config } => {
+            cli::server::run_server(config).await?;
         }
-        cli::Commands::Debug { subcommand } => match subcommand {
-            cli::DebugCommands::ListKeys { config } => {
-                cli::debug::list_keys(config).await?;
-            }
-        },
-        cli::Commands::Checkpoint { subcommand } => match subcommand {
-            cli::CheckpointCommands::Create { config, name } => {
-                cli::checkpoint::create_checkpoint(&config, &name).await?;
-            }
-            cli::CheckpointCommands::List { config } => {
-                cli::checkpoint::list_checkpoints(&config).await?;
-            }
-            cli::CheckpointCommands::Delete { config, name } => {
-                cli::checkpoint::delete_checkpoint(&config, &name).await?;
-            }
-            cli::CheckpointCommands::Info { config, name } => {
-                cli::checkpoint::get_checkpoint_info(&config, &name).await?;
-            }
-        },
-        cli::Commands::Fatrace { config } => {
-            cli::fatrace::run_fatrace(config).await?;
-        }
-        cli::Commands::Compactor { config } => {
-            cli::compactor::run_compactor(config).await?;
-        }
-        cli::Commands::Flush { config } => {
-            cli::flush::flush(&config).await?;
-        }
-        cli::Commands::Lease { subcommand } => match subcommand {
-            cli::LeaseCommands::Status { config, path } => {
-                cli::lease::status(&config, &path).await?;
-            }
-            cli::LeaseCommands::List { config } => {
-                cli::lease::list(&config).await?;
-            }
-            cli::LeaseCommands::Acquire { config, path } => {
-                cli::lease::acquire(&config, &path).await?;
-            }
-            cli::LeaseCommands::PrepareHandoff { config, path } => {
-                cli::lease::prepare_handoff(&config, &path).await?;
-            }
-            cli::LeaseCommands::CompleteHandoff { config, path } => {
-                cli::lease::complete_handoff(&config, &path).await?;
-            }
-        },
     }
 
     Ok(())

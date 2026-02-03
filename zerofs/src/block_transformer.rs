@@ -7,8 +7,8 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use rand::{RngCore, thread_rng};
 use sha2::Sha256;
-use slatedb::BlockTransformer;
 use std::sync::Arc;
+use thiserror::Error;
 
 use crate::config::CompressionConfig;
 use crate::task::spawn_blocking_named;
@@ -16,12 +16,38 @@ use crate::task::spawn_blocking_named;
 const NONCE_SIZE: usize = 24;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// Block transformer that handles compression and encryption for SlateDB.
+/// Errors that can occur during block transformation.
+#[derive(Error, Debug)]
+pub enum TransformError {
+    #[error("Compression failed: {0}")]
+    Compression(String),
+
+    #[error("Decompression failed: {0}")]
+    Decompression(String),
+
+    #[error("Encryption failed: {0}")]
+    Encryption(String),
+
+    #[error("Decryption failed: {0}")]
+    Decryption(String),
+
+    #[error("Task execution failed: {0}")]
+    TaskJoin(String),
+}
+
+/// Trait for encoding/decoding blocks with compression and encryption.
+#[async_trait]
+pub trait BlockTransformer: Send + Sync {
+    /// Encode a block: compress then encrypt.
+    async fn encode(&self, data: Bytes) -> Result<Bytes, TransformError>;
+
+    /// Decode a block: decrypt then decompress.
+    async fn decode(&self, data: Bytes) -> Result<Bytes, TransformError>;
+}
+
+/// Block transformer that handles compression and encryption.
 ///
-/// This implements SlateDB's `BlockTransformer` trait to provide transparent
-/// compression and encryption at the SST block level. The transformation
-/// pipeline is:
-///
+/// The transformation pipeline is:
 /// - Write path: compress -> encrypt
 /// - Read path: decrypt -> decompress
 ///
@@ -62,12 +88,12 @@ impl ZeroFsBlockTransformer {
 }
 
 impl TransformerInner {
-    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, TransformError> {
         match self.compression {
             CompressionConfig::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),
             CompressionConfig::Zstd(level) => {
                 let compressed = zstd::bulk::compress(data, level)
-                    .map_err(|e| slatedb::Error::data(format!("Zstd compression failed: {}", e)))?;
+                    .map_err(|e| TransformError::Compression(e.to_string()))?;
                 // Prepend original size as little-endian u32 for decompression
                 let size = data.len() as u32;
                 let mut result = Vec::with_capacity(4 + compressed.len());
@@ -78,21 +104,21 @@ impl TransformerInner {
         }
     }
 
-    fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
+    fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, TransformError> {
         // Auto-detect compression algorithm based on magic bytes
         // Zstd format: [u32 size][zstd data with magic at offset 4]
         if data.len() >= 8 && data[4..8] == ZSTD_MAGIC {
             let size = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
             zstd::bulk::decompress(&data[4..], size)
-                .map_err(|e| slatedb::Error::data(format!("Zstd decompression failed: {}", e)))
+                .map_err(|e| TransformError::Decompression(e.to_string()))
         } else {
             // LZ4 compressed (also has size prepended by lz4_flex)
             lz4_flex::decompress_size_prepended(data)
-                .map_err(|e| slatedb::Error::data(format!("LZ4 decompression failed: {}", e)))
+                .map_err(|e| TransformError::Decompression(e.to_string()))
         }
     }
 
-    fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
+    fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, TransformError> {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
@@ -100,7 +126,7 @@ impl TransformerInner {
         let ciphertext = self
             .cipher
             .encrypt(nonce, data)
-            .map_err(|e| slatedb::Error::data(format!("Encryption failed: {}", e)))?;
+            .map_err(|e| TransformError::Encryption(e.to_string()))?;
 
         // Format: [nonce][ciphertext]
         let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
@@ -109,9 +135,9 @@ impl TransformerInner {
         Ok(result)
     }
 
-    fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, slatedb::Error> {
+    fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, TransformError> {
         if data.len() < NONCE_SIZE {
-            return Err(slatedb::Error::data(
+            return Err(TransformError::Decryption(
                 "Invalid ciphertext: too short".to_string(),
             ));
         }
@@ -121,14 +147,14 @@ impl TransformerInner {
 
         self.cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| slatedb::Error::data(format!("Decryption failed: {}", e)))
+            .map_err(|e| TransformError::Decryption(e.to_string()))
     }
 }
 
 #[async_trait]
 impl BlockTransformer for ZeroFsBlockTransformer {
     /// Encode a block: compress then encrypt.
-    async fn encode(&self, data: Bytes) -> Result<Bytes, slatedb::Error> {
+    async fn encode(&self, data: Bytes) -> Result<Bytes, TransformError> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking_named("block-encode", move || {
             let compressed = inner.compress(&data)?;
@@ -136,11 +162,11 @@ impl BlockTransformer for ZeroFsBlockTransformer {
             Ok(Bytes::from(encrypted))
         })
         .await
-        .map_err(|e| slatedb::Error::data(format!("Task join error: {}", e)))?
+        .map_err(|e| TransformError::TaskJoin(e.to_string()))?
     }
 
     /// Decode a block: decrypt then decompress.
-    async fn decode(&self, data: Bytes) -> Result<Bytes, slatedb::Error> {
+    async fn decode(&self, data: Bytes) -> Result<Bytes, TransformError> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking_named("block-decode", move || {
             let decrypted = inner.decrypt(&data)?;
@@ -148,7 +174,7 @@ impl BlockTransformer for ZeroFsBlockTransformer {
             Ok(Bytes::from(decompressed))
         })
         .await
-        .map_err(|e| slatedb::Error::data(format!("Task join error: {}", e)))?
+        .map_err(|e| TransformError::TaskJoin(e.to_string()))?
     }
 }
 

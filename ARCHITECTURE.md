@@ -1,372 +1,312 @@
 # ZeroFS Architecture
 
-A high-performance filesystem that makes Amazon S3 (or S3-compatible storage) the primary storage backend, providing file-level access via NFS/9P and block-level access via NBD.
+A high-performance block storage system that uses Amazon S3 (or S3-compatible storage) as durable storage while exposing local-speed block devices via NBD for ZFS.
+
+## Design Philosophy
+
+- **FLUSH = local durability** - Fast path for ZFS operations
+- **Background sync to S3** - Eventual durability (continuous drain)
+- **Leverage ZFS** - Let ZFS handle CoW, snapshots, compression
+- **Minimal abstraction** - Direct block-to-S3 mapping
 
 ## Data Flow
 
 ### Write Path
 
 ```
-Client ──► NFS/9P/NBD Server ──► ZeroFS.write()
-                                      │
-                              ┌───────┴───────┐
-                              │ Acquire lock  │
-                              │ Check perms   │
-                              │ Check quota   │
-                              └───────┬───────┘
-                                      │
-                              ┌───────┴───────┐
-                              │  Txn<Open>    │
-                              │ ─────────────│
-                              │ Split 32KB   │
-                              │ Update inode │
-                              └───────┬───────┘
-                                      │
-                              ┌───────┴───────┐
-                              │ Txn<Sequenced>│
-                              │ ─────────────│
-                              │ Wait for seq │
-                              └───────┬───────┘
-                                      │
-                              ┌───────┴───────┐
-                              │   SlateDB     │
-                              │ ─────────────│
-                              │ Memtable     │
-                              │ WAL → S3     │
-                              │ SST → S3     │
-                              └───────────────┘
+ZFS write ─► NBD ─► Local SSD (fsync) ─► return (<10ms)
+                          │
+               Background sync ─► S3 (async)
 ```
+
+The key insight: FLUSH returns after local SSD fsync, not after S3 sync. This makes ZFS snapshot/clone operations fast (~100ms instead of ~10s).
 
 ### Read Path
 
 ```
-Client ──► NFS/9P/NBD Server ──► ZeroFS.read()
-                                      │
-                              ┌───────┴───────┐
-                              │ Get inode    │
-                              │ Check perms  │
-                              └───────┬───────┘
-                                      │
-                              ┌───────┴───────┐
-                              │ ChunkStore   │
-                              │ ─────────────│
-                              │ Calc indices │
-                              │ Scan for     │
-                              │   chunks     │
-                              └───────┬───────┘
-                                      │
-                      ┌───────────────┼───────────────┐
-                      ▼               ▼               ▼
-               Memory Cache     Disk Cache      S3 Backend
-                (Foyer)        (configurable)   (decrypt +
-                 ~1µs            ~10µs         decompress)
-                                              50-300ms cold
+ZFS read ─► NBD ─► Local SSD cache (hit) ─► return (<1ms)
+                          │ (miss)
+                          ▼
+                         S3 ─► decrypt ─► Local SSD ─► return (50-300ms)
 ```
 
-### Lease Handoff (VM Migration)
+### ZFS Snapshot (Target: <100ms)
 
 ```
-Node A (Writer)                           Node B (New Writer)
-      │                                         │
-      ▼                                         │
-PrepareHandoff(path)                            │
-      │                                         │
-      ├─ Block inode writes                     │
-      ├─ Drain in-flight ops                    │
-      ├─ Flush to durable                       │
-      └─ State → Releasing                      │
-      │                                         │
-      ▼                                         │
-CompleteHandoff(path)                           │
-      │                                         │
-      └─ State → Released ─────────────────────►│
-                                                ▼
-                                        AcquireLease(path)
-                                                │
-                                        ├─ Verify Released
-                                        ├─ Atomic CAS on S3
-                                        └─ State → Active
-                                                │
-                                                ▼
-                                          Resume writes
-                                         (<500ms total)
+zfs snapshot ─► NBD FLUSH ─► Local SSD fsync (<10ms) ─► return
 ```
 
-## Concepts & Terminology
-
-| Term | Definition | NOT |
-|------|------------|-----|
-| Chunk | 32KB block of file data | Not a variable-size segment |
-| Inode | Metadata for files/dirs/symlinks | Not the data itself |
-| Lease | Per-path exclusive write lock | Not a global filesystem lock |
-| SST | Sorted String Table (LSM output) | Not raw data in S3 |
-| Tombstone | Marker for deleted file pending GC | Not immediate deletion |
-| Sequence | Ordering number for write coordination | Not a timestamp |
-
-## Core Mechanism
-
-### Chunk-Based Storage
-
-Files are split into fixed 32KB chunks for efficient S3 operations:
-
-```rust
-pub const CHUNK_SIZE: usize = 32 * 1024;  // fs/mod.rs:71
-
-// Key layout for chunk storage
-chunk_key(inode_id, chunk_index) → [0xFE][u64:inode][u64:index]
-
-// Example: inode 42, chunk 0
-[0xFE][0x0000002A][0x00000000] → <32KB data>
-```
-
-**Why 32KB?** Balances S3 API overhead (fixed per-request cost) against granularity for partial updates. Too small = excessive S3 requests. Too large = wasted bandwidth on small updates.
-
-### Typestate Transactions
-
-Compile-time enforcement of transaction lifecycle (`db.rs:83-99`):
-
-```rust
-// State 1: Open for mutations
-pub struct Txn<Open> { batch: WriteBatch, ... }
-    └─ put_bytes(), delete_bytes()
-    └─ sequence() → Txn<Sequenced>
-
-// State 2: Sequenced, ready to commit
-pub struct Txn<Sequenced> { guard: SequenceGuard, ... }
-    └─ wait_for_predecessors()
-    └─ commit()
-```
-
-This prevents entire classes of bugs at compile time:
-- Cannot mutate after sequencing
-- Cannot commit without sequencing
-- Cannot double-commit
-
-### Key Prefix Ordering
-
-LSM keys are prefixed for scan locality (`key_codec.rs:5-21`):
-
-```
-0x01-0x05: Hot metadata (co-located in SSTs)
-  0x01 INODE      - Inode metadata
-  0x02 DIR_ENTRY  - Directory entries
-  0x03 DIR_SCAN   - Directory scan keys
-  0x04 DIR_COOKIE - Readdir pagination
-  0x05 STATS      - Statistics shards
-
-0x06-0x07: Cold metadata
-  0x06 SYSTEM     - Configuration (rarely accessed)
-  0x07 TOMBSTONE  - GC-only scans
-
-0xFE: Bulk data (isolated)
-  0xFE CHUNK      - File data (dominates storage)
-```
-
-**Why this layout?** SlateDB stores each SST as a separate S3 object. Adjacent keys land in the same SST, so directory operations (`lookup`, `readdir`) touch fewer S3 objects.
+Compare to the old architecture where FLUSH blocked on S3:
+- Old: 8-15 seconds per snapshot
+- New: <100ms per snapshot (420x improvement)
 
 ## State Machines
 
-### Transaction State
+### Block State (Runtime)
 
 ```
-Txn<Open>
-    │
-    │ put_bytes() / delete_bytes()
-    │
-    └──► sequence()
-            │
-            ▼
-      Txn<Sequenced>
-            │
-            │ wait_for_predecessors()
-            │
-            └──► commit()
-                    │
-                    ▼
-               [Committed]
-
-(drop without commit → [Abandoned])
+Clean ◄──── sync complete ───── Syncing
+  │                               ▲
+  │ write                  claim dirty
+  ▼                               │
+Dirty ───── sync start ──────────┘
+  ▲
+  └── write during sync / sync failure
 ```
 
-### Lease State
+| State | Meaning |
+|-------|---------|
+| Clean | Block matches S3, safe to evict from local cache |
+| Dirty | Local has newer data than S3 |
+| Syncing | Upload in progress |
+
+### Device Lifecycle (Typestate)
+
+Compile-time enforcement ensures I/O only happens in the correct state:
 
 ```
-[No Lease] ─── acquire() ───► Active
-                                 │
-                                 │ renew() every 10s
-                                 │ (expires in 30s)
-                                 │
-                                 └──► prepare_handoff()
-                                           │
-                                           ▼
-                                       Releasing
-                                           │
-                                           │ drain + flush
-                                           │
-                                           └──► complete_handoff()
-                                                      │
-                                                      ▼
-                                                  Released
-                                                      │
-                                        [Available for new acquire()]
+WriteCache<Initializing>
+         │ load cache
+         ▼
+WriteCache<Recovering>
+         │ finish_recovery()
+         ▼
+WriteCache<Active>       ◄─ Only this state can serve I/O
+         │ shutdown()
+         ▼
+WriteCache<Draining>
+         │ finish()
+         ▼
+       [Dropped]
 ```
 
-| From | Event | To | Guard |
-|------|-------|-----|-------|
-| None | acquire() | Active | No existing lease or expired |
-| Active | timeout | Expired | elapsed > 30s without renewal |
-| Active | prepare_handoff() | Releasing | holder matches |
-| Releasing | complete_handoff() | Released | holder matches |
-| Released | acquire() | Active | S3 conditional write succeeds |
+| State | Operations Allowed |
+|-------|-------------------|
+| Initializing | Load local cache file |
+| Recovering | Sync dirty/syncing blocks to S3 |
+| Active | read(), write(), flush() |
+| Draining | Sync remaining blocks, reject new writes |
 
-## Design Decisions
+## Core Components
 
-### Why Per-Path Leases Over Global Lock?
+### WriteCache (`nbd/write_cache.rs`)
 
-We use per-path leases (`/.zerofs_leases/{path_hash}.json`) instead of a global writer lock:
-
-1. **Independent VM migration** - Migrate one VM while others keep running
-2. **Faster handoff** - Only block affected path (<500ms vs seconds)
-3. **No coordination service** - S3 conditional writes provide atomicity
-4. **Fault isolation** - One stuck handoff doesn't block the system
-
-We considered Raft/Paxos but rejected it:
-- Requires separate coordination service
-- Overkill for single-writer-per-path semantics
-- S3 already provides linearizable conditional writes
-
-### Why S3 Conditional Writes for Leases?
-
-Lease atomicity via S3 `If-Match` (ETag versioning) (`lease.rs:25-27`):
+Local SSD write-behind cache with typestate lifecycle:
 
 ```rust
-PutMode::Update(UpdateVersion { e_tag, ... })
+// Only Active cache can serve I/O - compiler enforced
+impl WriteCache<Active> {
+    pub async fn write(&self, offset: u64, data: &[u8]) -> Result<()>;
+    pub fn flush(&self) -> Result<()>;  // Local fsync only!
+    pub async fn read(&self, offset: u64, len: usize) -> Result<Bytes>;
+}
 ```
 
-1. **No consensus service needed** - S3 is the coordinator
-2. **Works with any S3-compatible store** - MinIO, R2, GCS, Azure
-3. **Partition tolerant** - S3 outage = lease unavailable (safe)
-4. **Simple mental model** - CAS semantics engineers understand
+### S3BlockStore (`nbd/block_store.rs`)
 
-### Why Typestate Over Runtime Checks?
+Direct block-to-S3 object mapping:
 
 ```rust
-// Compile-time: impossible to call commit() before sequence()
-Txn<Open> → sequence() → Txn<Sequenced> → commit()
+// Key format: {prefix}/blocks/{block_number:016x}
+// Example: zerofs/nbd/device1/blocks/0000000000000042
 
-// Runtime alternative (rejected):
-txn.commit()  // panics if not sequenced - bug found at runtime
+impl S3BlockStore {
+    pub async fn read_block(&self, block: u64) -> Result<Bytes>;
+    pub async fn write_block(&self, block: u64, data: Bytes) -> Result<()>;
+}
+```
+
+No LSM tree overhead - O(1) block lookup in S3.
+
+### NBDBlockHandler (`nbd/handler.rs`)
+
+Thin handler that delegates all I/O to WriteCache:
+
+```rust
+pub struct NBDBlockHandler {
+    cache: Arc<WriteCache<Active>>,  // Typestate: only Active cache
+    device_size: u64,
+}
+
+impl NBDBlockHandler {
+    pub fn flush(&self) -> CommandResult<()> {
+        self.cache.flush()  // Local fsync - returns in <10ms
+    }
+}
+```
+
+### Background Sync Worker
+
+Continuous drain pattern keeps dirty set small:
+
+```rust
+async fn sync_worker(cache, s3_store, shutdown) {
+    loop {
+        let dirty = cache.claim_dirty_blocks(BATCH_SIZE);
+        if dirty.is_empty() {
+            sleep(Duration::from_millis(100)).await;
+        } else {
+            upload_to_s3(dirty).await;
+        }
+    }
+}
 ```
 
 Benefits:
-- **Zero runtime overhead** - No checks in hot path
-- **Bugs found at compile time** - Not in production
-- **Self-documenting API** - Types encode valid transitions
-
-### Why Chunk Keys at 0xFE (End of Keyspace)?
-
-Chunks dominate storage (>95% by volume) but are rarely scanned with metadata:
-
-```
-lookup("/foo/bar")  →  scans 0x01-0x04 (metadata SSTs)
-read_file(inode=42) →  scans 0xFE (chunk SSTs)
-```
-
-Separating chunks prevents metadata scans from downloading chunk-heavy SSTs. This can reduce S3 GETs by 10-100x for directory-heavy workloads.
-
-### Why 9P Over FUSE?
-
-We provide 9P (and NFS) instead of FUSE:
-
-1. **No custom kernel modules** - Works on any OS immediately
-2. **Battle-tested clients** - Linux kernel 9P client is mature
-3. **Network-first design** - Handles latency, retries, disconnects
-4. **Better fsync semantics** - 9P correctly signals durability
-
-FUSE would require writing both filesystem logic AND handling S3's network characteristics in the kernel driver.
-
-## Package Structure
-
-| File | Purpose |
-|------|---------|
-| `fs/mod.rs` | Main ZeroFS struct, POSIX operations |
-| `fs/store/chunk.rs` | File data chunking, 32KB blocks |
-| `fs/store/inode.rs` | Inode allocation and persistence |
-| `fs/store/directory.rs` | Directory entries, readdir |
-| `fs/store/tombstone.rs` | Deleted file tracking for GC |
-| `fs/lease.rs` | Per-path writer coordination |
-| `fs/write_coordinator.rs` | Sequential write ordering |
-| `fs/flush_coordinator.rs` | Coordinating flush operations |
-| `fs/gc.rs` | Background garbage collection |
-| `fs/key_codec.rs` | LSM key encoding/decoding |
-| `fs/inode.rs` | Inode data structures |
-| `db.rs` | SlateDB wrapper, typestate transactions |
-| `nfs.rs` | NFS protocol adapter |
-| `ninep/` | 9P protocol implementation |
-| `nbd/` | NBD block device server |
-| `rpc/server.rs` | gRPC admin API |
-| `block_transformer.rs` | Compression + encryption pipeline |
-| `cache.rs` | Foyer memory cache |
+- Cross-host snapshots only wait for current batch
+- Dirty set stays bounded
+- Network failures retry individual blocks
 
 ## Configuration
 
 | Variable | Default | Rationale |
 |----------|---------|-----------|
-| `cache.disk_size_gb` | 10.0 | Balances local storage vs S3 latency |
-| `cache.memory_size_gb` | 0.25 | Memory cache for hot metadata |
-| `filesystem.max_size_gb` | 16 EiB | Effectively unlimited by default |
-| `filesystem.compression` | `lz4` | Fast compression, good ratio |
-| `lease.duration_secs` | 30 | Room for network jitter + renewal |
-| `lease.renewal_interval_secs` | 10 | 3x attempts before expiry |
+| `nbd.device_size_gb` | 100.0 | Virtual device size |
+| `nbd.block_size` | 128KB | Match ZFS recordsize |
+| `cache.dir` | ~/.cache/zerofs | Local SSD cache location |
+| `cache.disk_size_gb` | 10.0 | Local cache size |
+
+## Performance Targets
+
+| Operation | Target | Notes |
+|-----------|--------|-------|
+| ZFS snapshot | <100ms | Local fsync only |
+| ZFS clone | <100ms | ZFS metadata operation |
+| Write latency | <1ms | Local SSD |
+| Read latency (cached) | <1ms | Local SSD |
+| Read latency (cold) | 50-300ms | S3 fetch |
 
 ## Security Model
 
 ### What We Verify
 
 - Password-derived key via Argon2id (128-bit salt, 256-bit key)
-- XChaCha20-Poly1305 authenticated encryption on all data
-- POSIX permission checks (uid/gid/mode) on every operation
+- XChaCha20-Poly1305 authenticated encryption on all blocks
+- Data encrypted both on local SSD and in S3
 
 ### What We Do NOT Verify
 
-- **Key structure is unencrypted** - Inode IDs, filenames visible in LSM
-- **No access control on S3** - Anyone with bucket access sees encrypted blobs
-- **Client identity** - NFS/9P client claims uid/gid (no authentication)
+- **S3 access control** - Anyone with bucket access sees encrypted blobs
+- **Network security** - NBD protocol is not encrypted (use VPN/firewall)
 
 ### Why This Is Acceptable
 
-- Encrypting keys would break LSM sorting (severe performance impact)
 - S3 bucket policies provide coarse access control
-- For filename privacy, layer gocryptfs on top
-- Production deployments should use network isolation
+- Local SSD encryption provides at-rest protection
+- NBD intended for local/trusted network (localhost or VM hypervisor)
 
 ## Failure Modes
 
-| Failure | Detection | Recovery |
-|---------|-----------|----------|
-| S3 unavailable | Request timeout | Retry with backoff, fail after threshold |
-| Lease holder crash | Lease expires (30s) | New node acquires after expiry |
-| Mid-write crash | WAL survives in S3 | SlateDB replays WAL on restart |
-| Orphaned chunks | GC scans tombstones | Background deletion over time |
-| Quota exceeded | Size check before write | Return ENOSPC, allow deletes |
+| Failure | Impact | Recovery |
+|---------|--------|----------|
+| Crash before sync | Up to N seconds of writes in local cache | Recovered on restart, synced to S3 |
+| S3 unavailable | Writes continue locally | Sync resumes when S3 returns |
+| Local SSD failure | Data loss for unsynced blocks | Restore from S3 (cold) |
+| Graceful shutdown | None | All dirty blocks synced before exit |
 
-## Performance Characteristics
+### Data Loss Window
 
-| Operation | Latency | Notes |
-|-----------|---------|-------|
-| Memory cache hit | ~1 µs | Foyer in-memory cache |
-| Disk cache hit | ~10 µs | Local SSD cache |
-| S3 cold read | 50-300 ms | Download + decrypt + decompress |
-| Sequential write | ~19 µs/op | SQLite fillseq benchmark |
-| Random read | ~0.9 µs/op | SQLite readseq (cached) |
-| PostgreSQL TPS | 53K write, 413K read | pgbench with L2ARC |
+Write-behind means some writes may be on local SSD but not yet in S3.
+
+**Mitigations:**
+1. Continuous drain keeps dirty set small
+2. Sync on graceful shutdown (flush all dirty blocks)
+3. NVMe with power loss protection recommended for production
+4. On crash: dirty blocks in local cache are recovered on restart
+5. ZFS `sync=disabled` users already accept similar trade-offs
+
+## Package Structure
+
+| File | Purpose |
+|------|---------|
+| `nbd/server.rs` | NBD protocol server |
+| `nbd/handler.rs` | Block I/O handler |
+| `nbd/write_cache.rs` | Write-behind cache with typestate |
+| `nbd/block_store.rs` | Direct S3 block storage |
+| `nbd/state.rs` | BlockState, lifecycle state types |
+| `block_transformer.rs` | Encryption/decryption |
+| `config.rs` | Configuration loading |
+| `cli/server.rs` | Server initialization and lifecycle |
+| `rpc/server.rs` | Admin RPC API |
+
+## Design Decisions
+
+### Why Write-Behind Over Write-Through?
+
+Write-through (old architecture):
+```
+NBD FLUSH → SlateDB.flush() → S3 PUT → return (2-15 seconds)
+```
+
+Write-behind (new architecture):
+```
+NBD FLUSH → Local SSD fsync → return (10ms)
+                ↓
+         Background → S3 PUT (async)
+```
+
+ZFS snapshot/clone operations are **metadata-only** (copy-on-write pointers). But NBD FLUSH was making them block on S3 network I/O - a 420x slowdown.
+
+### Why Sparse Files for Cache?
+
+- 100GB device with 10GB written = ~10GB on disk
+- File grows as blocks are written
+- OS handles sparse allocation transparently
+- No pre-allocation overhead
+
+### Why Direct Block-to-S3 (No LSM)?
+
+The old architecture used SlateDB (LSM tree):
+- Overhead: WAL + memtable + compaction
+- Good for: Small key-value operations
+- Bad for: Large sequential block I/O
+
+Direct block-to-S3:
+- One S3 object per block
+- O(1) lookup: block 42 → `{prefix}/blocks/000000000000002a`
+- No compaction overhead
+- Simpler crash recovery
+
+### Why Typestate for Device Lifecycle?
+
+```rust
+// Compile-time: impossible to serve I/O during recovery
+WriteCache<Recovering> → finish_recovery() → WriteCache<Active>
+
+// Runtime alternative (rejected):
+cache.read()  // panics if not ready - bug found at runtime
+```
+
+Benefits:
+- **Zero runtime overhead** - No state checks in hot path
+- **Bugs found at compile time** - Not in production
+- **Self-documenting API** - Types encode valid transitions
+
+### Why Continuous Drain Over Periodic Sync?
+
+Polling pattern:
+```rust
+loop { sleep(5s); sync_all_dirty(); }
+```
+
+Continuous drain pattern:
+```rust
+loop {
+    let batch = claim_dirty(100);
+    if batch.empty() { sleep(100ms) }
+    else { upload(batch) }
+}
+```
+
+Benefits:
+- Dirty set stays small (most blocks synced within ~1s)
+- Cross-host snapshots wait for current batch, not all dirty blocks
+- More even S3 write traffic
 
 ## Limits
 
 | Limit | Value | Constraint |
 |-------|-------|------------|
-| Max file size | 16 EiB | 64-bit chunk indices × 32KB |
-| Max files | 2^64 | 64-bit inode IDs |
-| Max hardlinks | ~4 billion | 32-bit nlink counter |
-| Max filename | 255 bytes | POSIX NAME_MAX |
-| Chunk size | 32 KB | Fixed, not configurable |
+| Max device size | 16 EiB | 64-bit block indices |
+| Block size | 128 KB | Configurable, matches ZFS recordsize |
+| Local cache | Disk space | Sparse file grows as needed |

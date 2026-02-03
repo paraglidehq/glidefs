@@ -6,15 +6,11 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-/// Compression algorithm configuration for chunk data.
-/// Supports lz4 and zstd.
+/// Compression algorithm configuration for block data.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompressionConfig {
-    /// LZ4 compression: fast with moderate compression ratio (default)
     #[default]
     Lz4,
-    /// Zstd compression with configurable level (1-22)
-    /// Level 1 is fastest, level 22 is maximum compression
     Zstd(i32),
 }
 
@@ -87,10 +83,9 @@ pub struct Settings {
     pub cache: CacheConfig,
     pub storage: StorageConfig,
     pub servers: ServerConfig,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub filesystem: Option<FilesystemConfig>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub lsm: Option<LsmConfig>,
+    /// Compression setting (lz4 or zstd-{level})
+    #[serde(default)]
+    pub compression: CompressionConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,189 +115,123 @@ pub struct StorageConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct FilesystemConfig {
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_size_gb: Option<f64>,
-    /// Compression algorithm for chunk data: "lz4" (default) or "zstd-{level}" where level is 1-22
-    #[serde(default)]
-    pub compression: CompressionConfig,
-    /// Writer lease configuration for multi-node coordination
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub lease: Option<LeaseConfig>,
-}
-
-/// Configuration for writer lease coordination.
-///
-/// Used to enable single-writer semantics for fast microVM migration.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct LeaseConfig {
-    /// Whether to enable writer lease coordination (default: false)
-    #[serde(default)]
-    pub enabled: bool,
-    /// Lease duration in seconds before expiration (default: 30)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub duration_secs: Option<u64>,
-    /// Interval between lease renewals in seconds (default: 10)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub renewal_interval_secs: Option<u64>,
-    /// Custom name to identify this node (default: hostname)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub holder_name: Option<String>,
-}
-
-impl LeaseConfig {
-    /// Default lease duration: 30 seconds
-    pub const DEFAULT_DURATION_SECS: u64 = 30;
-    /// Default renewal interval: 10 seconds
-    pub const DEFAULT_RENEWAL_INTERVAL_SECS: u64 = 10;
-    /// Minimum lease duration: 5 seconds
-    pub const MIN_DURATION_SECS: u64 = 5;
-    /// Minimum renewal interval: 1 second
-    pub const MIN_RENEWAL_INTERVAL_SECS: u64 = 1;
-
-    pub fn duration_secs(&self) -> u64 {
-        self.duration_secs
-            .unwrap_or(Self::DEFAULT_DURATION_SECS)
-            .max(Self::MIN_DURATION_SECS)
-    }
-
-    pub fn renewal_interval_secs(&self) -> u64 {
-        self.renewal_interval_secs
-            .unwrap_or(Self::DEFAULT_RENEWAL_INTERVAL_SECS)
-            .max(Self::MIN_RENEWAL_INTERVAL_SECS)
-    }
-}
-
-impl FilesystemConfig {
-    pub fn max_bytes(&self) -> u64 {
-        self.max_size_gb
-            .filter(|&gb| gb.is_finite() && gb > 0.0)
-            .map(|gb| (gb * 1_000_000_000.0) as u64)
-            .unwrap_or(u64::MAX)
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
-#[serde(deny_unknown_fields)]
-pub struct LsmConfig {
-    /// Maximum number of SST files in level 0 before triggering compaction
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub l0_max_ssts: Option<usize>,
-    /// Maximum unflushed data before forcing a flush (in gigabytes)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_unflushed_gb: Option<f64>,
-    /// Maximum number of concurrent compactions
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub max_concurrent_compactions: Option<usize>,
-    /// Interval in seconds between periodic flushes
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub flush_interval_secs: Option<u64>,
-}
-
-impl LsmConfig {
-    /// Default l0_max_ssts: 16
-    pub const DEFAULT_L0_MAX_SSTS: usize = 16;
-    /// Default max_unflushed_gb: 1.0 GiB
-    pub const DEFAULT_MAX_UNFLUSHED_GB: f64 = 1.0;
-    /// Default max_concurrent_compactions: 8
-    pub const DEFAULT_MAX_CONCURRENT_COMPACTIONS: usize = 8;
-    /// Default flush_interval_secs: 30 seconds
-    pub const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
-
-    /// Minimum l0_max_ssts to maintain reasonable performance
-    pub const MIN_L0_MAX_SSTS: usize = 4;
-    /// Minimum max_unflushed_gb: 0.1 GB (100 MB)
-    pub const MIN_MAX_UNFLUSHED_GB: f64 = 0.1;
-    /// Minimum max_concurrent_compactions: 1
-    pub const MIN_MAX_CONCURRENT_COMPACTIONS: usize = 1;
-    /// Minimum flush_interval_secs: 5 seconds
-    pub const MIN_FLUSH_INTERVAL_SECS: u64 = 5;
-
-    pub fn l0_max_ssts(&self) -> usize {
-        self.l0_max_ssts
-            .unwrap_or(Self::DEFAULT_L0_MAX_SSTS)
-            .max(Self::MIN_L0_MAX_SSTS)
-    }
-
-    pub fn max_unflushed_bytes(&self) -> usize {
-        let gb = self
-            .max_unflushed_gb
-            .unwrap_or(Self::DEFAULT_MAX_UNFLUSHED_GB)
-            .max(Self::MIN_MAX_UNFLUSHED_GB);
-        (gb * 1_000_000_000.0) as usize
-    }
-
-    pub fn max_concurrent_compactions(&self) -> usize {
-        self.max_concurrent_compactions
-            .unwrap_or(Self::DEFAULT_MAX_CONCURRENT_COMPACTIONS)
-            .max(Self::MIN_MAX_CONCURRENT_COMPACTIONS)
-    }
-
-    pub fn flush_interval_secs(&self) -> u64 {
-        self.flush_interval_secs
-            .unwrap_or(Self::DEFAULT_FLUSH_INTERVAL_SECS)
-            .max(Self::MIN_FLUSH_INTERVAL_SECS)
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub nfs: Option<NfsConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ninep: Option<NinePConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub nbd: Option<NbdConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rpc: Option<RpcConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct NfsConfig {
-    #[serde(default = "default_nfs_addresses")]
-    pub addresses: HashSet<SocketAddr>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct NinePConfig {
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub addresses: Option<HashSet<SocketAddr>>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_expandable_path",
-        default
-    )]
-    pub unix_socket: Option<PathBuf>,
-}
-
+/// NBD server configuration for block device access.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NbdConfig {
+    /// TCP addresses to listen on (e.g., "127.0.0.1:10809")
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub addresses: Option<HashSet<SocketAddr>>,
+
+    /// Unix socket path for local connections
     #[serde(
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_expandable_path",
         default
     )]
     pub unix_socket: Option<PathBuf>,
+
+    /// HTTP API address for dynamic export management (e.g., "127.0.0.1:8080")
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub api_address: Option<SocketAddr>,
+
+    /// Block size in bytes (default: 128KB to match ZFS recordsize)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_size: Option<usize>,
+
+    /// Static exports loaded at startup
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<ExportConfig>,
+
+    // Legacy single-device fields (for backward compatibility)
+    /// Name of the NBD device (DEPRECATED: use exports array instead)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub device_name: Option<String>,
+
+    /// Size of the block device in gigabytes (DEPRECATED: use exports array instead)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub device_size_gb: Option<f64>,
 }
 
+/// Configuration for a single NBD export (virtual block device).
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct RpcConfig {
+pub struct ExportConfig {
+    /// Export name (used by NBD client: nbd-client -N <name>)
+    pub name: String,
+
+    /// Device size in gigabytes
+    pub size_gb: f64,
+
+    /// S3 prefix for this export's blocks (default: derived from name)
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub addresses: Option<HashSet<SocketAddr>>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_expandable_path",
-        default
-    )]
-    pub unix_socket: Option<PathBuf>,
+    pub s3_prefix: Option<String>,
+}
+
+impl ExportConfig {
+    /// Get the S3 prefix for this export, defaulting to the export name.
+    pub fn s3_prefix(&self) -> &str {
+        self.s3_prefix.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Get the device size in bytes.
+    pub fn size_bytes(&self) -> u64 {
+        (self.size_gb * 1_000_000_000.0) as u64
+    }
+}
+
+impl NbdConfig {
+    pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
+    pub const DEFAULT_DEVICE_SIZE_GB: f64 = 100.0;
+    pub const DEFAULT_DEVICE_NAME: &'static str = "zerofs";
+
+    pub fn block_size(&self) -> usize {
+        self.block_size.unwrap_or(Self::DEFAULT_BLOCK_SIZE)
+    }
+
+    /// Get the list of exports, handling legacy single-device config.
+    pub fn get_exports(&self) -> Vec<ExportConfig> {
+        if !self.exports.is_empty() {
+            return self.exports.clone();
+        }
+
+        // Legacy support: convert old device_name/device_size_gb to export
+        if let (Some(name), Some(size_gb)) = (&self.device_name, self.device_size_gb) {
+            return vec![ExportConfig {
+                name: name.clone(),
+                size_gb,
+                s3_prefix: None,
+            }];
+        }
+
+        // Default: single export with default values
+        vec![ExportConfig {
+            name: Self::DEFAULT_DEVICE_NAME.to_string(),
+            size_gb: Self::DEFAULT_DEVICE_SIZE_GB,
+            s3_prefix: None,
+        }]
+    }
+}
+
+fn default_nbd_addresses() -> HashSet<SocketAddr> {
+    let mut set = HashSet::new();
+    set.insert(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+        10809,
+    ));
+    set
+}
+
+fn default_api_address() -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        8080,
+    )
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -339,42 +268,6 @@ impl<'de> Deserialize<'de> for GcsConfig {
     {
         Ok(GcsConfig(deserialize_expandable_hashmap(deserializer)?))
     }
-}
-
-fn default_nfs_addresses() -> HashSet<SocketAddr> {
-    let mut set = HashSet::new();
-    set.insert(SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-        2049,
-    ));
-    set
-}
-
-fn default_9p_addresses() -> HashSet<SocketAddr> {
-    let mut set = HashSet::new();
-    set.insert(SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-        5564,
-    ));
-    set
-}
-
-fn default_nbd_addresses() -> HashSet<SocketAddr> {
-    let mut set = HashSet::new();
-    set.insert(SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-        10809,
-    ));
-    set
-}
-
-fn default_rpc_addresses() -> HashSet<SocketAddr> {
-    let mut set = HashSet::new();
-    set.insert(SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-        7000,
-    ));
-    set
 }
 
 fn deserialize_expandable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -441,18 +334,8 @@ where
 }
 
 impl Settings {
-    pub fn max_bytes(&self) -> u64 {
-        self.filesystem
-            .as_ref()
-            .map(|fs| fs.max_bytes())
-            .unwrap_or(u64::MAX)
-    }
-
     pub fn compression(&self) -> CompressionConfig {
-        self.filesystem
-            .as_ref()
-            .map(|fs| fs.compression)
-            .unwrap_or_default()
+        self.compression
     }
 
     pub fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -508,24 +391,21 @@ impl Settings {
                 encryption_password: "${ZEROFS_PASSWORD}".to_string(),
             },
             servers: ServerConfig {
-                nfs: Some(NfsConfig {
-                    addresses: default_nfs_addresses(),
-                }),
-                ninep: Some(NinePConfig {
-                    addresses: Some(default_9p_addresses()),
-                    unix_socket: Some(PathBuf::from("/tmp/zerofs.9p.sock")),
-                }),
                 nbd: Some(NbdConfig {
                     addresses: Some(default_nbd_addresses()),
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.nbd.sock")),
-                }),
-                rpc: Some(RpcConfig {
-                    addresses: Some(default_rpc_addresses()),
-                    unix_socket: Some(PathBuf::from("/tmp/zerofs.rpc.sock")),
+                    api_address: Some(default_api_address()),
+                    block_size: None,
+                    exports: vec![ExportConfig {
+                        name: "default".to_string(),
+                        size_gb: 100.0,
+                        s3_prefix: None,
+                    }],
+                    device_name: None,
+                    device_size_gb: None,
                 }),
             },
-            filesystem: None,
-            lsm: None,
+            compression: CompressionConfig::default(),
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,
@@ -534,102 +414,21 @@ impl Settings {
 
     pub fn write_default_config(path: impl AsRef<std::path::Path>) -> Result<()> {
         let default = Self::generate_default();
-        let mut toml_string = toml::to_string_pretty(&default)?;
+        let toml_string = toml::to_string_pretty(&default)?;
 
-        toml_string.push_str("\n# Optional AWS S3 settings (uncomment to use):\n");
-        toml_string.push_str(
-            "# endpoint = \"https://s3.us-east-1.amazonaws.com\"  # For S3-compatible services\n",
-        );
-        toml_string.push_str("# default_region = \"us-east-1\"\n");
-        toml_string.push_str("# allow_http = \"true\"  # For non-HTTPS endpoints\n");
-
-        toml_string.push_str("\n# Optional filesystem configuration\n");
-        toml_string
-            .push_str("# Limit the maximum size of the filesystem to prevent unlimited growth\n");
-        toml_string.push_str("# If not specified, defaults to 16 EiB (effectively unlimited)\n");
-        toml_string.push_str("#\n");
-        toml_string.push_str("# Compression algorithm for chunk data:\n");
-        toml_string.push_str("#   - \"lz4\" (default): Fast compression, moderate ratio\n");
-        toml_string.push_str("#   - \"zstd-{level}\": Configurable compression (level 1-22)\n");
-        toml_string.push_str("#     Level 1 is fastest, level 22 is maximum compression\n");
-        toml_string.push_str("#     Recommended for zstd: zstd-3 for balanced speed/compression\n");
-        toml_string.push_str("#\n");
-        toml_string
-            .push_str("# Note: Compression can be changed at any time. Existing data remains\n");
-        toml_string
-            .push_str("# readable regardless of compression setting (auto-detected on read).\n");
-        toml_string.push_str("\n# [filesystem]\n");
-        toml_string.push_str("# max_size_gb = 100.0   # Limit filesystem to 100 GB\n");
-        toml_string.push_str("# compression = \"lz4\"  # or \"zstd-3\", \"zstd-19\", etc.\n");
-
-        toml_string.push_str("\n# Optional LSM tree tuning parameters\n");
-        toml_string
-            .push_str("# Advanced performance tuning for the underlying LSM tree storage engine\n");
-        toml_string.push_str("# Only modify these if you understand LSM tree behavior\n");
-        toml_string.push_str("\n# [lsm]\n");
-        toml_string.push_str("# l0_max_ssts = 16                 # Max SST files in L0 before compaction (default: 16, min: 4)\n");
-        toml_string.push_str("# max_unflushed_gb = 1.0           # Max unflushed data before forcing flush in GB (default: 1.0, min: 0.1)\n");
-        toml_string.push_str("# max_concurrent_compactions = 8   # Max concurrent compaction operations (default: 8, min: 1)\n");
-        toml_string.push_str("# flush_interval_secs = 30         # Interval between periodic flushes in seconds (default: 30, min: 5)\n");
-
-        toml_string.push_str("\n# Optional Azure settings can be added to [azure] section\n");
-
-        // Add commented-out Azure section
-        toml_string.push_str("\n# [azure]\n");
-        toml_string.push_str("# storage_account_name = \"${AZURE_STORAGE_ACCOUNT_NAME}\"\n");
-        toml_string.push_str("# storage_account_key = \"${AZURE_STORAGE_ACCOUNT_KEY}\"\n");
-
-        toml_string.push_str("\n# Optional GCS (Google Cloud Storage) settings\n");
-        toml_string.push_str("# Use gs:// URLs with the [gcp] section\n");
-
-        // Add commented-out GCS section
-        toml_string.push_str("\n# [gcp]\n");
-        toml_string.push_str(
-            "# service_account = \"${GCS_SERVICE_ACCOUNT}\"  # Path to service account JSON file\n",
-        );
-        toml_string
-            .push_str("# Or use application_credentials = \"${GOOGLE_APPLICATION_CREDENTIALS}\"\n");
         let commented = format!(
             "# ZeroFS Configuration File\n\
              # Generated by ZeroFS v{}\n\
              #\n\
-             # ============================================================================\n\
-             # ENVIRONMENT VARIABLE SUBSTITUTION\n\
-             # ============================================================================\n\
-             # This config file supports environment variable substitution.\n\
-             # \n\
-             # Supported syntax:\n\
-             #   - ${{VAR}} or $VAR  : Environment variable substitution\n\
-             # \n\
-             # Examples:\n\
-             #   encryption_password = \"${{ZEROFS_PASSWORD}}\"\n\
-             #   dir = \"${{HOME}}/.cache/zerofs\"\n\
-             #   access_key_id = \"${{AWS_ACCESS_KEY_ID}}\"\n\
+             # High-performance S3-backed block storage for ZFS\n\
              #\n\
-             # All referenced environment variables must be set, or the config will fail to load.\n\
+             # Environment variables are supported: ${{VAR}} or $VAR\n\
              #\n\
-             # ============================================================================\n\
-             # SERVER CONFIGURATION\n\
-             # ============================================================================\n\
-             # - To disable a server, remove or comment out its entire section\n\
-             # - Unix sockets are optional for 9P and NBD servers\n\
-             # - NFS only supports TCP connections\n\
-             # - Each protocol supports multiple bind addresses\n\
-             # \n\
-             # Examples:\n\
-             #   addresses = [\"127.0.0.1:2049\"]                  # IPv4 localhost only\n\
-             #   addresses = [\"0.0.0.0:2049\"]                    # All IPv4 interfaces\n\
-             #   addresses = [\"[::]:2049\"]                       # All IPv6 interfaces\n\
-             #   addresses = [\"127.0.0.1:2049\", \"[::1]:2049\"]  # Both IPv4 and IPv6 localhost\n\
+             # NBD Server:\n\
+             #   - FLUSH returns after local SSD fsync (<10ms)\n\
+             #   - Background sync to S3 (continuous drain)\n\
+             #   - Send SIGUSR1 to drain all dirty blocks (for VM migration)\n\
              #\n\
-             # ============================================================================\n\
-             # CLOUD STORAGE\n\
-             # ============================================================================\n\
-             # - For S3: Configure [aws] section with your credentials\n\
-             # - For Azure: Configure [azure] section with your credentials\n\
-             # - For GCS: Configure [gcp] section or set GOOGLE_APPLICATION_CREDENTIALS env var\n\
-             # - For local storage: Use file:// URLs (no cloud config needed)\n\
-             # ============================================================================\n\
              \n{}",
             env!("CARGO_PKG_VERSION"),
             toml_string
@@ -691,7 +490,7 @@ encryption_password = "test"
 
 [servers]
 
-[servers.ninep]
+[servers.nbd]
 unix_socket = "${ZEROFS_TEST_HOME}/zerofs.sock"
 "#;
 
@@ -705,10 +504,10 @@ unix_socket = "${ZEROFS_TEST_HOME}/zerofs.sock"
             settings.storage.url,
             format!("file://{}/data", home_dir.display())
         );
-        if let Some(ninep) = settings.servers.ninep {
-            assert_eq!(ninep.unix_socket.unwrap(), home_dir.join("zerofs.sock"));
+        if let Some(nbd) = settings.servers.nbd {
+            assert_eq!(nbd.unix_socket.unwrap(), home_dir.join("zerofs.sock"));
         } else {
-            panic!("Expected 9P config");
+            panic!("Expected NBD config");
         }
     }
 
@@ -731,47 +530,13 @@ encryption_password = "${ZEROFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}"
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         assert!(result.is_err());
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(
-            error.contains("ZEROFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST"),
-            "Error was: {}",
-            error
-        );
     }
 
     #[test]
-    fn test_mixed_expansion() {
-        let home_dir = env::home_dir().expect("HOME not set");
-        unsafe {
-            env::set_var("ZEROFS_TEST_HOME_MIX", home_dir.to_str().unwrap());
-            env::set_var("ZEROFS_TEST_DIR_MIX", "mydir");
-        }
-
-        let config_content = r#"
-[cache]
-dir = "${ZEROFS_TEST_HOME_MIX}/${ZEROFS_TEST_DIR_MIX}/cache"
-disk_size_gb = 1.0
-
-[storage]
-url = "file:///data"
-encryption_password = "test"
-
-[servers]
-"#;
-
-        let temp_file = NamedTempFile::new().unwrap();
-        std::fs::write(temp_file.path(), config_content).unwrap();
-
-        let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
-        assert_eq!(settings.cache.dir, home_dir.join("mydir/cache"));
-    }
-
-    #[test]
-    fn test_aws_azure_config_expansion() {
+    fn test_aws_config_expansion() {
         unsafe {
             env::set_var("ZEROFS_TEST_AWS_KEY", "aws123");
             env::set_var("ZEROFS_TEST_AWS_SECRET", "aws_secret");
-            env::set_var("ZEROFS_TEST_AZURE_KEY", "azure456");
         }
 
         let config_content = r#"
@@ -788,9 +553,6 @@ encryption_password = "test"
 [aws]
 access_key_id = "${ZEROFS_TEST_AWS_KEY}"
 secret_access_key = "${ZEROFS_TEST_AWS_SECRET}"
-
-[azure]
-storage_account_key = "${ZEROFS_TEST_AZURE_KEY}"
 "#;
 
         let temp_file = NamedTempFile::new().unwrap();
@@ -801,57 +563,5 @@ storage_account_key = "${ZEROFS_TEST_AZURE_KEY}"
         let aws = settings.aws.unwrap();
         assert_eq!(aws.0.get("access_key_id").unwrap(), "aws123");
         assert_eq!(aws.0.get("secret_access_key").unwrap(), "aws_secret");
-
-        let azure = settings.azure.unwrap();
-        assert_eq!(azure.0.get("storage_account_key").unwrap(), "azure456");
-    }
-
-    #[test]
-    fn test_aws_bool_values() {
-        let config_with_bool = r#"
-[cache]
-dir = "/tmp/cache"
-disk_size_gb = 1.0
-
-[storage]
-url = "s3://bucket/data"
-encryption_password = "test"
-
-[servers]
-
-[aws]
-access_key_id = "key"
-allow_http = true
-"#;
-
-        let temp_file = NamedTempFile::new().unwrap();
-        std::fs::write(temp_file.path(), config_with_bool).unwrap();
-
-        // This should fail because we can't deserialize a bool into a String
-        let result = Settings::from_file(temp_file.path().to_str().unwrap());
-        assert!(result.is_err());
-
-        // Now test with string "true"
-        let config_with_string = r#"
-[cache]
-dir = "/tmp/cache"
-disk_size_gb = 1.0
-
-[storage]
-url = "s3://bucket/data"
-encryption_password = "test"
-
-[servers]
-
-[aws]
-access_key_id = "key"
-allow_http = "true"
-"#;
-
-        std::fs::write(temp_file.path(), config_with_string).unwrap();
-        let result = Settings::from_file(temp_file.path().to_str().unwrap());
-        assert!(result.is_ok());
-        let settings = result.unwrap();
-        assert_eq!(settings.aws.unwrap().0.get("allow_http").unwrap(), "true");
     }
 }

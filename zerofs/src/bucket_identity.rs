@@ -1,4 +1,5 @@
-use slatedb::object_store::{ObjectStore, path::Path};
+use object_store::path::Path;
+use object_store::ObjectStore;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -30,7 +31,7 @@ impl BucketIdentity {
                 tracing::info!("Found existing bucket ID: {}", uuid);
                 uuid
             }
-            Err(slatedb::object_store::Error::NotFound { .. }) => {
+            Err(object_store::Error::NotFound { .. }) => {
                 tracing::debug!("Bucket ID marker not found, creating new one");
                 let new_id = Uuid::new_v4();
                 tracing::info!("Creating new bucket ID: {}", new_id);

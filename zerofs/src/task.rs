@@ -13,6 +13,7 @@ where
         .expect("failed to spawn task")
 }
 
+#[allow(dead_code)]
 pub fn spawn_named_on<T, F>(name: &str, future: F, handle: &Handle) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,

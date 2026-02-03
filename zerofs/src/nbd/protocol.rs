@@ -60,6 +60,7 @@ pub const NBD_SUCCESS: u32 = 0;
 pub const NBD_EIO: u32 = 5;
 pub const NBD_EINVAL: u32 = 22;
 pub const NBD_ENOSPC: u32 = 28;
+pub const NBD_EROFS: u32 = 30; // Read-only filesystem
 
 // Protocol sizes
 pub const NBD_EXPORT_NAME_PADDING: usize = 124;
@@ -67,7 +68,9 @@ pub const NBD_OPTION_HEADER_SIZE: usize = 16;
 pub const NBD_REQUEST_HEADER_SIZE: usize = 28;
 
 // Server configuration
+#[allow(dead_code)]
 pub const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
+#[allow(dead_code)]
 pub const NBD_ZERO_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]

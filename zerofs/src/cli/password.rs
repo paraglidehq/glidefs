@@ -1,6 +1,6 @@
 use crate::config::Settings;
 use crate::key_management;
-use slatedb::object_store::path::Path;
+use object_store::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]

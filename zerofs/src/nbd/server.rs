@@ -1,7 +1,12 @@
+//! NBD server implementation with multi-export support.
+//!
+//! This module provides a TCP/Unix socket NBD server that supports multiple
+//! exports, each with its own write-behind cache and S3 storage.
+
 use super::error::{NBDError, Result};
-use super::handler::{NBDDevice, NBDHandler, OptionReply, OptionResult};
+use super::handler::{NBDBlockHandler, NBDDevice};
 use super::protocol::*;
-use crate::fs::ZeroFS;
+use super::router::ExportRouter;
 use bytes::BytesMut;
 use deku::prelude::*;
 use std::net::SocketAddr;
@@ -16,22 +21,37 @@ pub enum Transport {
     Unix(std::path::PathBuf),
 }
 
+/// NBD server with multi-export support.
+///
+/// Uses an ExportRouter to manage multiple exports, each with independent
+/// storage and caching.
+///
+/// # Example
+/// ```ignore
+/// let router = Arc::new(ExportRouter::new(...));
+/// router.create_export(config, false).await?;
+///
+/// let server = NBDServer::new_tcp(router, "0.0.0.0:10809".parse()?);
+/// server.start(shutdown_token).await?;
+/// ```
 pub struct NBDServer {
-    filesystem: Arc<ZeroFS>,
+    router: Arc<ExportRouter>,
     transport: Transport,
 }
 
 impl NBDServer {
-    pub fn new_tcp(filesystem: Arc<ZeroFS>, socket: SocketAddr) -> Self {
+    /// Create a TCP NBD server.
+    pub fn new_tcp(router: Arc<ExportRouter>, socket: SocketAddr) -> Self {
         Self {
-            filesystem,
+            router,
             transport: Transport::Tcp(socket),
         }
     }
 
-    pub fn new_unix(filesystem: Arc<ZeroFS>, socket_path: impl Into<std::path::PathBuf>) -> Self {
+    /// Create a Unix socket NBD server.
+    pub fn new_unix(router: Arc<ExportRouter>, socket_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            filesystem,
+            router,
             transport: Transport::Unix(socket_path.into()),
         }
     }
@@ -40,16 +60,20 @@ impl NBDServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
-        let filesystem = Arc::clone(&self.filesystem);
+        let router = Arc::clone(&self.router);
         let client_shutdown = shutdown.child_token();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client_stream(stream, filesystem, client_shutdown).await {
+            if let Err(e) = handle_client_stream(stream, router, client_shutdown).await {
                 error!("Error handling NBD client {}: {}", client_name, e);
             }
         });
     }
 
+    /// Start the NBD server.
+    ///
+    /// This listens for connections and spawns a handler for each client.
+    /// Returns when the shutdown token is cancelled.
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
         match &self.transport {
             Transport::Tcp(socket) => {
@@ -105,7 +129,7 @@ impl NBDServer {
 
 async fn handle_client_stream<S>(
     stream: S,
-    filesystem: Arc<ZeroFS>,
+    router: Arc<ExportRouter>,
     shutdown: CancellationToken,
 ) -> Result<()>
 where
@@ -115,16 +139,16 @@ where
     let reader = BufReader::new(reader);
     let writer = BufWriter::new(writer);
 
-    let mut session = NBDSession::new(reader, writer, filesystem, shutdown);
+    let mut session = NBDSession::new(reader, writer, router, shutdown);
     session.perform_handshake().await?;
 
     match session.negotiate_options().await {
-        Ok(device) => {
+        Ok((device, handler)) => {
             info!(
-                "Client selected device: {}",
+                "Client selected export: {}",
                 String::from_utf8_lossy(&device.name)
             );
-            session.handle_transmission(device).await?;
+            session.handle_transmission(device, handler).await?;
         }
         Err(NBDError::Io(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             debug!("Client disconnected cleanly after option negotiation");
@@ -139,17 +163,22 @@ where
 struct NBDSession<R, W> {
     reader: R,
     writer: W,
-    handler: NBDHandler,
+    router: Arc<ExportRouter>,
     client_no_zeroes: bool,
     shutdown: CancellationToken,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
-    fn new(reader: R, writer: W, filesystem: Arc<ZeroFS>, shutdown: CancellationToken) -> Self {
+    fn new(
+        reader: R,
+        writer: W,
+        router: Arc<ExportRouter>,
+        shutdown: CancellationToken,
+    ) -> Self {
         Self {
             reader,
             writer,
-            handler: NBDHandler::new(filesystem),
+            router,
             client_no_zeroes: false,
             shutdown,
         }
@@ -176,13 +205,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         Ok(())
     }
 
-    async fn negotiate_options(&mut self) -> Result<NBDDevice> {
+    async fn negotiate_options(&mut self) -> Result<(NBDDevice, Arc<NBDBlockHandler>)> {
         loop {
             let mut header_buf = [0u8; NBD_OPTION_HEADER_SIZE];
             match self.reader.read_exact(&mut header_buf).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Client disconnected, this is normal after LIST
                     debug!("Client disconnected during option negotiation");
                     return Err(NBDError::Io(e));
                 }
@@ -215,10 +243,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 }
                 NBD_OPT_GO => {
                     match self.handle_go_option(header.length).await {
-                        Ok(device) => return Ok(device),
+                        Ok(result) => return Ok(result),
                         Err(NBDError::DeviceNotFound(_)) => {
                             // Device not found - stay in negotiation loop
-                            // Error reply already sent by handle_go_option
                         }
                         Err(e) => return Err(e),
                     }
@@ -247,31 +274,51 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
     async fn handle_list_option(&mut self, length: u32) -> Result<()> {
         self.drain_option_data(length).await?;
-        let result = self.handler.list().await;
-        self.process_option_result(NBD_OPT_LIST, result).await?;
+
+        // List all exports from router
+        let exports = self.router.list_exports().await;
+
+        for export in exports {
+            // Send NBD_REP_SERVER for each export
+            let name_bytes = export.name.as_bytes();
+            let mut data = Vec::with_capacity(4 + name_bytes.len());
+            data.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
+            data.extend_from_slice(name_bytes);
+
+            self.send_option_reply(NBD_OPT_LIST, NBD_REP_SERVER, &data)
+                .await?;
+        }
+
+        // Send final ACK
+        self.send_option_reply(NBD_OPT_LIST, NBD_REP_ACK, &[])
+            .await?;
+        self.writer.flush().await?;
         Ok(())
     }
 
-    async fn handle_export_name_option(&mut self, length: u32) -> Result<NBDDevice> {
+    async fn handle_export_name_option(
+        &mut self,
+        length: u32,
+    ) -> Result<(NBDDevice, Arc<NBDBlockHandler>)> {
         let mut name_buf = vec![0u8; length as usize];
         self.reader.read_exact(&mut name_buf).await?;
 
+        let export_name = String::from_utf8_lossy(&name_buf).to_string();
         debug!(
             "Client requested export: '{}' (length: {})",
-            String::from_utf8_lossy(&name_buf),
-            length
+            export_name, length
         );
 
-        // For NBD_OPT_EXPORT_NAME, we can't send an error reply
-        // We must either send the export info or close the connection
-        let device = self.handler.get_device(&name_buf).await.map_err(|e| {
-            error!(
-                "Export '{}' not found, closing connection: {:?}",
-                String::from_utf8_lossy(&name_buf),
-                e
-            );
+        // Look up handler from router
+        let handler = self.router.get_handler(&export_name).await.ok_or_else(|| {
+            error!("Export '{}' not found, closing connection", export_name);
             NBDError::DeviceNotFound(name_buf.clone())
         })?;
+
+        let device = NBDDevice {
+            name: name_buf,
+            size: handler.device_size(),
+        };
 
         self.writer.write_all(&device.size.to_be_bytes()).await?;
         self.writer
@@ -285,23 +332,115 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
 
         self.writer.flush().await?;
-        Ok(device)
+        Ok((device, handler))
     }
 
     async fn handle_info_option(&mut self, length: u32) -> Result<()> {
         let data = self.read_option_data(length).await?;
-        let result = self.handler.info(&data).await;
-        self.process_option_result(NBD_OPT_INFO, result).await?;
+
+        // Parse export name from data
+        if data.len() < 4 {
+            self.send_option_reply(NBD_OPT_INFO, NBD_REP_ERR_INVALID, &[])
+                .await?;
+            self.writer.flush().await?;
+            return Ok(());
+        }
+
+        let name_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + name_len {
+            self.send_option_reply(NBD_OPT_INFO, NBD_REP_ERR_INVALID, &[])
+                .await?;
+            self.writer.flush().await?;
+            return Ok(());
+        }
+
+        let export_name = String::from_utf8_lossy(&data[4..4 + name_len]).to_string();
+
+        // Look up handler
+        let handler = match self.router.get_handler(&export_name).await {
+            Some(h) => h,
+            None => {
+                self.send_option_reply(NBD_OPT_INFO, NBD_REP_ERR_UNKNOWN, &[])
+                    .await?;
+                self.writer.flush().await?;
+                return Ok(());
+            }
+        };
+
+        // Send NBD_INFO_EXPORT
+        let mut info_data = Vec::with_capacity(12);
+        info_data.extend_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
+        info_data.extend_from_slice(&handler.device_size().to_be_bytes());
+        info_data.extend_from_slice(&TRANSMISSION_FLAGS.to_be_bytes());
+
+        self.send_option_reply(NBD_OPT_INFO, NBD_REP_INFO, &info_data)
+            .await?;
+
+        // Send ACK
+        self.send_option_reply(NBD_OPT_INFO, NBD_REP_ACK, &[])
+            .await?;
+        self.writer.flush().await?;
         Ok(())
     }
 
-    async fn handle_go_option(&mut self, length: u32) -> Result<NBDDevice> {
+    async fn handle_go_option(
+        &mut self,
+        length: u32,
+    ) -> Result<(NBDDevice, Arc<NBDBlockHandler>)> {
         let data = self.read_option_data(length).await?;
-        let result = self.handler.go(&data).await;
-        match self.process_option_result(NBD_OPT_GO, result).await? {
-            Some(device) => Ok(device),
-            None => Err(NBDError::DeviceNotFound(Vec::new())),
+
+        // Parse export name
+        if data.len() < 4 {
+            self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_INVALID, &[])
+                .await?;
+            self.writer.flush().await?;
+            return Err(NBDError::DeviceNotFound(Vec::new()));
         }
+
+        let name_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + name_len {
+            self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_INVALID, &[])
+                .await?;
+            self.writer.flush().await?;
+            return Err(NBDError::DeviceNotFound(Vec::new()));
+        }
+
+        let name_bytes = &data[4..4 + name_len];
+        let export_name = String::from_utf8_lossy(name_bytes).to_string();
+
+        debug!("GO option for export: '{}'", export_name);
+
+        // Look up handler
+        let handler = match self.router.get_handler(&export_name).await {
+            Some(h) => h,
+            None => {
+                warn!("Export '{}' not found", export_name);
+                self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
+                    .await?;
+                self.writer.flush().await?;
+                return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
+            }
+        };
+
+        let device = NBDDevice {
+            name: name_bytes.to_vec(),
+            size: handler.device_size(),
+        };
+
+        // Send NBD_INFO_EXPORT
+        let mut info_data = Vec::with_capacity(12);
+        info_data.extend_from_slice(&NBD_INFO_EXPORT.to_be_bytes());
+        info_data.extend_from_slice(&device.size.to_be_bytes());
+        info_data.extend_from_slice(&TRANSMISSION_FLAGS.to_be_bytes());
+
+        self.send_option_reply(NBD_OPT_GO, NBD_REP_INFO, &info_data)
+            .await?;
+
+        // Send ACK
+        self.send_option_reply(NBD_OPT_GO, NBD_REP_ACK, &[]).await?;
+        self.writer.flush().await?;
+
+        Ok((device, handler))
     }
 
     async fn handle_structured_reply_option(&mut self, length: u32) -> Result<()> {
@@ -312,51 +451,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         Ok(())
     }
 
-    /// Read option data from the stream
     async fn read_option_data(&mut self, length: u32) -> Result<Vec<u8>> {
         let mut data = vec![0u8; length as usize];
         self.reader.read_exact(&mut data).await?;
         Ok(data)
     }
 
-    /// Drain any remaining option data from the reader
     async fn drain_option_data(&mut self, length: u32) -> Result<()> {
         if length > 0 {
             let mut buf = vec![0u8; length as usize];
             self.reader.read_exact(&mut buf).await?;
         }
-        Ok(())
-    }
-
-    /// Process option result from handler - send replies and return device if done
-    async fn process_option_result(
-        &mut self,
-        option: u32,
-        result: OptionResult,
-    ) -> Result<Option<NBDDevice>> {
-        match result {
-            OptionResult::Continue(replies) => {
-                self.send_option_replies(option, &replies).await?;
-                Ok(None)
-            }
-            OptionResult::Done(device, replies) => {
-                self.send_option_replies(option, &replies).await?;
-                Ok(Some(device))
-            }
-            OptionResult::Error(err, replies) => {
-                self.send_option_replies(option, &replies).await?;
-                Err(err)
-            }
-        }
-    }
-
-    /// Send multiple option replies and flush
-    async fn send_option_replies(&mut self, option: u32, replies: &[OptionReply]) -> Result<()> {
-        for reply in replies {
-            self.send_option_reply(option, reply.reply_type, &reply.data)
-                .await?;
-        }
-        self.writer.flush().await?;
         Ok(())
     }
 
@@ -370,7 +475,13 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         Ok(())
     }
 
-    async fn handle_transmission(&mut self, device: NBDDevice) -> Result<()> {
+    async fn handle_transmission(
+        &mut self,
+        device: NBDDevice,
+        handler: Arc<NBDBlockHandler>,
+    ) -> Result<()> {
+        let device_size = device.size;
+
         loop {
             let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
 
@@ -397,21 +508,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
             match request.cmd_type {
                 NBDCommand::Read => {
-                    let result = self
-                        .handler
-                        .read(device.inode, request.offset, request.length, device.size)
-                        .await;
+                    let result = handler.read(request.offset, request.length).await;
                     self.send_read_result(request.cookie, result).await;
                 }
                 NBDCommand::Write => {
                     let result = self
-                        .read_write_data(
-                            device.inode,
-                            request.offset,
-                            request.length,
-                            fua,
-                            device.size,
-                        )
+                        .read_write_data(&handler, request.offset, request.length, fua, device_size)
                         .await;
                     self.send_unit_result(request.cookie, result).await;
                 }
@@ -420,40 +522,19 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     return Ok(());
                 }
                 NBDCommand::Flush => {
-                    let result = self.handler.flush().await;
+                    let result = handler.flush();
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::Trim => {
-                    let result = self
-                        .handler
-                        .trim(
-                            device.inode,
-                            request.offset,
-                            request.length,
-                            fua,
-                            device.size,
-                        )
-                        .await;
+                    let result = handler.trim(request.offset, request.length, fua);
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::WriteZeroes => {
-                    let result = self
-                        .handler
-                        .write_zeroes(
-                            device.inode,
-                            request.offset,
-                            request.length,
-                            fua,
-                            device.size,
-                        )
-                        .await;
+                    let result = handler.write_zeroes(request.offset, request.length, fua);
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::Cache => {
-                    let result = self
-                        .handler
-                        .cache(request.offset, request.length, device.size)
-                        .await;
+                    let result = handler.cache(request.offset, request.length);
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::Unknown(cmd) => {
@@ -468,10 +549,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
     }
 
-    /// Read write data from stream and delegate to handler
     async fn read_write_data(
         &mut self,
-        inode: u64,
+        handler: &NBDBlockHandler,
         offset: u64,
         length: u32,
         fua: bool,
@@ -479,7 +559,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     ) -> super::error::CommandResult<()> {
         use super::error::CommandError;
 
-        // Check for out-of-bounds write - must read and discard data first
         if offset + length as u64 > device_size {
             let mut data = BytesMut::zeroed(length as usize);
             let _ = self.reader.read_exact(&mut data).await;
@@ -496,11 +575,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             .await
             .map_err(|_| CommandError::IoError)?;
 
-        let data = data.freeze();
-        self.handler.write(inode, offset, &data, fua).await
+        handler.write(offset, &data, fua)
     }
 
-    /// Send read result (with data) as NBD reply
     async fn send_read_result(
         &mut self,
         cookie: u64,
@@ -518,7 +595,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
     }
 
-    /// Send unit result (no data) as NBD reply
     async fn send_unit_result(&mut self, cookie: u64, result: super::error::CommandResult<()>) {
         match result {
             Ok(()) => {

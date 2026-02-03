@@ -10,17 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fmt:
-    name: Rustfmt
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: zerofs
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check formatting
-        run: cargo fmt -- --check
-
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

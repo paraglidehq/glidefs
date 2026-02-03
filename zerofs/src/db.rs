@@ -5,6 +5,7 @@
 //! just passes through operations.
 
 use crate::fs::errors::FsError;
+use crate::fs::write_coordinator::{SequenceGuard, WriteCoordinator};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -46,36 +47,121 @@ pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
-/// Transaction for batching database writes.
-pub struct Transaction {
-    inner: WriteBatch,
+/// Trait for types that can accumulate transaction mutations.
+///
+/// This allows store methods to work with both `Txn<Open>` (for sequenced
+/// filesystem operations) and `WriteBatch` (for unsequenced operations like GC).
+pub trait TransactionMut {
+    fn put_bytes(&mut self, key: &Bytes, value: Bytes);
+    fn delete_bytes(&mut self, key: &Bytes);
 }
 
-impl Transaction {
-    pub fn new() -> Self {
+impl TransactionMut for WriteBatch {
+    fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
+        self.put(key, &value);
+    }
+
+    fn delete_bytes(&mut self, key: &Bytes) {
+        self.delete(key);
+    }
+}
+
+// ============================================================================
+// Typestate Transaction API
+// ============================================================================
+
+/// Transaction state: open for mutations (put/delete operations).
+pub struct Open {
+    coordinator: Arc<WriteCoordinator>,
+}
+
+/// Transaction state: sequenced and ready to commit (no more mutations allowed).
+pub struct Sequenced {
+    guard: SequenceGuard,
+}
+
+/// A typestate transaction that combines WriteBatch with WriteCoordinator sequencing.
+///
+/// This provides compile-time enforcement of the transaction lifecycle:
+/// - `Txn<Open>`: Can call `put_bytes()`, `delete_bytes()`, then `sequence()`
+/// - `Txn<Sequenced>`: Can only call `commit()` (or drop to auto-abandon)
+///
+/// # Example
+/// ```ignore
+/// let mut txn = fs.begin_txn()?;
+/// store.save(&mut txn, id, &data)?;
+/// txn.sequence().commit(&db).await?;
+/// ```
+pub struct Txn<S> {
+    batch: WriteBatch,
+    db: Arc<Db>,
+    state: S,
+}
+
+impl Txn<Open> {
+    /// Create a new transaction in the Open state.
+    pub(crate) fn new(db: Arc<Db>, coordinator: Arc<WriteCoordinator>) -> Self {
         Self {
-            inner: WriteBatch::new(),
+            batch: WriteBatch::new(),
+            db,
+            state: Open { coordinator },
         }
     }
 
-    pub fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
-        self.inner.put(key, &value);
+    /// Acquire a sequence number and transition to Sequenced state.
+    ///
+    /// After calling this, no more mutations are allowed. The transaction
+    /// must be committed or it will be automatically abandoned on drop.
+    pub fn sequence(self) -> Txn<Sequenced> {
+        let guard = self.state.coordinator.allocate_sequence();
+        Txn {
+            batch: self.batch,
+            db: self.db,
+            state: Sequenced { guard },
+        }
+    }
+}
+
+impl TransactionMut for Txn<Open> {
+    fn put_bytes(&mut self, key: &Bytes, value: Bytes) {
+        self.batch.put(key, &value);
     }
 
-    pub fn delete_bytes(&mut self, key: &Bytes) {
-        self.inner.delete(key);
-    }
-
-    pub fn into_inner(self) -> WriteBatch {
-        self.inner
+    fn delete_bytes(&mut self, key: &Bytes) {
+        self.batch.delete(key);
     }
 }
 
-impl Default for Transaction {
-    fn default() -> Self {
-        Self::new()
+impl Txn<Sequenced> {
+    /// Wait for predecessors and commit the transaction.
+    ///
+    /// This consumes the transaction to prevent use after commit.
+    /// On success, the sequence is marked committed.
+    /// On error (or if dropped without calling commit), the sequence is marked abandoned.
+    pub async fn commit(mut self) -> Result<(), FsError> {
+        // Wait for all preceding sequences to complete
+        self.state.guard.wait_for_predecessors().await;
+
+        // Write batch to database
+        self.db
+            .write_with_options(
+                std::mem::take(&mut self.batch),
+                &WriteOptions {
+                    await_durable: false,
+                },
+            )
+            .await
+            .map_err(|_| FsError::IoError)?;
+
+        // Mark committed - this prevents Drop from marking abandoned
+        self.state.guard.mark_committed();
+
+        Ok(())
     }
 }
+
+// Note: We don't need a custom Drop for Txn<Sequenced> because SequenceGuard
+// already handles marking as abandoned if not committed.
 
 /// Database wrapper providing a unified interface for SlateDB operations.
 ///
@@ -185,13 +271,6 @@ impl Db {
         }
 
         Ok(())
-    }
-
-    pub fn new_transaction(&self) -> Result<Transaction, FsError> {
-        if self.is_read_only() {
-            return Err(FsError::ReadOnlyFilesystem);
-        }
-        Ok(Transaction::new())
     }
 
     pub async fn put_with_options(

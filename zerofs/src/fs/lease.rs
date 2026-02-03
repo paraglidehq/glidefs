@@ -152,15 +152,36 @@ pub enum LeaseError {
     LeaseExpired,
 
     #[error("Path not found: {0}")]
+    #[allow(dead_code)] // Available for future use
     PathNotFound(String),
+
+    #[error("Invalid handoff state: {0}")]
+    InvalidHandoffState(String),
 }
 
 /// Held lease state including ETag for conditional updates
 struct HeldPathLease {
-    path: String,
     inode_id: InodeId,
     lease: WriterLease,
     etag: Option<String>,
+}
+
+/// A token proving that `prepare_handoff` was called for a specific path.
+///
+/// This token is REQUIRED by `complete_handoff`. You cannot complete a handoff
+/// without first preparing it - this is enforced at compile time.
+///
+/// The token is consumed by `complete_handoff`, so you can only complete once.
+#[must_use = "PreparedHandoff must be passed to complete_handoff to finish the handoff"]
+pub struct PreparedHandoff {
+    path: String,
+}
+
+impl PreparedHandoff {
+    /// Get the path this handoff is for.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
 }
 
 /// Coordinates per-path writer leases for single-writer semantics.
@@ -178,6 +199,11 @@ pub struct LeaseCoordinator {
     /// Inodes with blocked writes (populated during prepare_handoff)
     /// pub to allow testing from integration tests
     pub blocked_inodes: DashSet<InodeId>,
+
+    /// Pending handoff tokens stored after prepare_handoff.
+    /// This allows RPC handlers to complete handoffs without carrying tokens
+    /// across request boundaries, while still enforcing the prepare→complete protocol.
+    pending_handoffs: DashMap<String, PreparedHandoff>,
 
     /// Sender for lease state changes (path, state)
     state_sender: watch::Sender<Option<(String, LeaseState)>>,
@@ -203,6 +229,7 @@ impl LeaseCoordinator {
             config,
             held_leases: DashMap::new(),
             blocked_inodes: DashSet::new(),
+            pending_handoffs: DashMap::new(),
             state_sender,
             state_receiver,
         }
@@ -271,7 +298,6 @@ impl LeaseCoordinator {
         self.held_leases.insert(
             path.to_string(),
             HeldPathLease {
-                path: path.to_string(),
                 inode_id,
                 lease,
                 etag,
@@ -290,12 +316,15 @@ impl LeaseCoordinator {
     /// 2. Update lease state to Releasing in S3
     /// 3. Drain in-flight writes
     /// 4. Flush data
-    pub async fn prepare_handoff_path(
+    ///
+    /// Returns a [`PreparedHandoff`] token that MUST be passed to [`complete_handoff`]
+    /// to finish the handoff. This enforces correct protocol at compile time.
+    pub async fn prepare_handoff(
         &self,
         path: &str,
         write_coordinator: &Arc<WriteCoordinator>,
         flush_coordinator: &FlushCoordinator,
-    ) -> Result<(), LeaseError> {
+    ) -> Result<PreparedHandoff, LeaseError> {
         info!("Preparing handoff for path: {}", path);
 
         let lease_path = self.path_to_lease_path(path);
@@ -349,14 +378,33 @@ impl LeaseCoordinator {
 
         debug!("Handoff prepared for path {}, inode {}", path, inode_id);
 
-        Ok(())
+        // Store in pending_handoffs - this is the source of truth that prepare was called.
+        // Both complete_handoff(token) and complete_handoff_by_path() will check this.
+        let token = PreparedHandoff {
+            path: path.to_string(),
+        };
+        self.pending_handoffs.insert(path.to_string(), PreparedHandoff {
+            path: path.to_string(),
+        });
+
+        // Return token for callers who want compile-time enforcement
+        Ok(token)
     }
 
-    /// Complete the handoff for a specific path.
+    /// Complete the handoff for a prepared path.
     ///
-    /// After this, another node can acquire the lease for this path.
-    pub async fn complete_handoff_path(&self, path: &str) -> Result<(), LeaseError> {
+    /// This method REQUIRES a [`PreparedHandoff`] token, which can only be obtained
+    /// by calling [`prepare_handoff`]. This enforces at compile time that you cannot
+    /// complete a handoff without first preparing it.
+    ///
+    /// After this returns, another node can acquire the lease for this path.
+    pub async fn complete_handoff(&self, prepared: PreparedHandoff) -> Result<(), LeaseError> {
+        let path = &prepared.path;
         info!("Completing handoff for path: {}", path);
+
+        // Remove from pending_handoffs (token proves prepare was called,
+        // but we also clean up the stored entry)
+        self.pending_handoffs.remove(path);
 
         let lease_path = self.path_to_lease_path(path);
 
@@ -366,6 +414,8 @@ impl LeaseCoordinator {
 
         let held = entry.value_mut();
 
+        // This check is now redundant (prepare_handoff guarantees Releasing state)
+        // but we keep it for defense in depth
         if held.lease.state != LeaseState::Releasing {
             return Err(LeaseError::WrongState {
                 expected: LeaseState::Releasing,
@@ -382,6 +432,59 @@ impl LeaseCoordinator {
         let _ = self.state_sender.send(Some((path.to_string(), LeaseState::Released)));
 
         info!("Handoff complete for path {}: lease released", path);
+
+        // Token is consumed here - cannot be reused
+        drop(prepared);
+
+        Ok(())
+    }
+
+    /// Complete handoff by path (for RPC use).
+    ///
+    /// This method is for RPC handlers where we can't pass tokens between requests.
+    /// It validates that `prepare_handoff` was called by checking the internal
+    /// `pending_handoffs` map, ensuring the prepare→complete protocol is enforced
+    /// even across RPC request boundaries.
+    ///
+    /// For internal/SDK use, prefer the token-based [`complete_handoff`] method
+    /// which provides compile-time enforcement.
+    pub async fn complete_handoff_by_path(&self, path: &str) -> Result<(), LeaseError> {
+        info!("Completing handoff for path (RPC): {}", path);
+
+        // Verify and consume the pending handoff token.
+        // This ensures prepare_handoff was called before complete_handoff.
+        let _token = self
+            .pending_handoffs
+            .remove(path)
+            .ok_or_else(|| LeaseError::InvalidHandoffState(
+                format!("No pending handoff for path '{}'. Call prepare_handoff first.", path)
+            ))?;
+
+        let lease_path = self.path_to_lease_path(path);
+
+        let mut entry = self.held_leases
+            .get_mut(path)
+            .ok_or_else(|| LeaseError::LeaseNotHeld(path.to_string()))?;
+
+        let held = entry.value_mut();
+
+        // Additional runtime validation - should always pass if pending_handoffs was set
+        if held.lease.state != LeaseState::Releasing {
+            return Err(LeaseError::WrongState {
+                expected: LeaseState::Releasing,
+                actual: held.lease.state,
+            });
+        }
+
+        held.lease.state = LeaseState::Released;
+        held.lease.version += 1;
+
+        let new_etag = self.write_lease_conditional(&lease_path, &held.lease, held.etag.as_deref()).await?;
+        held.etag = new_etag;
+
+        let _ = self.state_sender.send(Some((path.to_string(), LeaseState::Released)));
+
+        info!("Handoff complete for path {}: lease released (RPC)", path);
 
         Ok(())
     }
@@ -471,6 +574,46 @@ impl LeaseCoordinator {
     /// Check if this coordinator holds a lease for the given path.
     pub fn holds_lease_for(&self, path: &str) -> bool {
         self.held_leases.contains_key(path)
+    }
+
+    /// Perform a complete handoff in a single operation.
+    ///
+    /// This is a convenience method that does the full handoff sequence:
+    /// 1. Acquire lease for the path
+    /// 2. Prepare handoff (blocks writes, drains, flushes) - returns a token
+    /// 3. Complete handoff with that token - releases the lease
+    ///
+    /// The `prepare_handoff` → `complete_handoff` sequence uses compile-time
+    /// enforcement: `complete_handoff` REQUIRES the `PreparedHandoff` token
+    /// which can only be obtained from `prepare_handoff`.
+    ///
+    /// After this method returns, another node can acquire the lease for this path.
+    pub async fn perform_full_handoff(
+        &self,
+        path: &str,
+        inode_id: InodeId,
+        write_coordinator: &Arc<WriteCoordinator>,
+        flush_coordinator: &FlushCoordinator,
+    ) -> Result<(), LeaseError> {
+        info!("Performing full handoff for path: {}", path);
+
+        // Step 1: Acquire the lease
+        self.acquire_path(path, inode_id).await?;
+        info!("Acquired lease for {}", path);
+
+        // Step 2: Prepare handoff - returns PreparedHandoff token
+        // You CANNOT skip this step and call complete directly
+        let prepared = self
+            .prepare_handoff(path, write_coordinator, flush_coordinator)
+            .await?;
+        info!("Prepared handoff for {}", prepared.path());
+
+        // Step 3: Complete handoff - REQUIRES the token from prepare
+        // This is compile-time enforced: no token = no complete = compile error
+        self.complete_handoff(prepared).await?;
+        info!("Completed handoff for {}", path);
+
+        Ok(())
     }
 
     /// Start a background task that periodically renews all held leases.
@@ -628,156 +771,9 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-// ============================================================================
-// TYPESTATE MODULE - Compile-time safe handoff protocol
-// ============================================================================
-
-/// Typestate pattern for compile-time enforcement of the handoff protocol.
-///
-/// This module provides a type-safe wrapper around the lease coordinator that
-/// uses Rust's type system to prevent invalid state transitions at compile time.
-///
-/// # Example
-///
-/// ```ignore
-/// use zerofs::fs::lease::typestate::*;
-///
-/// // Acquire returns an Active lease - you can ONLY call prepare_handoff on it
-/// let active: PathLease<Active> = coordinator.acquire_typed(path, inode_id).await?;
-///
-/// // prepare_handoff consumes Active and returns Releasing
-/// let releasing: PathLease<Releasing> = active.prepare_handoff(...).await?;
-///
-/// // complete_handoff consumes Releasing and returns Released
-/// let released: PathLease<Released> = releasing.complete_handoff().await?;
-///
-/// // This would NOT compile - you can't call complete_handoff on Active:
-/// // let released = active.complete_handoff().await; // ERROR!
-/// ```
-pub mod typestate {
-    use super::*;
-    use std::marker::PhantomData;
-
-    /// Marker type for Active state - lease is held, writes are allowed
-    pub struct Active;
-
-    /// Marker type for Releasing state - writes are blocked, preparing for handoff
-    pub struct Releasing;
-
-    /// Marker type for Released state - lease is released, another node can acquire
-    pub struct Released;
-
-    /// A compile-time safe handle to a lease in a specific state.
-    ///
-    /// The state parameter `S` encodes what operations are valid:
-    /// - `PathLease<Active>`: Can call `prepare_handoff()` or `release()`
-    /// - `PathLease<Releasing>`: Can call `complete_handoff()`
-    /// - `PathLease<Released>`: Terminal state, no further operations
-    pub struct PathLease<S> {
-        path: String,
-        inode_id: InodeId,
-        _state: PhantomData<S>,
-    }
-
-    impl<S> PathLease<S> {
-        /// Get the path this lease is for
-        pub fn path(&self) -> &str {
-            &self.path
-        }
-
-        /// Get the inode ID this lease protects
-        pub fn inode_id(&self) -> InodeId {
-            self.inode_id
-        }
-    }
-
-    impl PathLease<Active> {
-        /// Create a new Active lease handle (internal use only).
-        pub(super) fn new(path: String, inode_id: InodeId) -> Self {
-            PathLease {
-                path,
-                inode_id,
-                _state: PhantomData,
-            }
-        }
-
-        /// Prepare for handoff, transitioning from Active to Releasing.
-        ///
-        /// This will:
-        /// 1. Block writes to the inode
-        /// 2. Drain in-flight writes
-        /// 3. Flush data to S3
-        /// 4. Update lease state to Releasing
-        ///
-        /// Consumes the Active lease and returns a Releasing lease.
-        pub async fn prepare_handoff(
-            self,
-            coordinator: &LeaseCoordinator,
-            write_coordinator: &Arc<WriteCoordinator>,
-            flush_coordinator: &FlushCoordinator,
-        ) -> Result<PathLease<Releasing>, LeaseError> {
-            coordinator
-                .prepare_handoff_path(&self.path, write_coordinator, flush_coordinator)
-                .await?;
-
-            Ok(PathLease {
-                path: self.path,
-                inode_id: self.inode_id,
-                _state: PhantomData,
-            })
-        }
-
-        /// Release the lease without handoff (for normal shutdown).
-        ///
-        /// Consumes the Active lease - use when not doing a coordinated handoff.
-        pub async fn release(self, coordinator: &LeaseCoordinator) -> Result<(), LeaseError> {
-            coordinator.release_path(&self.path).await
-        }
-    }
-
-    impl PathLease<Releasing> {
-        /// Complete the handoff, transitioning from Releasing to Released.
-        ///
-        /// After this, another node can acquire the lease for this path.
-        ///
-        /// Consumes the Releasing lease and returns a Released lease.
-        pub async fn complete_handoff(
-            self,
-            coordinator: &LeaseCoordinator,
-        ) -> Result<PathLease<Released>, LeaseError> {
-            coordinator.complete_handoff_path(&self.path).await?;
-
-            Ok(PathLease {
-                path: self.path,
-                inode_id: self.inode_id,
-                _state: PhantomData,
-            })
-        }
-    }
-
-    impl PathLease<Released> {
-        /// The lease is released - this is a terminal state.
-        /// Another node can now acquire this path.
-        pub fn into_path(self) -> String {
-            self.path
-        }
-    }
-
-    impl LeaseCoordinator {
-        /// Acquire a lease with typestate safety.
-        ///
-        /// Returns a `PathLease<Active>` which can only transition through
-        /// valid states at compile time.
-        pub async fn acquire_typed(
-            &self,
-            path: &str,
-            inode_id: InodeId,
-        ) -> Result<PathLease<Active>, LeaseError> {
-            self.acquire_path(path, inode_id).await?;
-            Ok(PathLease::new(path.to_string(), inode_id))
-        }
-    }
-}
+// Note: Compile-time handoff enforcement is achieved through the PreparedHandoff token.
+// The prepare_handoff() method returns this token, and complete_handoff() REQUIRES it.
+// This makes it impossible to call complete without first calling prepare - enforced at compile time.
 
 #[cfg(test)]
 mod tests {
@@ -916,9 +912,9 @@ mod tests {
         let write_coordinator = create_mock_write_coordinator();
         let flush_coordinator = create_mock_flush_coordinator();
 
-        // Prepare handoff
-        coordinator_a
-            .prepare_handoff_path("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+        // Prepare handoff - returns a token that MUST be passed to complete_handoff
+        let prepared = coordinator_a
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
             .await
             .unwrap();
 
@@ -926,8 +922,8 @@ mod tests {
         assert_eq!(status.state, LeaseState::Releasing);
         assert!(coordinator_a.is_inode_blocked(42));
 
-        // Complete handoff
-        coordinator_a.complete_handoff_path("/.nbd/vm-1.raw").await.unwrap();
+        // Complete handoff - REQUIRES the token from prepare_handoff (compile-time enforced)
+        coordinator_a.complete_handoff(prepared).await.unwrap();
 
         let status = coordinator_a.get_path_status("/.nbd/vm-1.raw").unwrap();
         assert_eq!(status.state, LeaseState::Released);
@@ -958,9 +954,9 @@ mod tests {
         let write_coordinator = create_mock_write_coordinator();
         let flush_coordinator = create_mock_flush_coordinator();
 
-        // Handoff only vm-1
-        coordinator
-            .prepare_handoff_path("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+        // Handoff only vm-1 - returns token (we don't complete in this test)
+        let _prepared = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
             .await
             .unwrap();
 
@@ -983,14 +979,14 @@ mod tests {
         let write_coordinator = create_mock_write_coordinator();
         let flush_coordinator = create_mock_flush_coordinator();
 
-        coordinator
-            .prepare_handoff_path("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+        let _prepared = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
             .await
             .unwrap();
 
         assert!(coordinator.is_inode_blocked(42));
 
-        // Release should unblock
+        // Release should unblock (even though we have a prepared token)
         coordinator.release_path("/.nbd/vm-1.raw").await.unwrap();
         assert!(!coordinator.is_inode_blocked(42));
         assert!(!coordinator.holds_lease_for("/.nbd/vm-1.raw"));
@@ -1044,15 +1040,17 @@ mod tests {
         let write_coordinator = create_mock_write_coordinator();
         let flush_coordinator = create_mock_flush_coordinator();
 
-        coordinator_a
-            .prepare_handoff_path("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+        // Prepare handoff returns a token
+        let prepared = coordinator_a
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
             .await
             .unwrap();
 
         let v2 = coordinator_a.get_path_status("/.nbd/vm-1.raw").unwrap().version;
         assert!(v2 > v1);
 
-        coordinator_a.complete_handoff_path("/.nbd/vm-1.raw").await.unwrap();
+        // Complete handoff requires the token (compile-time enforced)
+        coordinator_a.complete_handoff(prepared).await.unwrap();
 
         let v3 = coordinator_a.get_path_status("/.nbd/vm-1.raw").unwrap().version;
         assert!(v3 > v2);
@@ -1065,10 +1063,14 @@ mod tests {
         assert!(v4 > v3);
     }
 
+    /// Test that the token-based API enforces correct handoff ordering.
+    ///
+    /// This test demonstrates that:
+    /// - prepare_handoff() returns a PreparedHandoff token
+    /// - complete_handoff() REQUIRES that token - you cannot call it without one
+    /// - This is compile-time enforcement: no token = no complete = compile error
     #[tokio::test]
-    async fn test_typestate_handoff_flow() {
-        use super::typestate::*;
-
+    async fn test_token_enforces_handoff_ordering() {
         let store = create_test_store();
         let coordinator = LeaseCoordinator::new(
             Arc::clone(&store),
@@ -1076,59 +1078,53 @@ mod tests {
             create_test_config("node-a"),
         );
 
-        // Acquire using typestate API - returns PathLease<Active>
-        let active_lease: PathLease<Active> = coordinator
-            .acquire_typed("/.nbd/vm-1.raw", 42)
-            .await
-            .unwrap();
-
-        assert_eq!(active_lease.path(), "/.nbd/vm-1.raw");
-        assert_eq!(active_lease.inode_id(), 42);
+        coordinator.acquire_path("/.nbd/vm-1.raw", 42).await.unwrap();
 
         let write_coordinator = create_mock_write_coordinator();
         let flush_coordinator = create_mock_flush_coordinator();
 
-        // Prepare handoff - consumes Active, returns Releasing
-        // (trying to call complete_handoff on active_lease would be a compile error)
-        let releasing_lease: PathLease<Releasing> = active_lease
-            .prepare_handoff(&coordinator, &write_coordinator, &flush_coordinator)
+        // Step 1: prepare_handoff returns a token
+        let prepared: PreparedHandoff = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
             .await
             .unwrap();
 
-        assert!(coordinator.is_inode_blocked(42));
+        // The token knows what path it's for
+        assert_eq!(prepared.path(), "/.nbd/vm-1.raw");
 
-        // Complete handoff - consumes Releasing, returns Released
-        // (trying to call prepare_handoff on releasing_lease would be a compile error)
-        let released_lease: PathLease<Released> = releasing_lease
-            .complete_handoff(&coordinator)
-            .await
-            .unwrap();
+        // Step 2: complete_handoff REQUIRES the token
+        // Without this token, you cannot call complete_handoff - this is compile-time enforced
+        coordinator.complete_handoff(prepared).await.unwrap();
 
-        let released_path = released_lease.into_path();
-        assert_eq!(released_path, "/.nbd/vm-1.raw");
-
-        // Verify the state
+        // Verify the handoff completed
         let status = coordinator.get_path_status("/.nbd/vm-1.raw").unwrap();
         assert_eq!(status.state, LeaseState::Released);
     }
 
     #[tokio::test]
-    async fn test_typestate_release_without_handoff() {
-        use super::typestate::*;
-
+    async fn test_complete_handoff_by_path_requires_prepare() {
         let store = create_test_store();
         let coordinator = LeaseCoordinator::new(store, "test-db", create_test_config("node-a"));
 
-        // Acquire using typestate API
-        let active_lease = coordinator
-            .acquire_typed("/.nbd/vm-1.raw", 42)
-            .await
-            .unwrap();
+        // Acquire a lease
+        coordinator.acquire_path("/.nbd/vm-1.raw", 42).await.unwrap();
+        assert!(coordinator.holds_lease_for("/.nbd/vm-1.raw"));
 
-        // Release directly (for normal shutdown, not handoff)
-        active_lease.release(&coordinator).await.unwrap();
+        // Try to complete handoff without calling prepare_handoff first
+        let result = coordinator.complete_handoff_by_path("/.nbd/vm-1.raw").await;
 
-        // Lease should be released
-        assert!(!coordinator.holds_lease_for("/.nbd/vm-1.raw"));
+        // Should fail with InvalidHandoffState because prepare_handoff wasn't called
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LeaseError::InvalidHandoffState(msg) => {
+                assert!(msg.contains("No pending handoff"));
+                assert!(msg.contains("prepare_handoff"));
+            }
+            other => panic!("Expected InvalidHandoffState, got: {:?}", other),
+        }
+
+        // Lease should still be Active (not Released)
+        let status = coordinator.get_path_status("/.nbd/vm-1.raw").unwrap();
+        assert_eq!(status.state, LeaseState::Active);
     }
 }

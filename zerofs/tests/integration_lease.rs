@@ -125,12 +125,12 @@ async fn test_per_path_graceful_handoff() {
     assert_eq!(status_a.holder_name, "node-a");
     assert_eq!(status_a.path, path);
 
-    // Node A prepares for handoff
+    // Node A prepares for handoff - returns token for compile-time enforcement
     let write_coordinator = create_mock_write_coordinator();
     let flush_coordinator = create_mock_flush_coordinator();
 
-    node_a
-        .prepare_handoff_path(path, &write_coordinator, &flush_coordinator)
+    let prepared = node_a
+        .prepare_handoff(path, &write_coordinator, &flush_coordinator)
         .await
         .expect("Prepare handoff should succeed");
 
@@ -138,9 +138,9 @@ async fn test_per_path_graceful_handoff() {
     let status_a = node_a.get_path_status(path).expect("Should have status");
     assert_eq!(status_a.state, LeaseState::Releasing);
 
-    // Node A completes handoff
+    // Node A completes handoff - REQUIRES the token from prepare (compile-time enforced)
     node_a
-        .complete_handoff_path(path)
+        .complete_handoff(prepared)
         .await
         .expect("Complete handoff should succeed");
 
@@ -201,8 +201,8 @@ async fn test_multiple_independent_paths() {
     let write_coordinator = create_mock_write_coordinator();
     let flush_coordinator = create_mock_flush_coordinator();
 
-    coordinator
-        .prepare_handoff_path(path1, &write_coordinator, &flush_coordinator)
+    let prepared1 = coordinator
+        .prepare_handoff(path1, &write_coordinator, &flush_coordinator)
         .await
         .expect("Prepare handoff for path1 should succeed");
 
@@ -214,8 +214,8 @@ async fn test_multiple_independent_paths() {
     let status2 = coordinator.get_path_status(path2).expect("Should have status for path2");
     assert_eq!(status2.state, LeaseState::Active);
 
-    // Complete handoff for path1
-    coordinator.complete_handoff_path(path1).await.expect("Complete should succeed");
+    // Complete handoff for path1 - requires the token
+    coordinator.complete_handoff(prepared1).await.expect("Complete should succeed");
 
     let status1 = coordinator.get_path_status(path1).expect("Should have status for path1");
     assert_eq!(status1.state, LeaseState::Released);
@@ -250,14 +250,14 @@ async fn test_handoff_timing_under_500ms() {
     // Measure handoff time
     let start = Instant::now();
 
-    // Phase 1: Prepare handoff
-    node_a
-        .prepare_handoff_path(path, &write_coordinator, &flush_coordinator)
+    // Phase 1: Prepare handoff - returns token
+    let prepared = node_a
+        .prepare_handoff(path, &write_coordinator, &flush_coordinator)
         .await
         .unwrap();
 
-    // Phase 2: Complete handoff
-    node_a.complete_handoff_path(path).await.unwrap();
+    // Phase 2: Complete handoff - requires token
+    node_a.complete_handoff(prepared).await.unwrap();
 
     // Phase 3: New node acquires
     let node_b = Arc::new(LeaseCoordinator::new(
@@ -346,15 +346,15 @@ async fn test_version_monotonic_increase() {
     // Prepare handoff increments version
     let write_coordinator = create_mock_write_coordinator();
     let flush_coordinator = create_mock_flush_coordinator();
-    node_a
-        .prepare_handoff_path(path, &write_coordinator, &flush_coordinator)
+    let prepared = node_a
+        .prepare_handoff(path, &write_coordinator, &flush_coordinator)
         .await
         .unwrap();
     let v2 = node_a.get_path_status(path).unwrap().version;
     assert!(v2 > v1, "Prepare handoff should increment version");
 
     // Complete handoff increments version
-    node_a.complete_handoff_path(path).await.unwrap();
+    node_a.complete_handoff(prepared).await.unwrap();
     let v3 = node_a.get_path_status(path).unwrap().version;
     assert!(v3 > v2, "Complete handoff should increment version");
 
@@ -397,13 +397,13 @@ async fn test_multiple_handoff_cycles() {
         assert!(coordinator.holds_lease_for(path));
 
         let flush_coordinator = create_mock_flush_coordinator();
-        coordinator
-            .prepare_handoff_path(path, &write_coordinator, &flush_coordinator)
+        let prepared = coordinator
+            .prepare_handoff(path, &write_coordinator, &flush_coordinator)
             .await
             .expect(&format!("Cycle {}: prepare should succeed", cycle));
 
         coordinator
-            .complete_handoff_path(path)
+            .complete_handoff(prepared)
             .await
             .expect(&format!("Cycle {}: complete should succeed", cycle));
 
@@ -412,4 +412,186 @@ async fn test_multiple_handoff_cycles() {
 
         println!("Cycle {} completed, version: {}", cycle, status.version);
     }
+}
+
+/// Test: Concurrent acquire attempts for the same path
+///
+/// Verifies that when multiple nodes try to acquire the same path simultaneously,
+/// exactly one succeeds and the others fail with LeaseHeldByOther error.
+/// This tests the S3 conditional write (ETag) mechanism.
+#[tokio::test]
+async fn test_concurrent_acquire_race_condition() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zerofs::fs::lease::LeaseError;
+
+    let store = create_test_store();
+    let path = "/.nbd/contested-vm.raw";
+    let inode_id = 100;
+
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let failure_count = Arc::new(AtomicUsize::new(0));
+
+    // Launch multiple concurrent acquire attempts
+    let num_contenders = 10;
+    let mut handles = Vec::new();
+
+    for i in 0..num_contenders {
+        let store_clone = Arc::clone(&store);
+        let success_count_clone = Arc::clone(&success_count);
+        let failure_count_clone = Arc::clone(&failure_count);
+        let node_name = format!("node-{}", i);
+
+        let handle = tokio::spawn(async move {
+            let coordinator = LeaseCoordinator::new(
+                store_clone,
+                "concurrent-db",
+                create_config(&node_name),
+            );
+
+            match coordinator.acquire_path(path, inode_id).await {
+                Ok(()) => {
+                    success_count_clone.fetch_add(1, Ordering::SeqCst);
+                    println!("{} acquired the lease!", node_name);
+                    Some(node_name)
+                }
+                Err(LeaseError::LeaseHeldByOther { holder_name, .. }) => {
+                    failure_count_clone.fetch_add(1, Ordering::SeqCst);
+                    println!("{} failed: lease held by {}", node_name, holder_name);
+                    None
+                }
+                Err(LeaseError::ConcurrentModification) => {
+                    failure_count_clone.fetch_add(1, Ordering::SeqCst);
+                    println!("{} failed: concurrent modification", node_name);
+                    None
+                }
+                Err(e) => {
+                    panic!("{} got unexpected error: {:?}", node_name, e);
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all attempts to complete
+    let results: Vec<Option<String>> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let successes = success_count.load(Ordering::SeqCst);
+    let failures = failure_count.load(Ordering::SeqCst);
+
+    println!(
+        "Concurrent acquire results: {} successes, {} failures",
+        successes, failures
+    );
+
+    // Exactly one should succeed
+    assert_eq!(
+        successes, 1,
+        "Expected exactly 1 successful acquire, got {}",
+        successes
+    );
+
+    // The rest should fail
+    assert_eq!(
+        failures,
+        num_contenders - 1,
+        "Expected {} failures, got {}",
+        num_contenders - 1,
+        failures
+    );
+
+    // Verify the winner
+    let winner: Vec<String> = results.into_iter().flatten().collect();
+    assert_eq!(winner.len(), 1);
+    println!("Winner: {}", winner[0]);
+}
+
+/// Test: Concurrent acquire after release - first come first serve
+///
+/// After a lease is released, multiple nodes race to acquire it.
+/// Exactly one should win.
+#[tokio::test]
+async fn test_concurrent_acquire_after_release() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zerofs::fs::lease::LeaseError;
+
+    let store = create_test_store();
+    let path = "/.nbd/released-vm.raw";
+    let inode_id = 101;
+
+    // First, have a node acquire and release the lease
+    let initial_node = Arc::new(LeaseCoordinator::new(
+        Arc::clone(&store),
+        "release-db",
+        create_config("initial-holder"),
+    ));
+    initial_node.acquire_path(path, inode_id).await.unwrap();
+
+    let write_coordinator = create_mock_write_coordinator();
+    let flush_coordinator = create_mock_flush_coordinator();
+
+    let prepared = initial_node
+        .prepare_handoff(path, &write_coordinator, &flush_coordinator)
+        .await
+        .unwrap();
+    initial_node.complete_handoff(prepared).await.unwrap();
+
+    // Verify lease is released
+    let status = initial_node.get_path_status(path).unwrap();
+    assert_eq!(status.state, LeaseState::Released);
+
+    // Now race to acquire
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let num_contenders = 5;
+    let mut handles = Vec::new();
+
+    for i in 0..num_contenders {
+        let store_clone = Arc::clone(&store);
+        let success_count_clone = Arc::clone(&success_count);
+        let node_name = format!("racer-{}", i);
+
+        let handle = tokio::spawn(async move {
+            let coordinator = LeaseCoordinator::new(
+                store_clone,
+                "release-db",
+                create_config(&node_name),
+            );
+
+            match coordinator.acquire_path(path, inode_id).await {
+                Ok(()) => {
+                    success_count_clone.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+                Err(LeaseError::LeaseHeldByOther { .. })
+                | Err(LeaseError::ConcurrentModification) => false,
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    let results: Vec<bool> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let winners: Vec<_> = results.iter().filter(|&&won| won).collect();
+    println!(
+        "Race after release: {} winners out of {} contenders",
+        winners.len(),
+        num_contenders
+    );
+
+    // Exactly one winner
+    assert_eq!(
+        winners.len(),
+        1,
+        "Expected exactly 1 winner after release race"
+    );
 }

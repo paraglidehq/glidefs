@@ -1,4 +1,5 @@
 use crate::db::Db;
+use slatedb::WriteBatch;
 use crate::fs::CHUNK_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::metrics::FileSystemStats;
@@ -132,9 +133,9 @@ impl GarbageCollector {
                     is_final_batch,
                 ));
 
-                let mut txn = self.db.new_transaction()?;
+                let mut batch = WriteBatch::new();
                 self.chunk_store.delete_range(
-                    &mut txn,
+                    &mut batch,
                     entry.inode_id,
                     start_chunk as u64,
                     total_chunks as u64,
@@ -143,7 +144,7 @@ impl GarbageCollector {
                 if chunks_to_delete > 0 {
                     self.db
                         .write_with_options(
-                            txn.into_inner(),
+                            batch,
                             &WriteOptions {
                                 await_durable: false,
                             },
@@ -168,23 +169,23 @@ impl GarbageCollector {
             }
 
             if !tombstones_to_update.is_empty() {
-                let mut txn = self.db.new_transaction()?;
+                let mut batch = WriteBatch::new();
 
                 for (key, old_size, start_chunk, delete_tombstone) in tombstones_to_update {
                     if delete_tombstone {
-                        self.tombstone_store.remove(&mut txn, &key);
+                        self.tombstone_store.remove(&mut batch, &key);
                     } else {
                         let remaining_chunks = start_chunk;
                         let remaining_size = (remaining_chunks as u64) * (CHUNK_SIZE as u64);
                         let actual_remaining = remaining_size.min(old_size);
                         self.tombstone_store
-                            .update(&mut txn, &key, actual_remaining);
+                            .update(&mut batch, &key, actual_remaining);
                     }
                 }
 
                 self.db
                     .write_with_options(
-                        txn.into_inner(),
+                        batch,
                         &WriteOptions {
                             await_durable: false,
                         },

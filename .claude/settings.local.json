@@ -6,7 +6,8 @@
       "Bash(cargo check:*)",
       "Bash(cargo test:*)",
       "Bash(cargo build:*)",
-      "Bash(./target/debug/zerofs:*)"
+      "Bash(./target/debug/zerofs:*)",
+      "Bash(cargo clippy:*)"
     ]
   }
 }

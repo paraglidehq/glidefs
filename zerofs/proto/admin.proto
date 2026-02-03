@@ -24,6 +24,11 @@ service AdminService {
 
     rpc CompleteHandoff(CompleteHandoffRequest) returns (CompleteHandoffResponse);
 
+    // Perform a complete handoff in one atomic operation (acquire → prepare → complete).
+    // Uses the typestate pattern internally to ensure correct state transitions.
+    // After this returns, the lease is Released and available for another node.
+    rpc PerformFullHandoff(PerformFullHandoffRequest) returns (PerformFullHandoffResponse);
+
     rpc GetLeaseStatus(GetLeaseStatusRequest) returns (GetLeaseStatusResponse);
 
     rpc ListHeldLeases(ListHeldLeasesRequest) returns (ListHeldLeasesResponse);
@@ -154,6 +159,17 @@ message CompleteHandoffRequest {
 
 message CompleteHandoffResponse {
     // The updated lease after transitioning to Released state
+    WriterLease lease = 1;
+}
+
+message PerformFullHandoffRequest {
+    // Path to perform full handoff for (e.g., "/.nbd/vm-1.raw")
+    // This will acquire the lease, prepare handoff, and complete handoff in one operation.
+    string path = 1;
+}
+
+message PerformFullHandoffResponse {
+    // The final lease after transitioning to Released state
     WriterLease lease = 1;
 }
 

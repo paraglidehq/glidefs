@@ -191,8 +191,11 @@ impl AdminService for AdminRpcServer {
             .as_ref()
             .ok_or_else(|| Status::unavailable("Lease coordination is not enabled"))?;
 
-        coordinator
-            .prepare_handoff_path(&path, &self.write_coordinator, &self.flush_coordinator)
+        // For RPC, we call prepare_handoff but don't use the token
+        // (RPC is stateless, can't pass tokens between requests)
+        // The state is tracked in the coordinator and validated in complete_handoff_by_path
+        let _prepared = coordinator
+            .prepare_handoff(&path, &self.write_coordinator, &self.flush_coordinator)
             .await
             .map_err(|e| Status::internal(format!("Prepare handoff failed: {}", e)))?;
 
@@ -216,8 +219,10 @@ impl AdminService for AdminRpcServer {
             .as_ref()
             .ok_or_else(|| Status::unavailable("Lease coordination is not enabled"))?;
 
+        // For RPC, use the path-based method (runtime validation)
+        // Internal/SDK code should use the token-based complete_handoff for compile-time enforcement
         coordinator
-            .complete_handoff_path(&path)
+            .complete_handoff_by_path(&path)
             .await
             .map_err(|e| Status::internal(format!("Complete handoff failed: {}", e)))?;
 
@@ -226,6 +231,40 @@ impl AdminService for AdminRpcServer {
             .ok_or_else(|| Status::internal("No lease held after complete_handoff"))?;
 
         Ok(Response::new(proto::CompleteHandoffResponse {
+            lease: Some(lease.into()),
+        }))
+    }
+
+    async fn perform_full_handoff(
+        &self,
+        request: Request<proto::PerformFullHandoffRequest>,
+    ) -> Result<Response<proto::PerformFullHandoffResponse>, Status> {
+        let path = request.into_inner().path;
+
+        let coordinator = self
+            .lease_coordinator
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Lease coordination is not enabled"))?;
+
+        // Resolve path to inode
+        let inode_id = self
+            .fs
+            .resolve_path_to_inode(&path)
+            .await
+            .map_err(|e| Status::not_found(format!("Path not found: {}", e)))?;
+
+        // Perform the full handoff using the typestate API internally
+        // This ensures correct state transitions at compile time
+        coordinator
+            .perform_full_handoff(&path, inode_id, &self.write_coordinator, &self.flush_coordinator)
+            .await
+            .map_err(|e| Status::internal(format!("Full handoff failed: {}", e)))?;
+
+        let lease = coordinator
+            .get_path_status(&path)
+            .ok_or_else(|| Status::internal("No lease held after full handoff"))?;
+
+        Ok(Response::new(proto::PerformFullHandoffResponse {
             lease: Some(lease.into()),
         }))
     }

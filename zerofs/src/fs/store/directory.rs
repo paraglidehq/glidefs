@@ -1,4 +1,4 @@
-use crate::db::{Db, Transaction};
+use crate::db::{Db, TransactionMut};
 use crate::fs::errors::FsError;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::key_codec::{KeyCodec, ParsedKey};
@@ -106,7 +106,7 @@ impl DirectoryStore {
     pub async fn allocate_cookie(
         &self,
         dir_id: InodeId,
-        txn: &mut Transaction,
+        txn: &mut impl TransactionMut,
     ) -> Result<u64, FsError> {
         let counter_key = KeyCodec::dir_cookie_counter_key(dir_id);
         let current = match self.db.get_bytes(&counter_key).await {
@@ -219,7 +219,7 @@ impl DirectoryStore {
     /// If `inode` is None, only a reference is stored (for hardlinked entries).
     pub fn add(
         &self,
-        txn: &mut Transaction,
+        txn: &mut impl TransactionMut,
         dir_id: InodeId,
         name: &[u8],
         entry_id: InodeId,
@@ -241,7 +241,7 @@ impl DirectoryStore {
         txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
     }
 
-    pub fn unlink_entry(&self, txn: &mut Transaction, dir_id: InodeId, name: &[u8], cookie: u64) {
+    pub fn unlink_entry(&self, txn: &mut impl TransactionMut, dir_id: InodeId, name: &[u8], cookie: u64) {
         let entry_key = KeyCodec::dir_entry_key(dir_id, name);
         txn.delete_bytes(&entry_key);
 
@@ -249,7 +249,7 @@ impl DirectoryStore {
         txn.delete_bytes(&scan_key);
     }
 
-    pub fn delete_directory(&self, txn: &mut Transaction, dir_id: InodeId) {
+    pub fn delete_directory(&self, txn: &mut impl TransactionMut, dir_id: InodeId) {
         let counter_key = KeyCodec::dir_cookie_counter_key(dir_id);
         txn.delete_bytes(&counter_key);
     }
@@ -276,7 +276,7 @@ impl DirectoryStore {
     /// Does nothing if the entry doesn't exist (already unlinked).
     pub async fn update_inode_in_entry(
         &self,
-        txn: &mut Transaction,
+        txn: &mut impl TransactionMut,
         dir_id: InodeId,
         name: &[u8],
         inode_id: InodeId,
@@ -297,7 +297,7 @@ impl DirectoryStore {
     /// Used when nlink goes from 1 to 2+.
     pub async fn convert_to_reference(
         &self,
-        txn: &mut Transaction,
+        txn: &mut impl TransactionMut,
         dir_id: InodeId,
         name: &[u8],
         inode_id: InodeId,

@@ -2,8 +2,8 @@ name: Release with PGO
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
+  # push:
+  #   branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always

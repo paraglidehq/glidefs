@@ -1,4 +1,4 @@
-use crate::db::{Db, Transaction};
+use crate::db::{Db, TransactionMut};
 use crate::fs::errors::FsError;
 use crate::fs::inode::InodeId;
 use crate::fs::key_codec::{KeyCodec, KeyPrefix, ParsedKey};
@@ -25,7 +25,7 @@ impl TombstoneStore {
         Self { db }
     }
 
-    pub fn add(&self, txn: &mut Transaction, inode_id: InodeId, size: u64) {
+    pub fn add(&self, txn: &mut impl TransactionMut, inode_id: InodeId, size: u64) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -34,11 +34,11 @@ impl TombstoneStore {
         txn.put_bytes(&key, KeyCodec::encode_tombstone_size(size));
     }
 
-    pub fn update(&self, txn: &mut Transaction, key: &Bytes, new_size: u64) {
+    pub fn update(&self, txn: &mut impl TransactionMut, key: &Bytes, new_size: u64) {
         txn.put_bytes(key, KeyCodec::encode_tombstone_size(new_size));
     }
 
-    pub fn remove(&self, txn: &mut Transaction, key: &Bytes) {
+    pub fn remove(&self, txn: &mut impl TransactionMut, key: &Bytes) {
         txn.delete_bytes(key);
     }
 

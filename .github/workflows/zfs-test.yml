@@ -66,11 +66,12 @@ jobs:
           url = "s3://zerofs-zfs-test/zfs-test"
           encryption_password = "test-password-123"
 
-          [servers.ninep]
-          addresses = ["127.0.0.1:5564"]
-
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
+
+          [[servers.nbd.exports]]
+          name = "test-device"
+          size_gb = 3.0
 
           [aws]
           access_key_id = "minioadmin"
@@ -97,18 +98,6 @@ jobs:
             echo "ZeroFS NBD server failed to start"
             exit 1
           fi
-
-      - name: Mount 9P and create NBD device
-        run: |
-          echo "Mounting ZeroFS via 9P..."
-          sudo mkdir -p /mnt/zerofs
-          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
-
-          echo "Creating NBD device file..."
-          sudo mkdir -p /mnt/zerofs/.nbd
-          sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
-
-          sudo umount /mnt/zerofs
 
       - name: Connect NBD device
         run: |

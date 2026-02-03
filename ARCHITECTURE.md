@@ -38,8 +38,11 @@ Compute Node (ONE zerofs process):
 
 ```
 Guest write → NBD handler → WriteCache (local SSD)
-                               ├── Mark block present
-                               ├── Mark block dirty
+                               ├── Write to local file
+                               ├── Mark block present (atomic OR)
+                               ├── Mark block dirty (CAS)
+                               ├── Push to dirty_queue (lock-free)
+                               ├── Notify sync worker (wake if sleeping)
                                └── return (<1ms)
                                       │
                            (background) → S3BlockStore → S3
@@ -76,9 +79,9 @@ Guest FLUSH → NBD handler → WriteCache.flush()
 (S3 sync happens asynchronously in background)
 ```
 
-Compare to blocking on S3:
-- Old: 8-15 seconds per snapshot
-- New: <100ms per snapshot (420x improvement)
+Compare to blocking on S3 (write-through):
+- Write-through: 8-15 seconds per snapshot
+- Write-behind: <100ms per snapshot (420x faster)
 
 ## State Machines
 
@@ -174,9 +177,9 @@ Local SSD write-behind cache with typestate lifecycle:
 ```rust
 // Only Active cache can serve I/O - compiler enforced
 impl WriteCache<Active> {
-    pub async fn write(&self, offset: u64, data: &[u8]) -> Result<()>;
+    pub fn write(&self, offset: u64, data: &[u8]) -> Result<()>;
     pub fn flush(&self) -> Result<()>;  // Local fsync only!
-    pub async fn read(&self, offset: u64, len: usize) -> Result<Bytes>;
+    pub async fn read_with_fetch(&self, ...) -> Result<Bytes>;
 }
 ```
 
@@ -185,6 +188,12 @@ impl WriteCache<Active> {
 - Background sync pushes dirty blocks to S3
 - Drain blocks until all dirty blocks synced
 - **Read-through**: Blocks not present locally are fetched from S3 on demand
+
+**Lock-free internals**:
+- `block_states`: `AtomicU8` array with CAS for state transitions
+- `present_chunks`: `AtomicU64` bitmap with atomic OR
+- `dirty_queue`: Lock-free `SegQueue<u64>` for O(1) dirty block tracking
+- `dirty_notify`: `Notify` to wake sync worker on writes
 
 ### S3BlockStore (`nbd/block_store.rs`)
 
@@ -206,7 +215,7 @@ s3://bucket/path/{export_name}/batches/{batch_num:012x}
 
 ### Background Sync Worker
 
-Continuous drain pattern keeps dirty set small:
+Event-driven sync with O(1) dirty block tracking:
 
 ```rust
 loop {
@@ -218,10 +227,15 @@ loop {
         }
     }
 
+    // O(1) pop from lock-free dirty queue
     dirty_blocks = cache.claim_dirty_blocks(batch_size);
 
     if dirty_blocks.is_empty() {
-        sleep(100ms);
+        // Sleep until write path wakes us (or safety timeout)
+        select! {
+            _ = cache.wait_for_dirty() => {}
+            _ = sleep(1s) => {}
+        }
         continue;
     }
 
@@ -236,12 +250,17 @@ loop {
 }
 ```
 
+**Design**:
+- **Event-driven**: Sleeps when idle, wakes instantly on writes
+- **O(1) dirty tracking**: Lock-free queue (`SegQueue`) - no scanning
+- **Lease fencing**: Stops immediately if lease lost
+
 **Benefits**:
 - Cross-host snapshots only wait for current batch
 - Dirty set stays bounded (most blocks synced within ~1s)
 - More even S3 write traffic
 - Network failures retry individual blocks
-- Fencing checks prevent writes after lease loss
+- Zero CPU for idle VMs
 
 ### NBDBlockHandler (`nbd/handler.rs`)
 
@@ -578,19 +597,19 @@ ZeroFS behaves like local disk with background replication - similar to DRBD asy
 
 ### Why Write-Behind Over Write-Through?
 
-Write-through (old architecture):
+Write-through would block on S3:
 ```
-NBD FLUSH → SlateDB.flush() → S3 PUT → return (2-15 seconds)
+NBD FLUSH → S3 PUT → return (2-15 seconds)
 ```
 
-Write-behind (new architecture):
+Write-behind (what we do):
 ```
 NBD FLUSH → Local SSD fsync → return (10ms)
                 ↓
          Background → S3 PUT (async)
 ```
 
-ZFS snapshot/clone operations are **metadata-only** (copy-on-write pointers). But NBD FLUSH was making them block on S3 network I/O - a 420x slowdown.
+ZFS snapshot/clone operations are **metadata-only** (copy-on-write pointers). Blocking FLUSH on S3 network I/O would cause a 420x slowdown.
 
 ### Why Sparse Files for Cache?
 
@@ -601,12 +620,12 @@ ZFS snapshot/clone operations are **metadata-only** (copy-on-write pointers). Bu
 
 ### Why Direct Block-to-S3 (No LSM)?
 
-The old architecture used SlateDB (LSM tree):
-- Overhead: WAL + memtable + compaction
+LSM trees (like RocksDB/SlateDB) add overhead:
+- WAL + memtable + compaction
 - Good for: Small key-value operations
 - Bad for: Large sequential block I/O
 
-Direct block-to-S3:
+Direct block-to-S3 (what we do):
 - One S3 batch per N blocks
 - O(1) lookup: block 42 → batch 0, offset 42
 - No compaction overhead
@@ -627,26 +646,29 @@ Benefits:
 - **Bugs found at compile time** - Not in production
 - **Self-documenting API** - Types encode valid transitions
 
-### Why Continuous Drain Over Periodic Sync?
+### Why Event-Driven Sync?
 
-Polling pattern:
-```rust
-loop { sleep(5s); sync_all_dirty(); }
-```
-
-Continuous drain pattern:
 ```rust
 loop {
-    let batch = claim_dirty(100);
-    if batch.empty() { sleep(100ms) }
-    else { upload(batch) }
+    let batch = claim_dirty(100);  // O(1) pop from dirty queue
+    if batch.empty() {
+        wait_for_dirty().await;    // Zero CPU when idle
+    } else {
+        upload(batch)
+    }
 }
 ```
+
+**Design**:
+- **O(1) dirty block tracking**: Write path pushes to lock-free queue, sync pops
+- **Zero CPU when idle**: Sync worker sleeps until write path notifies
+- **Instant response**: Wakes immediately when writes happen
 
 Benefits:
 - Dirty set stays small (most blocks synced within ~1s)
 - Cross-host snapshots wait for current batch, not all dirty blocks
 - More even S3 write traffic
+- No CPU overhead for idle VMs
 
 ## Distributed Coordination
 

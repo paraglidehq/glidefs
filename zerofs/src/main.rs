@@ -10,9 +10,6 @@ mod parse_object_store;
 mod storage_compatibility;
 mod task;
 
-#[cfg(feature = "failpoints")]
-mod failpoints;
-
 use mimalloc::MiMalloc;
 
 #[global_allocator]

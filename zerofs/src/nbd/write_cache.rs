@@ -12,6 +12,7 @@
 //! handle for metadata operations (not data path).
 
 use bytes::Bytes;
+use crossbeam::queue::SegQueue;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::marker::PhantomData;
@@ -20,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
+use tokio::sync::Notify;
 use tracing::{debug, info, instrument, warn};
 
 use super::block_store::{BlockStoreError, S3BlockStore};
@@ -122,6 +124,15 @@ pub(crate) struct CacheInner {
     /// Statistics
     dirty_block_count: AtomicU64,
     syncing_block_count: AtomicU64,
+
+    /// Queue of dirty block numbers for O(1) claiming (no scanning).
+    /// Blocks are pushed here when transitioning to Dirty state.
+    /// The sync worker pops from this queue instead of scanning all blocks.
+    dirty_queue: SegQueue<u64>,
+
+    /// Notification for waking the sync worker when dirty blocks are available.
+    /// The sync worker waits on this instead of polling.
+    dirty_notify: Notify,
 }
 
 impl CacheInner {
@@ -425,6 +436,15 @@ impl WriteCache<Initializing> {
             .map(|c| c.load(Ordering::Relaxed).count_ones() as usize)
             .sum();
 
+        // Pre-populate dirty queue with blocks that are dirty from recovery.
+        // This avoids needing to scan on first sync cycle.
+        let dirty_queue = SegQueue::new();
+        for (idx, state) in block_states.iter().enumerate() {
+            if state.load(Ordering::Relaxed) == BlockState::Dirty as u8 {
+                dirty_queue.push(idx as u64);
+            }
+        }
+
         let inner = Arc::new(CacheInner {
             config,
             data_file: RwLock::new(data_file),
@@ -433,6 +453,8 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
+            dirty_queue,
+            dirty_notify: Notify::new(),
         });
 
         info!(
@@ -601,8 +623,8 @@ impl WriteCache<Active> {
     /// # Lock-Free State Updates
     ///
     /// Uses CAS operations for state transitions:
-    /// - Clean → Dirty: increment dirty_count
-    /// - Syncing → Dirty: decrement syncing_count, increment dirty_count
+    /// - Clean → Dirty: increment dirty_count, push to queue, notify
+    /// - Syncing → Dirty: decrement syncing_count, increment dirty_count, push to queue, notify
     /// - Dirty → Dirty: no-op
     #[instrument(skip(self, data), fields(offset = offset, len = data.len()))]
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), CacheError> {
@@ -628,6 +650,8 @@ impl WriteCache<Active> {
         let start_block = offset / block_size;
         let end_block = (offset + data.len() as u64 - 1) / block_size;
 
+        let mut newly_dirty = false;
+
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx >= self.inner.num_blocks {
@@ -642,7 +666,7 @@ impl WriteCache<Active> {
                 let current = self.inner.block_states[idx].load(Ordering::Acquire);
 
                 if current == BlockState::Dirty as u8 {
-                    // Already dirty, nothing to do
+                    // Already dirty, nothing to do (already in queue)
                     break;
                 }
 
@@ -658,6 +682,8 @@ impl WriteCache<Active> {
                         .is_ok()
                     {
                         self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                        self.inner.dirty_queue.push(block);
+                        newly_dirty = true;
                         break;
                     }
                     // CAS failed, retry
@@ -674,6 +700,8 @@ impl WriteCache<Active> {
                     {
                         self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
                         self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                        self.inner.dirty_queue.push(block);
+                        newly_dirty = true;
                         break;
                     }
                     // CAS failed, retry
@@ -682,6 +710,11 @@ impl WriteCache<Active> {
                     break;
                 }
             }
+        }
+
+        // Wake sync worker if we added dirty blocks
+        if newly_dirty {
+            self.inner.dirty_notify.notify_one();
         }
 
         debug!(start_block = start_block, end_block = end_block, "marked blocks dirty and present");
@@ -918,6 +951,8 @@ impl WriteCache<Active> {
         let start_block = offset / block_size;
         let end_block = (offset + len - 1) / block_size;
 
+        let mut newly_dirty = false;
+
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx >= self.inner.num_blocks {
@@ -946,6 +981,8 @@ impl WriteCache<Active> {
                         .is_ok()
                     {
                         self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                        self.inner.dirty_queue.push(block);
+                        newly_dirty = true;
                         break;
                     }
                 } else if current == BlockState::Syncing as u8 {
@@ -960,6 +997,8 @@ impl WriteCache<Active> {
                     {
                         self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
                         self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                        self.inner.dirty_queue.push(block);
+                        newly_dirty = true;
                         break;
                     }
                 } else {
@@ -967,26 +1006,41 @@ impl WriteCache<Active> {
                 }
             }
         }
+
+        // Wake sync worker if we added dirty blocks
+        if newly_dirty {
+            self.inner.dirty_notify.notify_one();
+        }
     }
 
-    /// Claim dirty blocks for syncing (lock-free).
+    /// Claim dirty blocks for syncing (lock-free, O(1) per block).
     ///
-    /// This transitions blocks from Dirty to Syncing and returns their numbers.
-    /// The sync worker should call this, upload the blocks, then call
+    /// Pops block numbers from the dirty queue and transitions them from Dirty
+    /// to Syncing. The sync worker should call this, upload the blocks, then call
     /// `mark_synced` or `mark_sync_failed` for each block.
     ///
-    /// Uses CAS to atomically transition Dirty → Syncing.
+    /// Uses CAS to atomically transition Dirty → Syncing. If a block is no longer
+    /// Dirty (e.g., already synced or transitioned by another thread), it is skipped.
     #[instrument(skip(self))]
     pub fn claim_dirty_blocks(&self, max_blocks: usize) -> Vec<u64> {
         let mut claimed = Vec::with_capacity(max_blocks);
 
-        for i in 0..self.inner.num_blocks {
-            if claimed.len() >= max_blocks {
+        while claimed.len() < max_blocks {
+            // Pop from dirty queue - O(1)
+            let Some(block_num) = self.inner.dirty_queue.pop() else {
                 break;
+            };
+
+            let idx = block_num as usize;
+            if idx >= self.inner.num_blocks {
+                continue;
             }
 
             // Try CAS: Dirty → Syncing
-            if self.inner.block_states[i]
+            // The block might not be Dirty anymore if:
+            // - It was already synced (duplicate in queue from recovery)
+            // - Another thread claimed it (shouldn't happen with single sync worker)
+            if self.inner.block_states[idx]
                 .compare_exchange(
                     BlockState::Dirty as u8,
                     BlockState::Syncing as u8,
@@ -995,10 +1049,11 @@ impl WriteCache<Active> {
                 )
                 .is_ok()
             {
-                claimed.push(i as u64);
+                claimed.push(block_num);
                 self.inner.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
                 self.inner.syncing_block_count.fetch_add(1, Ordering::Relaxed);
             }
+            // If CAS fails, the block is no longer dirty - skip it
         }
 
         if !claimed.is_empty() {
@@ -1075,6 +1130,14 @@ impl WriteCache<Active> {
     /// Get the block size.
     pub fn block_size(&self) -> usize {
         self.inner.config.block_size
+    }
+
+    /// Wait for dirty blocks to become available.
+    ///
+    /// Returns immediately if there are already dirty blocks in the queue.
+    /// Otherwise, waits until a write operation adds dirty blocks and notifies.
+    pub async fn wait_for_dirty(&self) {
+        self.inner.dirty_notify.notified().await
     }
 
     /// Save metadata to disk.
@@ -1238,7 +1301,9 @@ impl WriteCache<Draining> {
 pub struct SyncWorkerConfig {
     /// Maximum number of blocks to claim per sync cycle
     pub batch_size: usize,
-    /// How long to sleep when no dirty blocks are found
+    /// Deprecated: The sync worker is now event-driven and wakes on writes.
+    /// This field is kept for backwards compatibility but is no longer used.
+    #[allow(dead_code)]
     pub idle_sleep: std::time::Duration,
     /// How often to save metadata (every N sync cycles)
     pub metadata_save_interval: usize,
@@ -1248,7 +1313,7 @@ impl Default for SyncWorkerConfig {
     fn default() -> Self {
         Self {
             batch_size: 100,
-            idle_sleep: std::time::Duration::from_millis(100),
+            idle_sleep: std::time::Duration::from_millis(100), // Unused, kept for compat
             metadata_save_interval: 10,
         }
     }
@@ -1302,7 +1367,7 @@ pub async fn sync_worker(
         batch_size = config.batch_size,
         blocks_per_batch = s3.blocks_per_batch(),
         has_lease = lease_state.is_some(),
-        "sync worker started"
+        "sync worker started (event-driven)"
     );
 
     let mut batches_since_save = 0;
@@ -1324,13 +1389,19 @@ pub async fn sync_worker(
                 break;
             }
 
-        // Claim a batch of dirty blocks
+        // Claim a batch of dirty blocks from the queue (O(1) per block)
         let dirty = cache.claim_dirty_blocks(config.batch_size);
 
         if dirty.is_empty() {
-            // No dirty blocks - short sleep before checking again
+            // No dirty blocks - wait for notification from write path.
+            // Use a timeout as safety net in case notification was missed.
             tokio::select! {
-                _ = tokio::time::sleep(config.idle_sleep) => {}
+                _ = cache.wait_for_dirty() => {
+                    // Woken by write path - dirty blocks available
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    // Safety timeout - check queue in case notify was missed
+                }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         info!("sync worker received shutdown signal");

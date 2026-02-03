@@ -1,0 +1,203 @@
+name: pjdfstest
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  pjdfstest:
+    name: Run pjdfstest NFS Test Suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Start MinIO (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Download MinIO binary
+          wget https://dl.min.io/server/minio/release/darwin-amd64/minio
+          chmod +x minio
+
+          # Start MinIO in background
+          export MINIO_ROOT_USER=minioadmin
+          export MINIO_ROOT_PASSWORD=minioadmin
+          ./minio server /tmp/minio-data &
+
+          # Wait for MinIO to be ready
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nfs-common build-essential autoconf automake libtool git perl
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake libtool perl
+
+      - name: Clone pjdfstest_nfs
+        run: |
+          git clone https://github.com/Barre/pjdfstest_nfs.git /tmp/pjdfstest_nfs
+
+      - name: Build pjdfstest
+        working-directory: /tmp/pjdfstest_nfs
+        run: |
+          autoreconf -fvi
+          ./configure
+          make
+
+      - name: Setup MinIO bucket
+        run: |
+          # Install mc (MinIO client)
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          else
+            wget https://dl.min.io/client/mc/release/darwin-amd64/mc
+          fi
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/zerofs-test || true
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS
+        working-directory: zerofs
+        run: |
+          # Create cache directory
+          mkdir -p /tmp/zerofs-cache
+
+          # Create ZeroFS configuration
+          cat > zerofs-ci.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 1.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-test/test"
+          encryption_password = "test-password-123"
+
+          [servers.nfs]
+          addresses = ["127.0.0.1:2049"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
+          # Start ZeroFS in the background
+          ./target/ci/zerofs run -c zerofs-ci.toml &
+
+          # Wait for ZeroFS to start
+          echo "Waiting for ZeroFS to start..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 2049; then
+              echo "ZeroFS is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify ZeroFS is running
+          if ! nc -z 127.0.0.1 2049; then
+            echo "ZeroFS failed to start"
+            exit 1
+          fi
+
+      - name: Mount NFS (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Create mount point
+          sudo mkdir -p /mnt/zerofs
+
+          # Mount ZeroFS via NFS
+          sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
+
+          # Verify mount
+          mount | grep zerofs
+
+      - name: Mount NFS (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Create mount point in /tmp which is writable
+          sudo mkdir -p /tmp/zerofs
+
+          # Mount ZeroFS via NFS (macOS uses nolocks instead of nolock)
+          sudo mount -t nfs -o vers=3,nolocks,tcp,port=2049,mountport=2049,async,hard 127.0.0.1:/ /tmp/zerofs
+
+          # Verify mount
+          mount | grep zerofs
+
+      - name: Run pjdfstest (Linux)
+        if: runner.os == 'Linux'
+        working-directory: /mnt/zerofs
+        run: |
+          # Create test directory
+          mkdir -p pjdfstest_test
+          cd pjdfstest_test
+
+          # Get list of all test files
+          find /tmp/pjdfstest_nfs/tests -name "*.t" -type f > /tmp/all_tests.txt
+
+          # Filter out excluded tests
+          grep -v -f ${{ github.workspace }}/.github/.pjdfstest-nfs-exclude /tmp/all_tests.txt > /tmp/tests_to_run.txt || true
+
+          # Run the filtered test suite
+          sudo prove -rv $(cat /tmp/tests_to_run.txt)
+
+      - name: Run pjdfstest (macOS)
+        if: runner.os == 'macOS'
+        working-directory: /tmp/zerofs
+        run: |
+          # Run the test suite
+          sudo prove -rv /tmp/pjdfstest_nfs/tests/
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Unmount
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo umount /mnt/zerofs || true
+          else
+            sudo umount /tmp/zerofs || true
+          fi
+
+          # Kill ZeroFS
+          pkill -f "zerofs run -c zerofs-ci.toml" || true

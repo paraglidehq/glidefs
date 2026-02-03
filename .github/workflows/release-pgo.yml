@@ -1,0 +1,603 @@
+name: Release with PGO
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  collect-pgo-profile:
+    name: Collect PGO Profile Data - ${{ matrix.test }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test: [9p, zfs-on-zerofs, nfs-kernel-compile]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust with PGO support
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev libelf-dev bc
+
+          if [ "${{ matrix.test }}" = "9p" ]; then
+            sudo modprobe 9p
+            sudo modprobe 9pnet
+            sudo modprobe 9pnet_virtio
+          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
+            sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
+          elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
+            sudo apt-get install -y nfs-common
+          fi
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Setup MinIO bucket
+        run: |
+          wget https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+
+          if [ "${{ matrix.test }}" = "9p" ]; then
+            ./mc mb myminio/pgo-profile || true
+          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
+            ./mc mb myminio/pgo-zfs-test || true
+          elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
+            ./mc mb myminio/pgo-nfs-test || true
+          fi
+
+      - name: Build with PGO instrumentation
+        working-directory: zerofs
+        run: |
+          rm -rf /tmp/pgo-data
+
+          RUSTFLAGS="--cfg tokio_unstable -Cprofile-generate=/tmp/pgo-data" \
+            cargo build --release --target=x86_64-unknown-linux-gnu
+
+      - name: Run profiling workloads
+        run: |
+          mkdir -p /tmp/zerofs-cache
+
+          # Create ZeroFS configuration based on test type
+          if [ "${{ matrix.test }}" = "9p" ]; then
+            cat > zerofs-pgo.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 0.5
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://pgo-profile/test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
+            ZEROFS_PID=$!
+            echo "Waiting for ZeroFS 9P server to start..."
+            for i in {1..30}; do
+              if nc -z 127.0.0.1 5564 2>/dev/null; then
+                echo "ZeroFS 9P server is ready"
+                break
+              fi
+              sleep 1
+            done
+
+            sudo mkdir -p /mnt/zerofs
+            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+            cd /mnt/zerofs
+            wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+            tar -xf linux-6.11.tar.xz
+            cd linux-6.11
+            make tinyconfig
+            make -j$(nproc)
+            cd /mnt/zerofs
+            dd if=/dev/urandom of=500mb.bin bs=1M count=500
+            dd if=500mb.bin of=/dev/null bs=1M
+            cd /
+            sudo umount /mnt/zerofs || true
+            kill -TERM $ZEROFS_PID || true
+            wait $ZEROFS_PID || true
+
+          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
+            cat > zerofs-pgo.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 5.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://pgo-zfs-test/zfs-test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [servers.nbd]
+          addresses = ["127.0.0.1:10809"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
+            ZEROFS_PID=$!
+            echo "Waiting for ZeroFS NBD server to start..."
+            for i in {1..30}; do
+              if nc -z 127.0.0.1 10809; then
+                echo "ZeroFS NBD server is ready"
+                break
+              fi
+              sleep 1
+            done
+
+            sudo mkdir -p /mnt/zerofs
+            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
+            sudo mkdir -p /mnt/zerofs/.nbd
+            sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
+            sudo umount /mnt/zerofs
+            sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+            sudo zpool create testpool /dev/nbd0
+            sudo zfs create testpool/data
+            sudo zfs set mountpoint=/mnt/zfsdata testpool/data
+            cd /mnt/zfsdata
+            sudo wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+            sudo tar -xf linux-6.11.tar.xz
+            sudo zfs snapshot testpool/data@snapshot1
+            kill -TERM $ZEROFS_PID || true
+            wait $ZEROFS_PID || true
+
+          elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
+            cat > zerofs-pgo.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 5.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://pgo-nfs-test/test"
+          encryption_password = "test-password-123"
+
+          [servers.nfs]
+          addresses = ["127.0.0.1:2049"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
+            ZEROFS_PID=$!
+            echo "Waiting for ZeroFS NFS server to start..."
+            for i in {1..30}; do
+              if nc -z 127.0.0.1 2049; then
+                echo "ZeroFS NFS server is ready"
+                break
+              fi
+              sleep 1
+            done
+
+            sudo mkdir -p /mnt/zerofs
+            sudo mount -t nfs -o vers=3,async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
+            cd /mnt/zerofs
+            wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+            tar -xf linux-6.11.tar.xz
+            cd linux-6.11
+            make tinyconfig
+            make -j$(nproc)
+            cd /
+            sudo umount /mnt/zerofs || true
+            kill -TERM $ZEROFS_PID || true
+            wait $ZEROFS_PID || true
+          fi
+
+      - name: Generate PGO data
+        run: |
+          LLVM_PROFDATA=$(find ~/.rustup -name llvm-profdata | head -1)
+          echo "Using llvm-profdata: $LLVM_PROFDATA"
+
+          echo "Profile files generated:"
+          ls -la /tmp/pgo-data/
+
+          $LLVM_PROFDATA merge -o merged.profdata /tmp/pgo-data
+
+          mkdir -p pgo-data
+          cp merged.profdata pgo-data/
+          cp zerofs/Cargo.toml pgo-data/
+          cp zerofs/Cargo.lock pgo-data/
+
+      - name: Upload PGO profile data
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-profile-data-${{ matrix.test }}
+          path: pgo-data/
+
+  merge-pgo-data:
+    name: Merge PGO Profile Data
+    needs: collect-pgo-profile
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust with PGO support
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Download all PGO profile data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pgo-profile-data-*
+          path: pgo-artifacts/
+
+      - name: Merge PGO profiles
+        run: |
+          LLVM_PROFDATA=$(find ~/.rustup -name llvm-profdata | head -1)
+          echo "Using llvm-profdata: $LLVM_PROFDATA"
+
+          PROFDATA_FILES=$(find pgo-artifacts -name "*.profdata" | tr '\n' ' ')
+          echo "Found profdata files: $PROFDATA_FILES"
+
+          $LLVM_PROFDATA merge -o merged.profdata $PROFDATA_FILES
+
+          mkdir -p pgo-data
+          cp merged.profdata pgo-data/
+          cp pgo-artifacts/pgo-profile-data-*/Cargo.toml pgo-data/ || true
+          cp pgo-artifacts/pgo-profile-data-*/Cargo.lock pgo-data/ || true
+
+      - name: Upload merged PGO profile data
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-profile-data-merged
+          path: pgo-data/
+
+  build-release:
+    name: Build optimized for ${{ matrix.target }}
+    needs: merge-pgo-data
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            os: ubuntu-latest
+            platform: linux
+            use_cross: false
+            bolt: true
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            os: ubuntu-24.04-arm
+            platform: linux
+            use_cross: false
+            bolt: false
+          - target: armv7-unknown-linux-gnueabihf
+            arch: armv7
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: i686-unknown-linux-gnu
+            arch: i686
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: powerpc64le-unknown-linux-gnu
+            arch: ppc64le
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: s390x-unknown-linux-gnu
+            arch: s390x
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: riscv64gc-unknown-linux-gnu
+            arch: riscv64
+            os: ubuntu-latest
+            platform: linux
+            use_cross: true
+          - target: x86_64-apple-darwin
+            arch: x86_64
+            os: macos-latest
+            platform: darwin
+            use_cross: false
+          - target: aarch64-apple-darwin
+            arch: aarch64
+            os: macos-latest
+            platform: darwin
+            use_cross: false
+          - target: x86_64-unknown-freebsd
+            arch: amd64
+            os: ubuntu-latest
+            platform: freebsd
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download PGO profile data
+        uses: actions/download-artifact@v4
+        with:
+          name: pgo-profile-data-merged
+          path: pgo-data/
+
+      - name: Install Rust
+        if: matrix.platform != 'freebsd'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux only)
+        if: matrix.use_cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Setup PGO profile
+        if: matrix.platform != 'freebsd'
+        run: |
+          cp pgo-data/merged.profdata zerofs/
+          cp pgo-data/Cargo.lock zerofs/
+
+      - name: Build with PGO (cross)
+        if: matrix.use_cross && !matrix.bolt
+        run: |
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --target ${{ matrix.target }}
+
+      - name: Build with PGO + BOLT relocs (cross)
+        if: matrix.use_cross && matrix.bolt
+        run: |
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --target ${{ matrix.target }}
+
+      - name: Build with PGO (cargo)
+        if: matrix.use_cross == false && matrix.platform != 'freebsd' && !matrix.bolt
+        run: |
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --target ${{ matrix.target }}
+
+      - name: Build with PGO + BOLT relocs (cargo)
+        if: matrix.use_cross == false && matrix.platform != 'freebsd' && matrix.bolt
+        run: |
+          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --target ${{ matrix.target }}
+
+      - name: Build on FreeBSD with PGO
+        if: matrix.platform == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y gmake curl cmake
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          run: |
+            . $HOME/.cargo/env
+            echo "Building ZeroFS for FreeBSD with PGO..."
+            echo "Rust version: $(rustc --version)"
+
+            # Copy PGO data into VM
+            cp pgo-data/merged.profdata zerofs/
+            cp pgo-data/Cargo.lock zerofs/
+
+            cd zerofs
+            RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release
+
+            file target/release/zerofs
+            ls -lh target/release/zerofs
+
+            cp target/release/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+            rm -rf target/
+
+      - name: Prepare binary
+        run: |
+          mkdir -p artifacts
+          if [ "${{ matrix.platform }}" = "freebsd" ]; then
+            mv zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo artifacts/
+          else
+            cp zerofs/target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          fi
+          chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+
+      - name: Install BOLT dependencies
+        if: matrix.bolt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 build-essential libncurses-dev bison flex libssl-dev libelf-dev bc llvm-bolt
+          sudo ln -sf /usr/lib/llvm-18/lib/libbolt_rt_instr.a /usr/lib/libbolt_rt_instr.a
+          sudo ln -sf /usr/lib/llvm-18/lib/libbolt_rt_hugify.a /usr/lib/libbolt_rt_hugify.a
+
+      - name: Start MinIO for BOLT profiling
+        if: matrix.bolt
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          wget -q https://dl.min.io/client/mc/release/linux-${{ matrix.arch }}/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/bolt-profile || true
+
+      - name: Collect BOLT profile on PGO binary
+        if: matrix.bolt
+        run: |
+          BINARY="$(pwd)/artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
+          mkdir -p /tmp/zerofs-cache /tmp/bolt-profile
+
+          llvm-bolt $BINARY -instrument -o ${BINARY}.inst \
+            -instrumentation-file=/tmp/bolt-profile/prof \
+            -instrumentation-file-append-pid
+
+          cat > zerofs-bolt.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 0.5
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://bolt-profile/test"
+          encryption_password = "test-password-123"
+
+          [servers.ninep]
+          addresses = ["127.0.0.1:5564"]
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
+          ${BINARY}.inst run -c zerofs-bolt.toml &
+          ZEROFS_PID=$!
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5564 2>/dev/null; then
+              echo "ZeroFS 9P server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          sudo mkdir -p /mnt/zerofs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+
+          cd /mnt/zerofs
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
+          tar -xf linux-6.11.tar.xz
+          cd linux-6.11
+          make tinyconfig
+          make -j$(nproc)
+          cd /mnt/zerofs
+          dd if=/dev/urandom of=500mb.bin bs=1M count=500
+          dd if=500mb.bin of=/dev/null bs=1M
+          cd /
+
+          sudo umount /mnt/zerofs || true
+          kill -TERM $ZEROFS_PID || true
+          wait $ZEROFS_PID || true
+
+          echo "BOLT profile files:"
+          ls -lh /tmp/bolt-profile/
+
+          merge-fdata /tmp/bolt-profile/prof.* -o /tmp/bolt.fdata
+
+      - name: Apply BOLT optimization
+        if: matrix.bolt
+        run: |
+          BINARY="artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
+
+          llvm-bolt $BINARY -o ${BINARY}.bolt \
+            -data=/tmp/bolt.fdata \
+            -reorder-blocks=ext-tsp \
+            -reorder-functions=hfsort+ \
+            -split-functions \
+            -split-all-cold \
+            -dyno-stats
+
+          mv ${BINARY}.bolt $BINARY
+          rm -f ${BINARY}.inst
+          echo "BOLT optimization applied successfully"
+          ls -lh artifacts/
+
+      - name: Generate attestation for binary
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          path: artifacts/
+          retention-days: 30
+
+  create-release-bundle:
+    name: Create release bundle
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create tarball
+        run: |
+          mkdir -p release
+          for arch_dir in artifacts/*/; do
+            if [ -d "$arch_dir" ]; then
+              cp "$arch_dir"* release/
+            fi
+          done
+          cd release
+          tar czf ../zerofs-pgo-multiplatform.tar.gz zerofs-*-pgo*
+          cd ..
+          sha256sum zerofs-pgo-multiplatform.tar.gz > zerofs-pgo-multiplatform.tar.gz.sha256
+
+      - name: Upload combined release
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerofs-pgo-release
+          path: |
+            zerofs-pgo-multiplatform.tar.gz
+            zerofs-pgo-multiplatform.tar.gz.sha256
+          retention-days: 90
+
+      - name: Generate attestations
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: |
+            zerofs-pgo-multiplatform.tar.gz
+            release/zerofs-*-pgo*

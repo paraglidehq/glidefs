@@ -1,0 +1,368 @@
+export const metadata = {
+  title: 'Quickstart',
+  description:
+    'Get up and running with ZeroFS in minutes. Learn how to install, configure, and mount your first S3-backed filesystem.',
+}
+
+# Quickstart
+
+This guide will get you up and running with ZeroFS in minutes. We'll cover installation, basic configuration, and mounting your first S3-backed filesystem. By the end, you'll have a fully functional filesystem that stores data in S3 while feeling like local storage. {{ className: 'lead' }}
+
+<Note>
+  Before you begin, ensure you have access to an S3-compatible storage service and the necessary credentials (access key ID and secret access key). For quick testing without external storage, you can use `file:///` URLs to store data locally.
+</Note>
+
+## Installation
+
+ZeroFS is distributed as a single static binary. Choose your installation method:
+
+<CodeGroup>
+
+```bash {{ title: 'Install script (Recommended)' }}
+curl -sSfL https://sh.zerofs.net | sh
+```
+
+```bash {{ title: 'Via Cargo' }}
+# Install from crates.io
+cargo install zerofs
+```
+
+```bash {{ title: 'Build from Source' }}
+# Requires Rust toolchain
+git clone https://github.com/Barre/ZeroFS
+cd ZeroFS/zerofs
+cargo build --release
+sudo mv target/release/zerofs /usr/local/bin/
+```
+
+```bash {{ title: 'Docker' }}
+# Pull the ZeroFS Docker image
+docker pull ghcr.io/barre/zerofs:latest
+```
+
+```yaml {{ title: 'GitHub Action' }}
+# Use in your workflow
+- uses: Barre/zerofs@main
+  with:
+    object-store-url: 's3://bucket/path'
+    encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+```
+
+</CodeGroup>
+
+## Configuration
+
+Create a configuration file for ZeroFS:
+
+```bash
+# Initialize a config file
+zerofs init
+
+# This creates a template you can customize
+```
+
+Edit the configuration file with your settings:
+
+<CodeGroup>
+
+```toml {{ title: 'S3 Configuration' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 2.0    # Optional memory cache
+
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "your-secure-password"
+
+[aws]
+access_key_id = "your-access-key"
+secret_access_key = "your-secret-key"
+region = "us-east-1"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+```
+
+```toml {{ title: 'Azure Configuration' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 2.0
+
+[storage]
+url = "azure://my-container/zerofs-data"
+encryption_password = "your-secure-password"
+
+[azure]
+storage_account_name = "your-account"
+storage_account_key = "your-key"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+```
+
+```toml {{ title: 'Local Testing' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 2.0
+
+[storage]
+url = "file:///tmp/zerofs-test"
+encryption_password = "your-secure-password"
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+
+[servers.ninep]
+addresses = ["127.0.0.1:5564"]
+```
+
+```toml {{ title: 'MinIO/S3-Compatible' }}
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 2.0
+
+[storage]
+url = "s3://my-bucket/zerofs-data"
+encryption_password = "your-secure-password"
+
+[aws]
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+endpoint = "https://minio.example.com"
+allow_http = "true"    # For HTTP endpoints
+
+[servers.nfs]
+addresses = ["127.0.0.1:2049"]
+```
+
+</CodeGroup>
+
+<div className="not-prose">
+  <Button href="/configuration" variant="text" arrow="right">
+    See all configuration options
+  </Button>
+</div>
+
+## Start ZeroFS
+
+Now start ZeroFS with your configuration:
+
+<CodeGroup>
+
+```bash {{ title: 'Basic Start' }}
+# Start ZeroFS with configuration file
+zerofs run --config zerofs.toml
+
+# Or use the shorthand
+zerofs run -c zerofs.toml
+```
+
+```bash {{ title: 'With Environment Variables' }}
+# You can override config values with environment variables
+export ZEROFS_PASSWORD='override-password'
+export AWS_ACCESS_KEY_ID='override-key'
+export AWS_SECRET_ACCESS_KEY='override-secret'
+
+# Config file can reference environment variables
+# [storage]
+# encryption_password = "${ZEROFS_PASSWORD}"
+
+zerofs run -c zerofs.toml
+```
+
+```bash {{ title: 'With NBD Support' }}
+# Add NBD configuration to your TOML file
+cat >> zerofs.toml <<EOF
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+EOF
+
+# Start ZeroFS
+zerofs run -c zerofs.toml
+
+# Create NBD devices via the filesystem
+mkdir -p /mnt/zerofs/.nbd
+truncate -s 10G /mnt/zerofs/.nbd/device1
+```
+
+```bash {{ title: 'Docker' }}
+# Create config file
+cat > zerofs.toml <<EOF
+[cache]
+dir = "/cache"
+disk_size_gb = 10.0
+
+[storage]
+url = "s3://bucket/path"
+encryption_password = "\${ZEROFS_PASSWORD}"
+
+[aws]
+access_key_id = "\${AWS_ACCESS_KEY_ID}"
+secret_access_key = "\${AWS_SECRET_ACCESS_KEY}"
+
+[servers.nfs]
+addresses = ["0.0.0.0:2049"]
+EOF
+
+# Run with Docker
+docker run -d \
+  -e ZEROFS_PASSWORD='your-password' \
+  -e AWS_ACCESS_KEY_ID='your-key' \
+  -e AWS_SECRET_ACCESS_KEY='your-secret' \
+  -v $(pwd)/zerofs.toml:/config/zerofs.toml:ro \
+  -v /tmp/cache:/cache \
+  -p 2049:2049 \
+  ghcr.io/barre/zerofs:latest run --config /config/zerofs.toml
+```
+
+</CodeGroup>
+
+## Mount the Filesystem
+
+With ZeroFS running, mount it using standard NFS tools. Linux users can also use 9P for better performance:
+
+<CodeGroup>
+
+```bash {{ title: 'macOS' }}
+# Create mount point
+sudo mkdir -p /mnt/zerofs
+
+# Mount ZeroFS
+sudo mount -t nfs -o async,nolocks,vers=3,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
+```
+
+```bash {{ title: 'Linux (NFS)' }}
+# Create mount point
+sudo mkdir -p /mnt/zerofs
+
+# Mount ZeroFS via NFS
+sudo mount -t nfs -o vers=3,async,nolock,tcp,port=2049,mountport=2049 127.0.0.1:/ /mnt/zerofs
+```
+
+```bash {{ title: 'Linux (9P)' }}
+# Make sure 9P is configured in your TOML file:
+# [servers.ninep]
+# addresses = ["127.0.0.1:5564"]
+
+# Create mount point
+sudo mkdir -p /mnt/9p
+
+# Mount ZeroFS via 9P (better performance on Linux)
+sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/9p
+```
+
+```bash {{ title: 'Persistent Mount (NFS)' }}
+# Add to /etc/fstab for automatic mounting
+echo "127.0.0.1:/ /mnt/zerofs nfs vers=3,async,nolock,tcp,port=2049,mountport=2049,_netdev 0 0" | sudo tee -a /etc/fstab
+```
+
+```bash {{ title: 'Persistent Mount (9P)' }}
+# Add to /etc/fstab for automatic mounting (Linux only)
+echo "127.0.0.1 /mnt/9p 9p trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user,_netdev 0 0" | sudo tee -a /etc/fstab
+```
+
+</CodeGroup>
+
+## Using NBD Block Devices
+
+If you enabled NBD support, you can create and access block devices dynamically:
+
+<CodeGroup>
+
+```bash {{ title: 'Create & Connect NBD Device' }}
+# First, ensure NBD is configured in your TOML:
+# [servers.nbd]
+# addresses = ["127.0.0.1:10809"]
+
+# Mount the filesystem (if not already mounted)
+sudo mount -t nfs -o vers=3,async,nolock 127.0.0.1:/ /mnt/zerofs
+
+# Create a block device file
+sudo mkdir -p /mnt/zerofs/.nbd
+sudo truncate -s 10G /mnt/zerofs/.nbd/my-device
+
+# Install nbd-client if needed
+sudo apt-get install nbd-client  # Debian/Ubuntu
+sudo yum install nbd              # RHEL/CentOS
+
+# Connect to the NBD device
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
+
+# Create filesystem
+sudo mkfs.ext4 /dev/nbd0
+
+# Mount the block device
+sudo mkdir -p /mnt/nbd0
+sudo mount /dev/nbd0 /mnt/nbd0
+```
+
+```bash {{ title: 'Multiple Devices' }}
+# Create multiple block devices
+sudo truncate -s 10G /mnt/zerofs/.nbd/device1
+sudo truncate -s 20G /mnt/zerofs/.nbd/device2
+
+# Connect each device
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N device1
+sudo nbd-client 127.0.0.1 10809 /dev/nbd1 -N device2
+
+# Format and mount
+sudo mkfs.ext4 /dev/nbd0
+sudo mkfs.ext4 /dev/nbd1
+
+sudo mkdir -p /mnt/nbd0 /mnt/nbd1
+sudo mount /dev/nbd0 /mnt/nbd0
+sudo mount /dev/nbd1 /mnt/nbd1
+```
+
+```bash {{ title: 'Disconnect NBD' }}
+# Unmount first
+sudo umount /mnt/nbd0
+
+# Disconnect NBD device
+sudo nbd-client -d /dev/nbd0
+```
+
+</CodeGroup>
+
+<div className="not-prose">
+  <Button href="/nbd-devices" variant="text" arrow="right">
+    Learn more about NBD devices
+  </Button>
+</div>
+
+## Verify It's Working
+
+Test your new filesystem:
+
+```bash
+# Check mount
+df -h /mnt/zerofs
+
+# Create a test file
+echo "Hello from ZeroFS!" > /mnt/zerofs/test.txt
+
+# Read it back
+cat /mnt/zerofs/test.txt
+
+# Check file metadata
+ls -la /mnt/zerofs/
+```
+
+<div className="not-prose">
+  <Button href="/nfs-access" variant="text" arrow="right">
+    Learn about NFS operations
+  </Button>
+</div>
+
+## What's Next?
+
+Congratulations! You now have a fully functional filesystem backed by S3. Here are some next steps:
+
+- [Configure NBD block devices](/nbd-devices) for raw block storage
+- [Learn about encryption](/encryption) and how your data is protected
+- [Optimize performance](/caching) with caching configuration
+- [Explore advanced architectures](/advanced-use-cases) like geo-distributed storage

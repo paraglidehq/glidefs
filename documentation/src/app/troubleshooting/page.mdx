@@ -1,0 +1,262 @@
+export const metadata = {
+  title: 'Troubleshooting',
+  description:
+    'Common issues and solutions for ZeroFS, including mount problems, performance issues, S3 connectivity errors, and debugging techniques.',
+}
+
+# Troubleshooting
+
+This guide helps you diagnose and resolve common issues with ZeroFS. From mount failures to performance problems, we'll walk through systematic debugging steps and solutions for the most frequent problems users encounter. {{ className: 'lead' }}
+
+<Note>
+  Enable debug logging with `export RUST_LOG=zerofs=debug` to get detailed information about what ZeroFS is doing internally.
+</Note>
+
+## Common Issues
+
+### Mount Failures
+
+<CodeGroup>
+
+```bash {{ title: 'Permission Denied' }}
+# Error: mount.nfs: access denied by server
+# Solution: Check NFS port and permissions
+
+# Verify ZeroFS is running
+ps aux | grep zerofs
+
+# Check if port is listening
+netstat -tlnp | grep 2049
+# or
+ss -tlnp | grep 2049
+
+# Try mounting with verbose output
+sudo mount -v -t nfs -o vers=3,tcp,port=2049 127.0.0.1:/ /mnt/zerofs
+```
+
+```bash {{ title: 'Connection Refused' }}
+# Error: mount.nfs: Connection refused
+# Solution: Ensure ZeroFS is running and bound to correct address
+
+# Check ZeroFS logs
+journalctl -u zerofs -f
+
+# Verify bind address in config file
+# Edit zerofs.toml:
+# [servers.nfs]
+# addresses = ["0.0.0.0:2049"]  # Listen on all interfaces
+
+# Test connectivity
+telnet 127.0.0.1 2049
+```
+
+```bash {{ title: 'Protocol Not Supported' }}
+# Error: mount.nfs: Protocol not supported
+# Solution: Use NFSv3 explicitly
+
+# macOS
+mount -t nfs -o vers=3,tcp 127.0.0.1:/ /mnt/zerofs
+
+# Linux
+mount -t nfs -o vers=3,tcp 127.0.0.1:/ /mnt/zerofs
+
+# Note: ZeroFS only supports NFSv3
+```
+
+</CodeGroup>
+
+### S3 Connectivity Issues
+
+<CodeGroup>
+
+```bash {{ title: 'Invalid Credentials' }}
+# Error: InvalidAccessKeyId or SignatureDoesNotMatch
+# Solution: Verify AWS credentials in config
+
+# Test credentials directly
+aws s3 ls s3://your-bucket/ --debug
+
+# Check configuration file
+cat zerofs.toml | grep -A 5 '\[aws\]'
+
+# Verify values are correct:
+# [aws]
+# access_key_id = "your-key"
+# secret_access_key = "your-secret"
+# region = "us-east-1"
+# endpoint = "https://s3.wasabisys.com"  # For S3-compatible
+```
+
+```bash {{ title: 'Bucket Not Found' }}
+# Error: NoSuchBucket
+# Solution: Verify bucket name and region
+
+# List available buckets
+aws s3 ls
+
+# Check bucket region
+aws s3api get-bucket-location --bucket your-bucket
+
+# Update config file with correct region:
+# [aws]
+# region = "us-west-2"
+```
+
+```bash {{ title: 'Network Timeouts' }}
+# Error: Connection timeout
+# Solution: Check network and firewall
+
+# Test S3 connectivity
+curl -I https://s3.amazonaws.com
+
+# Check firewall rules
+sudo iptables -L -n | grep 443
+
+# For corporate networks, set proxy
+export HTTP_PROXY='http://proxy.company.com:8080'
+export HTTPS_PROXY='http://proxy.company.com:8080'
+```
+
+</CodeGroup>
+
+### Cache Problems
+
+<CodeGroup>
+
+```bash {{ title: 'Cache Directory Issues' }}
+# Error: Failed to create cache directory
+# Solution: Check permissions and disk space
+
+# Verify cache directory from config
+grep -A 3 '\[cache\]' zerofs.toml
+
+# Check if directory exists
+ls -la /var/cache/zerofs
+
+# Check disk space
+df -h /var/cache/zerofs
+
+# Fix permissions
+sudo mkdir -p /var/cache/zerofs
+sudo chown $USER:$USER /var/cache/zerofs
+chmod 755 /var/cache/zerofs
+
+# Verify write access
+touch /var/cache/zerofs/test && rm /var/cache/zerofs/test
+```
+
+```bash {{ title: 'Cache Size Errors' }}
+# Error: Invalid cache size
+# Solution: Use positive number for GB in config
+
+# Correct format in zerofs.toml:
+# [cache]
+# dir = "/var/cache/zerofs"
+# disk_size_gb = 50.0           # Correct
+# memory_size_gb = 2.0          # Correct
+
+# Wrong formats:
+# disk_size_gb = "50GB"         # Don't include unit
+# disk_size_gb = 50             # Should be float
+```
+
+</CodeGroup>
+
+## Configuration Issues
+
+### Missing Configuration File
+
+```bash
+# Error: Failed to load config
+# Solution: Create or specify config file
+
+# Initialize a new config
+zerofs init
+
+# Run with specific config file
+zerofs run --config /path/to/zerofs.toml
+
+# Or use short form
+zerofs run -c zerofs.toml
+```
+
+## Encryption Issues
+
+### Password Problems
+
+```toml
+# Wrong password or corrupted data
+
+# Verify password in config file:
+[storage]
+url = "s3://bucket/path"
+encryption_password = "correct-password"
+
+# For special characters, use single quotes in TOML:
+encryption_password = 'p@$$w0rd!'
+
+# Or use environment variable substitution:
+encryption_password = "${ZEROFS_PASSWORD}"
+```
+
+### Changing Passwords
+
+```bash
+# Change password using the CLI
+zerofs change-password --config zerofs.toml
+
+# You'll be prompted for the new password
+# After changing, update your config file:
+# [storage]
+# encryption_password = "new-password"
+```
+
+## NBD Issues
+
+### Device Connection
+
+```bash
+# Error: nbd-client connection failed
+# Solution: Check NBD configuration and availability
+
+# Verify NBD is configured in zerofs.toml:
+# [servers.nbd]
+# addresses = ["127.0.0.1:10809"]
+
+# Check if port is listening
+ss -tlnp | grep 10809
+
+# Ensure NBD module is loaded (Linux)
+sudo modprobe nbd
+lsmod | grep nbd
+
+# Create NBD device file
+sudo mkdir -p /mnt/zerofs/.nbd
+sudo truncate -s 10G /mnt/zerofs/.nbd/my-device
+
+# Connect to the device
+sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N my-device
+```
+
+## Debugging Techniques
+
+### Enable Detailed Logging
+
+```bash
+# Maximum verbosity
+export RUST_LOG='zerofs=trace,slatedb=debug'
+
+# Log to file for analysis
+export RUST_LOG='zerofs=debug'
+zerofs run -c zerofs.toml 2>&1 | tee zerofs.log
+
+# Filter specific components
+export RUST_LOG='zerofs::nfs=trace,zerofs::cache=debug'
+```
+
+
+<div className="not-prose">
+  <Button href="/advanced-use-cases" variant="text" arrow="right">
+    Explore advanced use cases
+  </Button>
+</div>

@@ -1,0 +1,178 @@
+syntax = "proto3";
+
+package zerofs.admin;
+
+import "google/protobuf/timestamp.proto";
+
+service AdminService {
+    rpc CreateCheckpoint(CreateCheckpointRequest) returns (CreateCheckpointResponse);
+
+    rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+
+    rpc DeleteCheckpoint(DeleteCheckpointRequest) returns (DeleteCheckpointResponse);
+
+    rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
+
+    rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
+
+    rpc Flush(FlushRequest) returns (FlushResponse);
+
+    // Writer lease coordination for fast microVM migration (per-path)
+    rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+
+    rpc PrepareHandoff(PrepareHandoffRequest) returns (PrepareHandoffResponse);
+
+    rpc CompleteHandoff(CompleteHandoffRequest) returns (CompleteHandoffResponse);
+
+    rpc GetLeaseStatus(GetLeaseStatusRequest) returns (GetLeaseStatusResponse);
+
+    rpc ListHeldLeases(ListHeldLeasesRequest) returns (ListHeldLeasesResponse);
+}
+
+message FlushRequest {}
+
+message FlushResponse {}
+
+message CheckpointInfo {
+    // UUID as string
+    string id = 1;
+    string name = 2;
+    google.protobuf.Timestamp created_at = 3;
+}
+
+message CreateCheckpointRequest {
+    string name = 1;
+}
+
+message CreateCheckpointResponse {
+    CheckpointInfo checkpoint = 1;
+}
+
+message ListCheckpointsRequest {}
+
+message ListCheckpointsResponse {
+    repeated CheckpointInfo checkpoints = 1;
+}
+
+message DeleteCheckpointRequest {
+    string name = 1;
+}
+
+message DeleteCheckpointResponse {}
+
+message GetCheckpointInfoRequest {
+    string name = 1;
+}
+
+message GetCheckpointInfoResponse {
+    CheckpointInfo checkpoint = 1;
+}
+
+message WatchFileAccessRequest {}
+
+message FileAccessEvent {
+    google.protobuf.Timestamp timestamp = 1;
+    FileOperation operation = 2;
+    string path = 3;
+    OperationParams params = 4;
+}
+
+enum FileOperation {
+    READ = 0;
+    WRITE = 1;
+    CREATE = 2;
+    REMOVE = 3;
+    RENAME = 4;
+    MKDIR = 5;
+    READDIR = 6;
+    LOOKUP = 7;
+    SETATTR = 8;
+    LINK = 9;
+    SYMLINK = 10;
+    MKNOD = 11;
+    TRIM = 12;
+}
+
+message OperationParams {
+    optional uint64 offset = 1;
+    optional uint64 length = 2;
+    optional uint32 mode = 3;
+    optional string new_path = 4;
+    optional string link_target = 5;
+    optional string filename = 6;
+}
+
+// Writer lease coordination messages for fast microVM migration
+
+enum LeaseState {
+    LEASE_STATE_ACTIVE = 0;
+    LEASE_STATE_RELEASING = 1;
+    LEASE_STATE_RELEASED = 2;
+}
+
+message WriterLease {
+    // Unique identifier for the lease holder
+    string holder_id = 1;
+    // Human-readable name for the lease holder (hostname, pod name, etc.)
+    string holder_name = 2;
+    // Unix timestamp when the lease was acquired
+    uint64 acquired_at = 3;
+    // Unix timestamp when the lease expires
+    uint64 expires_at = 4;
+    // Current state of the lease
+    LeaseState state = 5;
+    // Version for optimistic concurrency
+    uint64 version = 6;
+    // Path this lease is for (e.g., "/.nbd/vm-1.raw")
+    string path = 7;
+}
+
+message AcquireLeaseRequest {
+    // Path to acquire lease for (e.g., "/.nbd/vm-1.raw")
+    string path = 1;
+}
+
+message AcquireLeaseResponse {
+    // The acquired lease
+    WriterLease lease = 1;
+}
+
+message PrepareHandoffRequest {
+    // Path to prepare handoff for (e.g., "/.nbd/vm-1.raw")
+    string path = 1;
+}
+
+message PrepareHandoffResponse {
+    // The updated lease after transitioning to Releasing state
+    WriterLease lease = 1;
+}
+
+message CompleteHandoffRequest {
+    // Path to complete handoff for (e.g., "/.nbd/vm-1.raw")
+    string path = 1;
+}
+
+message CompleteHandoffResponse {
+    // The updated lease after transitioning to Released state
+    WriterLease lease = 1;
+}
+
+message GetLeaseStatusRequest {
+    // Path to get lease status for (e.g., "/.nbd/vm-1.raw")
+    // If empty, returns status for all held leases
+    string path = 1;
+}
+
+message GetLeaseStatusResponse {
+    // The current lease for the requested path, if one is held
+    optional WriterLease lease = 1;
+    // Whether this node currently holds the lease for this path
+    bool holds_lease = 2;
+}
+
+message ListHeldLeasesRequest {}
+
+message ListHeldLeasesResponse {
+    // All leases currently held by this node
+    repeated WriterLease leases = 1;
+}

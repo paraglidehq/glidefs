@@ -1,0 +1,127 @@
+export const metadata = {
+  title: 'Advanced Use Cases',
+  description:
+    'Explore advanced ZeroFS architectures including geo-distributed storage, tiered storage with ZFS, running databases, and CAP theorem considerations.',
+}
+
+# Advanced Use Cases
+
+ZeroFS enables powerful architectures that were previously complex or expensive to implement. From geo-distributed ZFS pools to tiered storage systems, this guide explores advanced use cases that showcase ZeroFS's full potential for enterprise and innovative deployments. {{ className: 'lead' }}
+
+<Note>
+  These advanced architectures require careful planning and testing. Start with simpler configurations and gradually add complexity as you gain experience with ZeroFS.
+</Note>
+
+## Geo-Distributed Storage
+
+Create globally distributed storage systems using ZeroFS instances across multiple regions:
+
+<CodeGroup>
+
+```toml {{ title: 'US East Config' }}
+# zerofs-us-east.toml
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 50.0
+
+[storage]
+url = "s3://my-bucket/us-east-db"
+encryption_password = "shared-key"
+
+[aws]
+region = "us-east-1"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+
+# Start: zerofs run -c zerofs-us-east.toml
+```
+
+```toml {{ title: 'EU West Config' }}
+# zerofs-eu-west.toml
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 50.0
+
+[storage]
+url = "s3://my-bucket/eu-west-db"
+encryption_password = "shared-key"
+
+[aws]
+region = "eu-west-1"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10810"]
+
+# Start: zerofs run -c zerofs-eu-west.toml
+```
+
+```toml {{ title: 'Asia Pacific Config' }}
+# zerofs-asia.toml
+[cache]
+dir = "/var/cache/zerofs"
+disk_size_gb = 50.0
+
+[storage]
+url = "s3://my-bucket/asia-db"
+encryption_password = "shared-key"
+
+[aws]
+region = "ap-southeast-1"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10811"]
+
+# Start: zerofs run -c zerofs-asia.toml
+```
+
+```bash {{ title: 'Create Global ZFS Pool' }}
+# Connect to NBD devices from each region with optimal settings
+nbd-client 127.0.0.1 10809 /dev/nbd0 -N device_10809 -persist -timeout 60 -block-size 4096 -connections 4  # US East
+nbd-client 192.168.1.2 10810 /dev/nbd1 -N device_10810 -persist -timeout 120 -block-size 4096 -connections 8  # EU West (remote)
+nbd-client 192.168.1.3 10811 /dev/nbd2 -N device_10811 -persist -timeout 120 -block-size 4096 -connections 8  # Asia (remote)
+
+# Create mirrored pool across continents
+zpool create global-pool mirror /dev/nbd0 /dev/nbd1 /dev/nbd2
+
+# Enable auto-trim for efficient space usage
+zpool set autotrim=on global-pool
+
+# Monitor pool status
+zpool status global-pool
+```
+
+</CodeGroup>
+
+### Benefits of Geo-Distribution
+
+- **Disaster Recovery**: Data survives regional outages
+- **Geographic Redundancy**: Automatic replication across continents
+- **Read Performance**: Local reads from nearby regions
+- **Compliance**: Data residency requirements met
+
+## Tiered Storage Architecture
+
+Combine ZeroFS with ZFS L2ARC for automatic storage tiering:
+
+```bash
+# Create S3-backed main pool
+zpool create datapool /dev/nbd0 /dev/nbd1 /dev/nbd2
+
+# Add local NVMe as L2ARC cache
+zpool add datapool cache /dev/nvme0n1
+
+# Add local SSD as SLOG for write performance
+zpool add datapool log /dev/ssd0
+
+# Monitor cache effectiveness
+zpool iostat -v datapool 5
+```
+
+
+
+<div className="not-prose">
+  <Button href="/" variant="text" arrow="left">
+    <>Back to documentation home</>
+  </Button>
+</div>

@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use std::io::BufRead;
 
-mod block_transformer;
 mod bucket_identity;
 mod cli;
 mod config;

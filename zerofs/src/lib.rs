@@ -1,4 +1,3 @@
-pub mod block_transformer;
 pub mod config;
 pub mod nbd;
 pub mod task;

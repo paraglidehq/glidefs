@@ -15,7 +15,11 @@
       "WebFetch(domain:utcc.utoronto.ca)",
       "WebFetch(domain:www.open-e.com)",
       "WebFetch(domain:klarasystems.com)",
-      "Bash(cargo search:*)"
+      "Bash(cargo search:*)",
+      "Bash(cargo doc:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(wc:*)"
     ]
   }
 }

@@ -29,6 +29,9 @@ pub struct CreateExportRequest {
     pub s3_prefix: Option<String>,
     #[serde(default)]
     pub readonly: bool,
+    /// Block size in bytes (default: inherit from global config)
+    #[serde(default)]
+    pub block_size: Option<usize>,
 }
 
 /// Response for export info.
@@ -135,6 +138,7 @@ async fn handle_request(
                 name: create_req.name.clone(),
                 size_gb: create_req.size_gb,
                 s3_prefix: create_req.s3_prefix,
+                block_size: create_req.block_size,
             };
 
             match router.create_export(config, create_req.readonly).await {
@@ -190,6 +194,14 @@ async fn handle_request(
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
                 }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/exports/{name}/metrics - Get I/O metrics
+        (Method::GET, ["api", "exports", name, "metrics"]) => {
+            match router.get_export_metrics(name).await {
+                Some(metrics) => json_response(StatusCode::OK, &metrics),
+                None => error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name)),
             }
         }
 

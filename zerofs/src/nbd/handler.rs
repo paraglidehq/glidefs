@@ -6,6 +6,7 @@
 
 use super::block_store::S3BlockStore;
 use super::error::{CommandError, CommandResult};
+use super::metrics::ExportMetrics;
 use super::state::Active;
 use super::write_cache::WriteCache;
 use bytes::Bytes;
@@ -40,6 +41,9 @@ pub struct NBDBlockHandler {
     /// Whether this export is readonly (rejects writes)
     /// Uses AtomicBool so promote_export can change it safely
     readonly: AtomicBool,
+
+    /// I/O metrics for this export
+    metrics: Arc<ExportMetrics>,
 }
 
 impl NBDBlockHandler {
@@ -50,17 +54,20 @@ impl NBDBlockHandler {
     /// * `s3_store` - S3 block store for read-through caching
     /// * `device_size` - Size of the block device in bytes
     /// * `readonly` - Whether this export rejects writes
+    /// * `metrics` - Shared metrics for tracking I/O statistics
     pub fn new(
         cache: Arc<WriteCache<Active>>,
         s3_store: Arc<S3BlockStore>,
         device_size: u64,
         readonly: bool,
+        metrics: Arc<ExportMetrics>,
     ) -> Self {
         Self {
             cache,
             s3_store,
             device_size,
             readonly: AtomicBool::new(readonly),
+            metrics,
         }
     }
 
@@ -97,9 +104,11 @@ impl NBDBlockHandler {
             return Ok(Bytes::new());
         }
 
+        self.metrics.record_guest_read(length as u64);
+
         let data = self
             .cache
-            .read_with_fetch(offset, length as usize, &self.s3_store)
+            .read_with_fetch(offset, length as usize, &self.s3_store, &self.metrics)
             .await?;
         Ok(data)
     }
@@ -121,6 +130,7 @@ impl NBDBlockHandler {
             return Ok(());
         }
 
+        self.metrics.record_guest_write(data.len() as u64);
         self.cache.write(offset, data)?;
 
         if fua {
@@ -228,10 +238,13 @@ mod tests {
 
         // Create in-memory S3 store for tests
         let object_store = Arc::new(InMemory::new());
-        let s3_store = Arc::new(S3BlockStore::new(object_store, "test", 4096, None));
+        let s3_store = Arc::new(S3BlockStore::new(object_store, "test", 4096));
+
+        // Create metrics for this handler
+        let metrics = Arc::new(ExportMetrics::new());
 
         // open() returns WriteCache<Recovering>
-        let cache = WriteCache::open(config, None).unwrap();
+        let cache = WriteCache::open(config).unwrap();
         // Skip recovery for test - go straight to active
         let cache = cache.skip_recovery_for_test();
         let handler = NBDBlockHandler::new(
@@ -239,6 +252,7 @@ mod tests {
             s3_store,
             1024 * 1024,
             readonly,
+            metrics,
         );
 
         (handler, temp_dir)

@@ -66,6 +66,7 @@ impl KeyManager {
     }
 
     /// Generate a new data encryption key and wrap it with a password
+    #[cfg(test)]
     pub fn generate_and_wrap_key(&self, password: &str) -> Result<(WrappedDataKey, [u8; 32])> {
         // Generate random DEK
         let mut dek = [0u8; 32];
@@ -204,51 +205,6 @@ pub async fn save_wrapped_key_to_object_store(
         .map_err(|e| anyhow::anyhow!("Failed to save wrapped key: {}", e))?;
 
     Ok(())
-}
-
-/// Load or initialize encryption key from object store.
-///
-/// This loads the wrapped encryption key from the object store and unwraps it
-/// using the provided password. If no key exists, a new one is generated and
-/// stored.
-pub async fn load_or_init_encryption_key(
-    object_store: &Arc<dyn ObjectStore>,
-    db_path: &Path,
-    password: &str,
-    read_only: bool,
-) -> Result<[u8; 32]> {
-    let key_manager = KeyManager::new();
-
-    let existing_key = load_wrapped_key_from_object_store(object_store, db_path).await?;
-
-    match existing_key {
-        Some(wrapped_key) => {
-            let password = password.to_string();
-            spawn_blocking_named("argon2-unwrap", move || {
-                key_manager.unwrap_key(&password, &wrapped_key)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?
-        }
-        None => {
-            if read_only {
-                return Err(anyhow::anyhow!(
-                    "Cannot initialize encryption key in read-only mode. Please initialize the database in read-write mode first."
-                ));
-            }
-
-            let password = password.to_string();
-            let (wrapped_key, dek) = spawn_blocking_named("argon2-generate", move || {
-                key_manager.generate_and_wrap_key(&password)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
-
-            save_wrapped_key_to_object_store(object_store, db_path, &wrapped_key).await?;
-
-            Ok(dek)
-        }
-    }
 }
 
 /// Change the password used to encrypt the DEK

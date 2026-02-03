@@ -1,81 +1,15 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
-use std::fmt;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-/// Compression algorithm configuration for block data.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum CompressionConfig {
-    #[default]
-    Lz4,
-    Zstd(i32),
-}
-
-impl Serialize for CompressionConfig {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            CompressionConfig::Lz4 => serializer.serialize_str("lz4"),
-            CompressionConfig::Zstd(level) => serializer.serialize_str(&format!("zstd-{}", level)),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for CompressionConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct CompressionConfigVisitor;
-
-        impl de::Visitor<'_> for CompressionConfigVisitor {
-            type Value = CompressionConfig;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("'lz4' or 'zstd-{level}' where level is 1-22")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<CompressionConfig, E>
-            where
-                E: de::Error,
-            {
-                if value == "lz4" {
-                    return Ok(CompressionConfig::Lz4);
-                }
-
-                if let Some(level_str) = value.strip_prefix("zstd-") {
-                    let level: i32 = level_str.parse().map_err(|_| {
-                        de::Error::invalid_value(
-                            de::Unexpected::Str(value),
-                            &"'zstd-{level}' where level is a number 1-22",
-                        )
-                    })?;
-
-                    if !(1..=22).contains(&level) {
-                        return Err(de::Error::invalid_value(
-                            de::Unexpected::Signed(level as i64),
-                            &"zstd level must be between 1 and 22",
-                        ));
-                    }
-
-                    return Ok(CompressionConfig::Zstd(level));
-                }
-
-                Err(de::Error::invalid_value(
-                    de::Unexpected::Str(value),
-                    &"'lz4' or 'zstd-{level}' where level is 1-22",
-                ))
-            }
-        }
-
-        deserializer.deserialize_str(CompressionConfigVisitor)
-    }
-}
+// Note: Block-level compression is intentionally NOT implemented.
+// ZFS handles compression at its layer, and block-level compression would:
+// 1. Interfere with ZFS's own compression
+// 2. Break the fixed block size assumption (compressed blocks vary in size)
+// 3. Add CPU overhead with minimal benefit since ZFS already compresses
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -83,9 +17,6 @@ pub struct Settings {
     pub cache: CacheConfig,
     pub storage: StorageConfig,
     pub servers: ServerConfig,
-    /// Compression setting (lz4 or zstd-{level})
-    #[serde(default)]
-    pub compression: CompressionConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aws: Option<AwsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,6 +75,17 @@ pub struct NbdConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_size: Option<usize>,
 
+    /// Number of blocks per S3 batch (default: 100).
+    /// Batching groups consecutive blocks into single S3 objects to reduce PUT costs.
+    /// 100 blocks × 128KB = 12.8MB per batch, reducing PUTs by ~10x.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub blocks_per_batch: Option<u64>,
+
+    /// Sync delay in milliseconds (default: 100ms)
+    /// Longer delays allow more writes to coalesce into fewer S3 operations.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sync_delay_ms: Option<u64>,
+
     /// Static exports loaded at startup
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exports: Vec<ExportConfig>,
@@ -171,6 +113,12 @@ pub struct ExportConfig {
     /// S3 prefix for this export's blocks (default: derived from name)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub s3_prefix: Option<String>,
+
+    /// Block size in bytes (default: inherit from global nbd.block_size)
+    /// Smaller blocks (16KB-32KB) reduce write amplification for random I/O.
+    /// Larger blocks (256KB+) improve throughput for sequential I/O.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_size: Option<usize>,
 }
 
 impl ExportConfig {
@@ -183,15 +131,32 @@ impl ExportConfig {
     pub fn size_bytes(&self) -> u64 {
         (self.size_gb * 1_000_000_000.0) as u64
     }
+
+    /// Get the block size, falling back to the provided default.
+    pub fn block_size_or(&self, default: usize) -> usize {
+        self.block_size.unwrap_or(default)
+    }
 }
 
 impl NbdConfig {
     pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
+    pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 100;
     pub const DEFAULT_DEVICE_SIZE_GB: f64 = 100.0;
     pub const DEFAULT_DEVICE_NAME: &'static str = "zerofs";
+    pub const DEFAULT_SYNC_DELAY_MS: u64 = 100;
 
     pub fn block_size(&self) -> usize {
         self.block_size.unwrap_or(Self::DEFAULT_BLOCK_SIZE)
+    }
+
+    /// Get the number of blocks per S3 batch.
+    pub fn blocks_per_batch(&self) -> u64 {
+        self.blocks_per_batch.unwrap_or(Self::DEFAULT_BLOCKS_PER_BATCH)
+    }
+
+    /// Get the sync delay in milliseconds.
+    pub fn sync_delay_ms(&self) -> u64 {
+        self.sync_delay_ms.unwrap_or(Self::DEFAULT_SYNC_DELAY_MS)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -206,6 +171,7 @@ impl NbdConfig {
                 name: name.clone(),
                 size_gb,
                 s3_prefix: None,
+                block_size: None,
             }];
         }
 
@@ -214,6 +180,7 @@ impl NbdConfig {
             name: Self::DEFAULT_DEVICE_NAME.to_string(),
             size_gb: Self::DEFAULT_DEVICE_SIZE_GB,
             s3_prefix: None,
+            block_size: None,
         }]
     }
 }
@@ -334,10 +301,6 @@ where
 }
 
 impl Settings {
-    pub fn compression(&self) -> CompressionConfig {
-        self.compression
-    }
-
     pub fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = config_path.as_ref();
         let content = fs::read_to_string(path)
@@ -396,16 +359,18 @@ impl Settings {
                     unix_socket: Some(PathBuf::from("/tmp/zerofs.nbd.sock")),
                     api_address: Some(default_api_address()),
                     block_size: None,
+                    blocks_per_batch: None,
+                    sync_delay_ms: None,
                     exports: vec![ExportConfig {
                         name: "default".to_string(),
                         size_gb: 100.0,
                         s3_prefix: None,
+                        block_size: None,
                     }],
                     device_name: None,
                     device_size_gb: None,
                 }),
             },
-            compression: CompressionConfig::default(),
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,

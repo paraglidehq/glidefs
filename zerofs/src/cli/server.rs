@@ -1,14 +1,11 @@
-use crate::block_transformer::ZeroFsBlockTransformer;
 use crate::bucket_identity;
 use crate::config::Settings;
-use crate::key_management;
 use crate::nbd::api::ApiServer;
 use crate::nbd::router::ExportRouter;
 use crate::nbd::server::NBDServer;
 use crate::parse_object_store::parse_url_opts;
 use crate::task::spawn_named;
 use anyhow::{Context, Result};
-use object_store::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -68,19 +65,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     crate::storage_compatibility::check_if_match_support(&object_store, &db_path).await?;
 
-    let password = settings.storage.encryption_password.clone();
-    super::password::validate_password(&password)
-        .map_err(|e| anyhow::anyhow!("Password validation failed: {}", e))?;
-
-    info!("Loading or initializing encryption key from object store");
-    let object_path = Path::from(db_path.clone());
-    let encryption_key =
-        key_management::load_or_init_encryption_key(&object_store, &object_path, &password, false)
-            .await?;
-
-    let block_transformer =
-        ZeroFsBlockTransformer::new_arc(&encryption_key, settings.compression());
-
     let shutdown = CancellationToken::new();
 
     let nbd_config = settings
@@ -89,13 +73,20 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("NBD server configuration is required"))?;
 
+    // Generate a unique node ID for lease coordination
+    // UUID ensures uniqueness even across restarts
+    let node_id = format!("node-{}", uuid::Uuid::new_v4().as_simple());
+    info!("Node ID for lease coordination: {}", node_id);
+
     // Create the export router
     let router = Arc::new(ExportRouter::new(
         Arc::clone(&object_store),
         db_path,
         cache_dir,
         nbd_config.block_size(),
-        Some(block_transformer),
+        nbd_config.blocks_per_batch(),
+        nbd_config.sync_delay_ms(),
+        node_id,
     ));
 
     // Load static exports from config

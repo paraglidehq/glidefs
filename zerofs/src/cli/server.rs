@@ -208,6 +208,7 @@ async fn start_nbd_servers(
     handles
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,

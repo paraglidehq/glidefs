@@ -173,6 +173,7 @@ struct HeldPathLease {
 ///
 /// The token is consumed by `complete_handoff`, so you can only complete once.
 #[must_use = "PreparedHandoff must be passed to complete_handoff to finish the handoff"]
+#[derive(Debug)]
 pub struct PreparedHandoff {
     path: String,
 }
@@ -319,6 +320,12 @@ impl LeaseCoordinator {
     ///
     /// Returns a [`PreparedHandoff`] token that MUST be passed to [`complete_handoff`]
     /// to finish the handoff. This enforces correct protocol at compile time.
+    ///
+    /// # Idempotency
+    ///
+    /// This operation is idempotent. If called multiple times for the same path:
+    /// - If already in `Releasing` state: returns a new token (drain/flush are safe to repeat)
+    /// - If already in `Released` state: returns error (handoff already complete)
     pub async fn prepare_handoff(
         &self,
         path: &str,
@@ -330,45 +337,54 @@ impl LeaseCoordinator {
         let lease_path = self.path_to_lease_path(path);
 
         // Get and update the held lease
-        let inode_id = {
+        let (inode_id, already_releasing) = {
             let mut entry = self.held_leases
                 .get_mut(path)
                 .ok_or_else(|| LeaseError::LeaseNotHeld(path.to_string()))?;
 
             let held = entry.value_mut();
 
-            if held.lease.state != LeaseState::Active {
-                return Err(LeaseError::WrongState {
-                    expected: LeaseState::Active,
-                    actual: held.lease.state,
-                });
+            match held.lease.state {
+                LeaseState::Active => {
+                    // Normal path: transition Active → Releasing
+                    let inode_id = held.inode_id;
+                    self.blocked_inodes.insert(inode_id);
+                    info!("Blocked writes to inode {} for path {}", inode_id, path);
+
+                    held.lease.state = LeaseState::Releasing;
+                    held.lease.version += 1;
+
+                    let new_etag = self.write_lease_conditional(&lease_path, &held.lease, held.etag.as_deref()).await?;
+                    held.etag = new_etag;
+
+                    (inode_id, false)
+                }
+                LeaseState::Releasing => {
+                    // Idempotent: already preparing, just re-drain and re-flush
+                    debug!("Idempotent prepare_handoff: path {} already in Releasing state", path);
+                    (held.inode_id, true)
+                }
+                LeaseState::Released => {
+                    // Can't prepare a completed handoff
+                    return Err(LeaseError::InvalidHandoffState(
+                        format!("Handoff for path '{}' already completed", path)
+                    ));
+                }
             }
-
-            // Block writes to this inode FIRST
-            let inode_id = held.inode_id;
-            self.blocked_inodes.insert(inode_id);
-            info!("Blocked writes to inode {} for path {}", inode_id, path);
-
-            // Update lease state
-            held.lease.state = LeaseState::Releasing;
-            held.lease.version += 1;
-
-            let new_etag = self.write_lease_conditional(&lease_path, &held.lease, held.etag.as_deref()).await?;
-            held.etag = new_etag;
-
-            inode_id
         };
 
-        let _ = self.state_sender.send(Some((path.to_string(), LeaseState::Releasing)));
+        if !already_releasing {
+            let _ = self.state_sender.send(Some((path.to_string(), LeaseState::Releasing)));
+        }
 
-        // Drain in-flight writes
+        // Drain in-flight writes (safe to repeat - just waits for current watermark)
         info!("Draining in-flight writes for path {}...", path);
         let mut drain_guard = write_coordinator.allocate_sequence();
         drain_guard.wait_for_predecessors().await;
         drain_guard.mark_committed();
         info!("All in-flight writes drained for path {}", path);
 
-        // Flush to S3
+        // Flush to S3 (safe to repeat - flush coordinator batches anyway)
         info!("Flushing data to S3 for path {}...", path);
         flush_coordinator
             .flush()
@@ -380,6 +396,7 @@ impl LeaseCoordinator {
 
         // Store in pending_handoffs - this is the source of truth that prepare was called.
         // Both complete_handoff(token) and complete_handoff_by_path() will check this.
+        // Idempotent: re-inserting same key just overwrites.
         let token = PreparedHandoff {
             path: path.to_string(),
         };
@@ -398,12 +415,18 @@ impl LeaseCoordinator {
     /// complete a handoff without first preparing it.
     ///
     /// After this returns, another node can acquire the lease for this path.
+    ///
+    /// # Idempotency
+    ///
+    /// This operation is idempotent. If called multiple times:
+    /// - If already in `Released` state: returns success (no-op)
+    /// - The token is always consumed regardless
     pub async fn complete_handoff(&self, prepared: PreparedHandoff) -> Result<(), LeaseError> {
         let path = &prepared.path;
         info!("Completing handoff for path: {}", path);
 
         // Remove from pending_handoffs (token proves prepare was called,
-        // but we also clean up the stored entry)
+        // but we also clean up the stored entry). Idempotent: remove tolerates missing.
         self.pending_handoffs.remove(path);
 
         let lease_path = self.path_to_lease_path(path);
@@ -414,24 +437,29 @@ impl LeaseCoordinator {
 
         let held = entry.value_mut();
 
-        // This check is now redundant (prepare_handoff guarantees Releasing state)
-        // but we keep it for defense in depth
-        if held.lease.state != LeaseState::Releasing {
-            return Err(LeaseError::WrongState {
-                expected: LeaseState::Releasing,
-                actual: held.lease.state,
-            });
+        match held.lease.state {
+            LeaseState::Releasing => {
+                // Normal path: transition Releasing → Released
+                held.lease.state = LeaseState::Released;
+                held.lease.version += 1;
+
+                let new_etag = self.write_lease_conditional(&lease_path, &held.lease, held.etag.as_deref()).await?;
+                held.etag = new_etag;
+
+                let _ = self.state_sender.send(Some((path.to_string(), LeaseState::Released)));
+                info!("Handoff complete for path {}: lease released", path);
+            }
+            LeaseState::Released => {
+                // Idempotent: already released, nothing to do
+                debug!("Idempotent complete_handoff: path {} already in Released state", path);
+            }
+            LeaseState::Active => {
+                // Should never happen with a valid token, but handle gracefully
+                return Err(LeaseError::InvalidHandoffState(
+                    format!("Cannot complete handoff for path '{}': lease is still Active (prepare_handoff not called?)", path)
+                ));
+            }
         }
-
-        held.lease.state = LeaseState::Released;
-        held.lease.version += 1;
-
-        let new_etag = self.write_lease_conditional(&lease_path, &held.lease, held.etag.as_deref()).await?;
-        held.etag = new_etag;
-
-        let _ = self.state_sender.send(Some((path.to_string(), LeaseState::Released)));
-
-        info!("Handoff complete for path {}: lease released", path);
 
         // Token is consumed here - cannot be reused
         drop(prepared);
@@ -448,17 +476,17 @@ impl LeaseCoordinator {
     ///
     /// For internal/SDK use, prefer the token-based [`complete_handoff`] method
     /// which provides compile-time enforcement.
+    ///
+    /// # Idempotency
+    ///
+    /// This operation is idempotent. If called multiple times:
+    /// - If already in `Released` state: returns success (no-op)
+    /// - If in `Active` state (prepare never called): returns error
     pub async fn complete_handoff_by_path(&self, path: &str) -> Result<(), LeaseError> {
         info!("Completing handoff for path (RPC): {}", path);
 
-        // Verify and consume the pending handoff token.
-        // This ensures prepare_handoff was called before complete_handoff.
-        let _token = self
-            .pending_handoffs
-            .remove(path)
-            .ok_or_else(|| LeaseError::InvalidHandoffState(
-                format!("No pending handoff for path '{}'. Call prepare_handoff first.", path)
-            ))?;
+        // Remove from pending_handoffs if present (idempotent: tolerates missing)
+        self.pending_handoffs.remove(path);
 
         let lease_path = self.path_to_lease_path(path);
 
@@ -468,23 +496,29 @@ impl LeaseCoordinator {
 
         let held = entry.value_mut();
 
-        // Additional runtime validation - should always pass if pending_handoffs was set
-        if held.lease.state != LeaseState::Releasing {
-            return Err(LeaseError::WrongState {
-                expected: LeaseState::Releasing,
-                actual: held.lease.state,
-            });
+        match held.lease.state {
+            LeaseState::Releasing => {
+                // Normal path: transition Releasing → Released
+                held.lease.state = LeaseState::Released;
+                held.lease.version += 1;
+
+                let new_etag = self.write_lease_conditional(&lease_path, &held.lease, held.etag.as_deref()).await?;
+                held.etag = new_etag;
+
+                let _ = self.state_sender.send(Some((path.to_string(), LeaseState::Released)));
+                info!("Handoff complete for path {}: lease released (RPC)", path);
+            }
+            LeaseState::Released => {
+                // Idempotent: already released, nothing to do
+                debug!("Idempotent complete_handoff_by_path: path {} already in Released state", path);
+            }
+            LeaseState::Active => {
+                // prepare_handoff was never called
+                return Err(LeaseError::InvalidHandoffState(
+                    format!("No pending handoff for path '{}'. Call prepare_handoff first.", path)
+                ));
+            }
         }
-
-        held.lease.state = LeaseState::Released;
-        held.lease.version += 1;
-
-        let new_etag = self.write_lease_conditional(&lease_path, &held.lease, held.etag.as_deref()).await?;
-        held.etag = new_etag;
-
-        let _ = self.state_sender.send(Some((path.to_string(), LeaseState::Released)));
-
-        info!("Handoff complete for path {}: lease released (RPC)", path);
 
         Ok(())
     }
@@ -1126,5 +1160,129 @@ mod tests {
         // Lease should still be Active (not Released)
         let status = coordinator.get_path_status("/.nbd/vm-1.raw").unwrap();
         assert_eq!(status.state, LeaseState::Active);
+    }
+
+    // =========================================================================
+    // Idempotency Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_prepare_handoff_is_idempotent() {
+        let store = create_test_store();
+        let coordinator = LeaseCoordinator::new(store, "test-db", create_test_config("node-a"));
+
+        coordinator.acquire_path("/.nbd/vm-1.raw", 42).await.unwrap();
+
+        let write_coordinator = create_mock_write_coordinator();
+        let flush_coordinator = create_mock_flush_coordinator();
+
+        // First prepare succeeds
+        let prepared1 = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+            .await
+            .unwrap();
+
+        assert_eq!(coordinator.get_path_status("/.nbd/vm-1.raw").unwrap().state, LeaseState::Releasing);
+
+        // Second prepare also succeeds (idempotent)
+        let prepared2 = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+            .await
+            .unwrap();
+
+        // Still in Releasing state
+        assert_eq!(coordinator.get_path_status("/.nbd/vm-1.raw").unwrap().state, LeaseState::Releasing);
+
+        // Both tokens are valid (can use either)
+        assert_eq!(prepared1.path(), "/.nbd/vm-1.raw");
+        assert_eq!(prepared2.path(), "/.nbd/vm-1.raw");
+
+        // Can complete with either token
+        coordinator.complete_handoff(prepared1).await.unwrap();
+        assert_eq!(coordinator.get_path_status("/.nbd/vm-1.raw").unwrap().state, LeaseState::Released);
+    }
+
+    #[tokio::test]
+    async fn test_complete_handoff_is_idempotent() {
+        let store = create_test_store();
+        let coordinator = LeaseCoordinator::new(store, "test-db", create_test_config("node-a"));
+
+        coordinator.acquire_path("/.nbd/vm-1.raw", 42).await.unwrap();
+
+        let write_coordinator = create_mock_write_coordinator();
+        let flush_coordinator = create_mock_flush_coordinator();
+
+        // Prepare and complete once
+        let prepared = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+            .await
+            .unwrap();
+
+        coordinator.complete_handoff(prepared).await.unwrap();
+        assert_eq!(coordinator.get_path_status("/.nbd/vm-1.raw").unwrap().state, LeaseState::Released);
+
+        // Second complete via by_path also succeeds (idempotent)
+        coordinator.complete_handoff_by_path("/.nbd/vm-1.raw").await.unwrap();
+
+        // Still Released
+        assert_eq!(coordinator.get_path_status("/.nbd/vm-1.raw").unwrap().state, LeaseState::Released);
+    }
+
+    #[tokio::test]
+    async fn test_complete_handoff_by_path_is_idempotent() {
+        let store = create_test_store();
+        let coordinator = LeaseCoordinator::new(store, "test-db", create_test_config("node-a"));
+
+        coordinator.acquire_path("/.nbd/vm-1.raw", 42).await.unwrap();
+
+        let write_coordinator = create_mock_write_coordinator();
+        let flush_coordinator = create_mock_flush_coordinator();
+
+        // Prepare
+        let _prepared = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+            .await
+            .unwrap();
+
+        // First complete by path
+        coordinator.complete_handoff_by_path("/.nbd/vm-1.raw").await.unwrap();
+        assert_eq!(coordinator.get_path_status("/.nbd/vm-1.raw").unwrap().state, LeaseState::Released);
+
+        // Second complete by path also succeeds (idempotent)
+        coordinator.complete_handoff_by_path("/.nbd/vm-1.raw").await.unwrap();
+
+        // Still Released
+        assert_eq!(coordinator.get_path_status("/.nbd/vm-1.raw").unwrap().state, LeaseState::Released);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_after_complete_fails() {
+        let store = create_test_store();
+        let coordinator = LeaseCoordinator::new(store, "test-db", create_test_config("node-a"));
+
+        coordinator.acquire_path("/.nbd/vm-1.raw", 42).await.unwrap();
+
+        let write_coordinator = create_mock_write_coordinator();
+        let flush_coordinator = create_mock_flush_coordinator();
+
+        // Complete the handoff
+        let prepared = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+            .await
+            .unwrap();
+        coordinator.complete_handoff(prepared).await.unwrap();
+
+        // Trying to prepare again should fail (can't go back from Released)
+        let result = coordinator
+            .prepare_handoff("/.nbd/vm-1.raw", &write_coordinator, &flush_coordinator)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LeaseError::InvalidHandoffState(msg) => {
+                assert!(msg.contains("already completed"));
+            }
+            other => panic!("Expected InvalidHandoffState, got: {:?}", other),
+        }
     }
 }

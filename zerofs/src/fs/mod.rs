@@ -215,10 +215,12 @@ impl ZeroFS {
     /// Check if writes are blocked for a specific inode (during per-path handoff).
     /// Returns an error if the inode is blocked.
     fn check_writes_allowed_for_inode(&self, inode_id: InodeId) -> Result<(), FsError> {
-        if let Some(ref coordinator) = self.lease_coordinator {
-            if coordinator.is_inode_blocked(inode_id) {
-                return Err(FsError::ReadOnlyFilesystem);
-            }
+        if self
+            .lease_coordinator
+            .as_ref()
+            .is_some_and(|c| c.is_inode_blocked(inode_id))
+        {
+            return Err(FsError::ReadOnlyFilesystem);
         }
         Ok(())
     }

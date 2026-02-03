@@ -7,7 +7,14 @@
       "Bash(cargo test:*)",
       "Bash(cargo build:*)",
       "Bash(./target/debug/zerofs:*)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(gh api:*)",
+      "Bash(gh search code:*)",
+      "Bash(curl:*)",
+      "Bash(gh search:*)",
+      "WebFetch(domain:utcc.utoronto.ca)",
+      "WebFetch(domain:www.open-e.com)",
+      "WebFetch(domain:klarasystems.com)"
     ]
   }
 }

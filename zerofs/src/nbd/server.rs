@@ -804,23 +804,10 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     }
                 }
 
-                // Try to get more responses, with a short wait to allow batching
+                // Try to get more responses without waiting
                 match response_rx.try_recv() {
                     Ok(next) => response = next,
-                    Err(_) => {
-                        // No responses immediately ready - wait briefly for more to arrive.
-                        // This helps batch fast writes (47µs) that complete while slow reads
-                        // (hundreds of µs) are still pending, avoiding per-response flushes.
-                        match tokio::time::timeout(
-                            std::time::Duration::from_micros(100),
-                            response_rx.recv(),
-                        )
-                        .await
-                        {
-                            Ok(Some(next)) => response = next, // Got one, keep batching
-                            _ => break, // Timeout or channel closed, flush now
-                        }
-                    }
+                    Err(_) => break, // No more waiting, flush now
                 }
             }
 

@@ -69,6 +69,7 @@ impl TestHarness {
     }
 
     /// Print metrics summary.
+    #[allow(dead_code)]
     fn print_metrics(&self, label: &str) {
         let snap = self.metrics.snapshot();
         eprintln!("\n=== {} Metrics ===", label);
@@ -339,7 +340,6 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
 
                 total += start.elapsed();
-                harness.print_metrics("VM Boot");
             }
 
             total
@@ -374,7 +374,6 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
 
                 total += start.elapsed();
-                harness.print_metrics("Database Random I/O");
             }
 
             total
@@ -418,7 +417,6 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
 
                 total += start.elapsed();
-                harness.print_metrics("Compilation Workload");
             }
 
             total

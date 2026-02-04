@@ -2,19 +2,48 @@
 //!
 //! This module provides a TCP/Unix socket NBD server that supports multiple
 //! exports, each with its own write-behind cache and S3 storage.
+//!
+//! # Concurrent Request Processing
+//!
+//! The transmission phase uses concurrent request handling to maximize IOPS:
+//! - Requests are read sequentially from the socket (protocol requirement)
+//! - Each request is dispatched to a separate task for processing
+//! - Responses are sent through a channel to a dedicated writer task
+//! - This allows multiple requests to be in-flight simultaneously
 
 use super::error::{NBDError, Result};
 use super::handler::{NBDBlockHandler, NBDDevice};
 use super::protocol::*;
 use super::router::ExportRouter;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use deku::prelude::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Maximum number of in-flight requests before backpressure kicks in.
+/// This limits memory usage while allowing high concurrency.
+const MAX_INFLIGHT_REQUESTS: usize = 256;
+
+/// Response to be sent back to the client.
+/// Sent through a channel from handler tasks to the writer task.
+#[derive(Debug)]
+enum Response {
+    /// Simple reply with optional data (for reads)
+    Simple {
+        cookie: u64,
+        error: u32,
+        data: Bytes,
+    },
+    /// Signal to drain and disconnect
+    Disconnect { export_name: String },
+    /// Signal that all requests have been processed
+    Shutdown,
+}
 
 pub enum Transport {
     Tcp(SocketAddr),
@@ -168,6 +197,7 @@ struct NBDSession<R, W> {
     shutdown: CancellationToken,
 }
 
+// Basic session methods - no 'static required
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     fn new(
         reader: R,
@@ -474,24 +504,83 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
         Ok(())
     }
+}
 
+// Transmission methods - require 'static for spawning tasks
+impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static> NBDSession<R, W> {
+    /// Handle the transmission phase with concurrent request processing.
+    ///
+    /// This implementation processes multiple requests concurrently:
+    /// 1. Requests are read sequentially from the socket (protocol requirement)
+    /// 2. Each request is dispatched to a tokio task for processing
+    /// 3. Responses are sent through a channel to a dedicated writer task
+    /// 4. The writer task serializes responses back to the client
+    ///
+    /// This allows high IOPS by overlapping I/O operations instead of
+    /// processing requests one at a time.
     async fn handle_transmission(
-        &mut self,
+        self,
         device: NBDDevice,
         handler: Arc<NBDBlockHandler>,
     ) -> Result<()> {
-        let device_size = device.size;
+        let export_name = String::from_utf8_lossy(&device.name).to_string();
 
+        // Destructure self to split reader and writer
+        let NBDSession { mut reader, writer, router, shutdown, .. } = self;
+
+        // Channel for sending responses from handler tasks to writer task
+        let (response_tx, response_rx) = mpsc::channel::<Response>(MAX_INFLIGHT_REQUESTS);
+
+        // Spawn writer task that serializes responses to the socket
+        let writer_handle = tokio::spawn(Self::response_writer(writer, response_rx, Arc::clone(&router)));
+
+        // Process requests until disconnect or shutdown
+        let result = Self::request_reader_loop(
+            &mut reader,
+            &shutdown,
+            &export_name,
+            handler,
+            response_tx,
+        ).await;
+
+        // Wait for writer to finish
+        if let Err(e) = writer_handle.await {
+            warn!("Writer task panicked: {:?}", e);
+        }
+
+        result
+    }
+
+    /// Read requests from socket and dispatch to handler tasks.
+    async fn request_reader_loop(
+        reader: &mut R,
+        shutdown: &CancellationToken,
+        export_name: &str,
+        handler: Arc<NBDBlockHandler>,
+        response_tx: mpsc::Sender<Response>,
+    ) -> Result<()> {
         loop {
             let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
 
             tokio::select! {
-                _ = self.shutdown.cancelled() => {
+                _ = shutdown.cancelled() => {
                     debug!("NBD client handler shutting down");
+                    let _ = response_tx.send(Response::Shutdown).await;
                     return Ok(());
                 }
-                result = self.reader.read_exact(&mut request_buf) => {
-                    result?;
+                result = reader.read_exact(&mut request_buf) => {
+                    match result {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            debug!("Client disconnected");
+                            let _ = response_tx.send(Response::Shutdown).await;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send(Response::Shutdown).await;
+                            return Err(NBDError::Io(e));
+                        }
+                    }
                 }
             }
 
@@ -508,121 +597,193 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
             match request.cmd_type {
                 NBDCommand::Read => {
-                    let result = handler.read(request.offset, request.length).await;
-                    self.send_read_result(request.cookie, result).await;
+                    // Spawn task to handle read concurrently
+                    let h = Arc::clone(&handler);
+                    let tx = response_tx.clone();
+                    let offset = request.offset;
+                    let length = request.length;
+                    let cookie = request.cookie;
+
+                    tokio::spawn(async move {
+                        let result = h.read(offset, length).await;
+                        let response = match result {
+                            Ok(data) => Response::Simple { cookie, error: NBD_SUCCESS, data },
+                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                        };
+                        let _ = tx.send(response).await;
+                    });
                 }
                 NBDCommand::Write => {
-                    let result = self
-                        .read_write_data(&handler, request.offset, request.length, fua, device_size)
-                        .await;
-                    self.send_unit_result(request.cookie, result).await;
+                    // Must read write data from socket before spawning task
+                    let write_data = Self::read_write_payload(reader, request.length).await;
+
+                    let h = Arc::clone(&handler);
+                    let tx = response_tx.clone();
+                    let offset = request.offset;
+                    let cookie = request.cookie;
+
+                    tokio::spawn(async move {
+                        let result = match write_data {
+                            Ok(data) => h.write(offset, &data, fua),
+                            Err(e) => Err(e),
+                        };
+                        let response = match result {
+                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                        };
+                        let _ = tx.send(response).await;
+                    });
                 }
                 NBDCommand::Disconnect => {
-                    let export_name = String::from_utf8_lossy(&device.name).to_string();
                     info!("Client disconnecting from '{}', draining to S3...", export_name);
-                    if let Err(e) = self.router.drain_export(&export_name).await {
-                        warn!("Failed to drain on disconnect: {}", e);
-                    }
-                    info!("Client disconnected, drain complete");
+                    let _ = response_tx.send(Response::Disconnect { export_name: export_name.to_string() }).await;
                     return Ok(());
                 }
                 NBDCommand::Flush => {
-                    let result = handler.flush();
-                    self.send_unit_result(request.cookie, result).await;
+                    // Flush is synchronous - important for data integrity
+                    let h = Arc::clone(&handler);
+                    let tx = response_tx.clone();
+                    let cookie = request.cookie;
+
+                    tokio::spawn(async move {
+                        let result = h.flush();
+                        let response = match result {
+                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                        };
+                        let _ = tx.send(response).await;
+                    });
                 }
                 NBDCommand::Trim => {
-                    let result = handler.trim(request.offset, request.length, fua);
-                    self.send_unit_result(request.cookie, result).await;
+                    let h = Arc::clone(&handler);
+                    let tx = response_tx.clone();
+                    let offset = request.offset;
+                    let length = request.length;
+                    let cookie = request.cookie;
+
+                    tokio::spawn(async move {
+                        let result = h.trim(offset, length, fua);
+                        let response = match result {
+                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                        };
+                        let _ = tx.send(response).await;
+                    });
                 }
                 NBDCommand::WriteZeroes => {
-                    let result = handler.write_zeroes(request.offset, request.length, fua);
-                    self.send_unit_result(request.cookie, result).await;
+                    let h = Arc::clone(&handler);
+                    let tx = response_tx.clone();
+                    let offset = request.offset;
+                    let length = request.length;
+                    let cookie = request.cookie;
+
+                    tokio::spawn(async move {
+                        let result = h.write_zeroes(offset, length, fua);
+                        let response = match result {
+                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                        };
+                        let _ = tx.send(response).await;
+                    });
                 }
                 NBDCommand::Cache => {
-                    let result = handler.cache(request.offset, request.length);
-                    self.send_unit_result(request.cookie, result).await;
+                    let h = Arc::clone(&handler);
+                    let tx = response_tx.clone();
+                    let offset = request.offset;
+                    let length = request.length;
+                    let cookie = request.cookie;
+
+                    tokio::spawn(async move {
+                        let result = h.cache(offset, length);
+                        let response = match result {
+                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                        };
+                        let _ = tx.send(response).await;
+                    });
                 }
                 NBDCommand::Unknown(cmd) => {
                     warn!("Unknown NBD command: {}", cmd);
-                    self.send_unit_result(
-                        request.cookie,
-                        Err(super::error::CommandError::InvalidArgument),
-                    )
-                    .await;
+                    let _ = response_tx.send(Response::Simple {
+                        cookie: request.cookie,
+                        error: super::error::CommandError::InvalidArgument.to_errno(),
+                        data: Bytes::new(),
+                    }).await;
                 }
             }
         }
     }
 
-    async fn read_write_data(
-        &mut self,
-        handler: &NBDBlockHandler,
-        offset: u64,
+    /// Read write payload from socket (must be done before spawning handler task).
+    async fn read_write_payload(
+        reader: &mut R,
         length: u32,
-        fua: bool,
-        device_size: u64,
-    ) -> super::error::CommandResult<()> {
+    ) -> super::error::CommandResult<Bytes> {
         use super::error::CommandError;
 
-        if offset + length as u64 > device_size {
-            let mut data = BytesMut::zeroed(length as usize);
-            let _ = self.reader.read_exact(&mut data).await;
-            return Err(CommandError::NoSpace);
-        }
-
         if length == 0 {
-            return Ok(());
+            return Ok(Bytes::new());
         }
 
         let mut data = BytesMut::zeroed(length as usize);
-        self.reader
+        reader
             .read_exact(&mut data)
             .await
             .map_err(|_| CommandError::IoError)?;
 
-        handler.write(offset, &data, fua)
+        Ok(data.freeze())
     }
 
-    async fn send_read_result(
-        &mut self,
-        cookie: u64,
-        result: super::error::CommandResult<bytes::Bytes>,
+    /// Writer task that serializes responses to the socket.
+    async fn response_writer<Writer: AsyncWrite + Unpin>(
+        mut writer: Writer,
+        mut response_rx: mpsc::Receiver<Response>,
+        router: Arc<ExportRouter>,
     ) {
-        match result {
-            Ok(data) => {
-                if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &data).await {
-                    debug!("Failed to send reply: {:?}", e);
+        while let Some(response) = response_rx.recv().await {
+            match response {
+                Response::Simple { cookie, error, data } => {
+                    let reply = NBDSimpleReply::new(cookie, error);
+                    let reply_bytes = match reply.to_bytes() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            debug!("Failed to serialize reply: {:?}", e);
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = writer.write_all(&reply_bytes).await {
+                        debug!("Failed to write reply header: {:?}", e);
+                        break;
+                    }
+
+                    if !data.is_empty() {
+                        if let Err(e) = writer.write_all(&data).await {
+                            debug!("Failed to write reply data: {:?}", e);
+                            break;
+                        }
+                    }
+
+                    if let Err(e) = writer.flush().await {
+                        debug!("Failed to flush: {:?}", e);
+                        break;
+                    }
                 }
-            }
-            Err(e) => {
-                let _ = self.send_simple_reply(cookie, e.to_errno(), &[]).await;
+                Response::Disconnect { export_name } => {
+                    if let Err(e) = router.drain_export(&export_name).await {
+                        warn!("Failed to drain on disconnect: {}", e);
+                    }
+                    info!("Client disconnected, drain complete");
+                    break;
+                }
+                Response::Shutdown => {
+                    debug!("Writer task shutting down");
+                    break;
+                }
             }
         }
     }
 
-    async fn send_unit_result(&mut self, cookie: u64, result: super::error::CommandResult<()>) {
-        match result {
-            Ok(()) => {
-                if let Err(e) = self.send_simple_reply(cookie, NBD_SUCCESS, &[]).await {
-                    debug!("Failed to send reply: {:?}", e);
-                }
-            }
-            Err(e) => {
-                let _ = self.send_simple_reply(cookie, e.to_errno(), &[]).await;
-            }
-        }
-    }
-
-    async fn send_simple_reply(&mut self, cookie: u64, error: u32, data: &[u8]) -> Result<()> {
-        let reply = NBDSimpleReply::new(cookie, error);
-        let reply_bytes = reply.to_bytes()?;
-        self.writer.write_all(&reply_bytes).await?;
-        if !data.is_empty() {
-            self.writer.write_all(data).await?;
-        }
-        self.writer.flush().await?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]

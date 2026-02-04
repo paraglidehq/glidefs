@@ -109,29 +109,33 @@ fn is_zero_block(data: &[u8]) -> bool {
 unsafe fn is_zero_block_avx2(data: &[u8]) -> bool {
     use std::arch::x86_64::*;
 
-    let mut ptr = data.as_ptr();
-    let end = ptr.add(data.len());
+    // SAFETY: This function is only called when AVX2 is available (checked by caller).
+    // All pointer operations stay within the bounds of `data`.
+    unsafe {
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
 
-    // Process 32-byte chunks with AVX2
-    // _mm256_loadu_si256 handles unaligned loads
-    while ptr.add(32) <= end {
-        let chunk = _mm256_loadu_si256(ptr as *const __m256i);
-        // testz returns 1 if all bits are zero: (chunk AND chunk) == 0
-        if _mm256_testz_si256(chunk, chunk) == 0 {
-            return false;
+        // Process 32-byte chunks with AVX2
+        // _mm256_loadu_si256 handles unaligned loads
+        while ptr.add(32) <= end {
+            let chunk = _mm256_loadu_si256(ptr as *const __m256i);
+            // testz returns 1 if all bits are zero: (chunk AND chunk) == 0
+            if _mm256_testz_si256(chunk, chunk) == 0 {
+                return false;
+            }
+            ptr = ptr.add(32);
         }
-        ptr = ptr.add(32);
-    }
 
-    // Handle remainder (0-31 bytes) with scalar code
-    while ptr < end {
-        if *ptr != 0 {
-            return false;
+        // Handle remainder (0-31 bytes) with scalar code
+        while ptr < end {
+            if *ptr != 0 {
+                return false;
+            }
+            ptr = ptr.add(1);
         }
-        ptr = ptr.add(1);
-    }
 
-    true
+        true
+    }
 }
 
 /// Fallback implementation using 64-bit words.

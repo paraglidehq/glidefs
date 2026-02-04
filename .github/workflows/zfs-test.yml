@@ -61,6 +61,7 @@ jobs:
 
           [storage]
           url = "s3://zerofs-iops-test/bench"
+          encryption_password = "bench-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]

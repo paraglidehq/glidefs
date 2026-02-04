@@ -131,10 +131,10 @@ WriteCache<Draining>
 | Draining | Sync remaining blocks, reject new writes |
 
 **Block presence tracking**:
-- `present_blocks` bitmap tracks which blocks exist locally
+- `present_chunks`: `Box<[AtomicU64]>` bitmap tracks which blocks exist locally
 - Fresh cache on new node: all blocks marked NOT present
 - On read: if block not present, fetch from S3 and cache locally
-- On write: mark block as present and dirty
+- On write: mark block as present (atomic OR) and dirty
 
 ## Core Components
 
@@ -146,9 +146,11 @@ Central coordinator for multi-tenant operation. Manages the lifecycle of all exp
 pub struct ExportRouter {
     exports: RwLock<HashMap<String, ExportState>>,
     object_store: Arc<dyn ObjectStore>,
+    db_path: String,              // Base S3 path prefix
     cache_dir: PathBuf,
     block_size: usize,
     blocks_per_batch: u64,
+    sync_delay_ms: u64,           // Write coalescing delay
     lease_manager: Arc<LeaseManager>,
 }
 ```
@@ -287,7 +289,10 @@ Thin handler that delegates all I/O to WriteCache:
 ```rust
 pub struct NBDBlockHandler {
     cache: Arc<WriteCache<Active>>,  // Typestate: only Active cache
+    s3_store: Arc<S3BlockStore>,     // For read-through caching
     device_size: u64,
+    readonly: AtomicBool,            // Reject writes when true (migration)
+    metrics: Arc<ExportMetrics>,     // I/O statistics
 }
 
 impl NBDBlockHandler {
@@ -314,7 +319,7 @@ REST API for orchestrator integration.
 
 ## Metrics (`nbd/metrics.rs`)
 
-Per-export I/O metrics for monitoring write amplification and compression effectiveness.
+Per-export I/O metrics for monitoring write amplification and cache effectiveness.
 
 **Available via**: `GET /api/exports/{name}/metrics`
 
@@ -322,8 +327,12 @@ Per-export I/O metrics for monitoring write amplification and compression effect
 |--------|-------------|
 | `guest_bytes_written` | Total bytes written by VM |
 | `guest_write_ops` | Number of NBD write commands |
-| `s3_bytes_written` | Total bytes written to S3 (after compression) |
+| `guest_bytes_read` | Total bytes read by VM |
+| `guest_read_ops` | Number of NBD read commands |
+| `s3_bytes_written` | Total bytes written to S3 |
 | `s3_write_ops` | Number of blocks synced to S3 |
+| `s3_bytes_read` | Total bytes read from S3 |
+| `s3_read_ops` | Number of blocks fetched from S3 |
 | `batches_written` | Number of S3 batch objects written |
 | `cache_hits` / `cache_misses` | Read-through cache effectiveness |
 
@@ -331,10 +340,11 @@ Per-export I/O metrics for monitoring write amplification and compression effect
 
 | Metric | Formula | Interpretation |
 |--------|---------|----------------|
-| `write_amplification` | s3_bytes / guest_bytes | < 1.0 = compression helping |
-| `compression_ratio` | uncompressed / compressed | > 1.0 = compression effective |
+| `write_amplification` | s3_bytes / guest_bytes | > 1.0 = batching overhead, < 1.0 = zero-block optimization helping |
 | `coalesce_ratio` | guest_ops / batches_written | > 1.0 = batching effective |
 | `cache_hit_rate` | hits / (hits + misses) | Higher = fewer S3 fetches |
+
+Note: Block-level compression is intentionally not implemented. ZFS handles compression at its layer.
 
 ## Operational Scenarios
 
@@ -410,9 +420,12 @@ SIGUSR1 (node maintenance):
 ```toml
 [storage]
 url = "s3://bucket/path"
+encryption_password = "$ZEROFS_PASSWORD"  # XChaCha20-Poly1305 key derivation
 
 [cache]
 dir = "/var/cache/zerofs"
+disk_size_gb = 100.0
+memory_size_gb = 10.0    # Optional in-memory cache
 
 [servers.nbd]
 addresses = ["0.0.0.0:10809"]
@@ -420,6 +433,7 @@ unix_socket = "/run/zerofs/nbd.sock"
 api_address = "127.0.0.1:8080"
 block_size = 131072      # 128KB (default)
 blocks_per_batch = 100   # S3 batching: 100 blocks × 128KB = 12.8MB per PUT
+sync_delay_ms = 100      # Write coalescing delay (maps to hot batch cooldown)
 
 [[servers.nbd.exports]]
 name = "vm-001"
@@ -432,12 +446,21 @@ s3_prefix = "custom-prefix"  # Optional, defaults to name
 block_size = 16384           # Optional, 16KB for database workloads
 ```
 
+**TOML Configuration Options**:
+
 | Variable | Default | Rationale |
 |----------|---------|-----------|
 | `block_size` | 128KB | Match ZFS recordsize |
 | `blocks_per_batch` | 100 | Balance PUT cost vs latency |
+| `sync_delay_ms` | 100ms | Write coalescing / hot batch cooldown |
 | `cache.dir` | ~/.cache/zerofs | Local SSD cache location |
-| `hot_batch_cooldown` | 100ms | Defer recently-synced batches to reduce write amplification |
+| `cache.disk_size_gb` | required | Cache size on disk |
+| `cache.memory_size_gb` | none | Optional in-memory cache |
+
+**Internal Defaults** (not configurable via TOML):
+
+| Variable | Default | Rationale |
+|----------|---------|-----------|
 | `dirty_queue_warn_threshold` | 1000 | Warn when dirty queue exceeds (128MB @ 128KB blocks) |
 | `dirty_queue_critical_threshold` | 10000 | Error when dirty queue exceeds (1.28GB @ 128KB blocks) |
 
@@ -784,25 +807,32 @@ remove_export() / shutdown():
 
 ```
 src/
+├── main.rs                    # Entry point: CLI command dispatching
+├── lib.rs                     # Library re-exports
+├── config.rs                  # TOML configuration parsing
+├── key_management.rs          # XChaCha20-Poly1305 encryption, Argon2 key derivation
+├── bucket_identity.rs         # Bucket UUID tracking for cache isolation
+├── parse_object_store.rs      # Object store factory (S3/Azure/GCP)
+├── storage_compatibility.rs   # Storage backend utilities
+├── task.rs                    # Named task spawning for debugging
+├── deku_bytes.rs              # Binary serialization helpers
 ├── cli/
-│   ├── mod.rs          # CLI entry point
-│   ├── server.rs       # Server startup and signal handling
-│   └── password.rs     # Password validation
-├── nbd/
-│   ├── mod.rs          # Module exports
-│   ├── server.rs       # NBD protocol server (TCP/Unix socket)
-│   ├── router.rs       # Multi-tenant export router
-│   ├── api.rs          # HTTP API for dynamic export management
-│   ├── handler.rs      # NBD command handler (read/write/flush/trim)
-│   ├── block_store.rs  # S3 block storage backend (batched)
-│   ├── write_cache.rs  # Write-behind cache with typestate
-│   ├── lease.rs        # S3-based distributed lease coordination
-│   ├── state.rs        # Device state machines
-│   ├── metrics.rs      # Per-export I/O metrics
-│   ├── protocol.rs     # NBD protocol types
-│   └── error.rs        # Error types
-├── config.rs           # Configuration parsing
-└── ...
+│   ├── mod.rs                 # CLI struct and subcommand routing
+│   ├── server.rs              # `zerofs run` command, signal handling
+│   └── password.rs            # `zerofs change-password` command
+└── nbd/
+    ├── mod.rs                 # Module exports
+    ├── server.rs              # NBD protocol server (TCP/Unix socket)
+    ├── router.rs              # Multi-tenant export router
+    ├── api.rs                 # HTTP API for dynamic export management
+    ├── handler.rs             # NBD command handler (read/write/flush/trim)
+    ├── block_store.rs         # S3 block storage backend (batched)
+    ├── write_cache.rs         # Write-behind cache with typestate
+    ├── lease.rs               # S3-based distributed lease coordination
+    ├── state.rs               # Device state machines and typestate markers
+    ├── metrics.rs             # Per-export I/O metrics
+    ├── protocol.rs            # NBD protocol types
+    └── error.rs               # Error types
 ```
 
 ## Limits

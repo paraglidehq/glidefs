@@ -4,12 +4,15 @@
 //! - How much write amplification are we seeing? (guest bytes vs S3 bytes)
 //! - How well is the cache coalescing writes? (guest writes vs S3 writes)
 //! - How effective is read caching? (cache hits vs misses)
+//! - Where is latency coming from? (read/write/s3 timing breakdown)
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
 /// Metrics for a single export's I/O operations.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExportMetrics {
     /// Total bytes written by guest (actual NBD write payload)
     pub guest_bytes_written: AtomicU64,
@@ -43,12 +46,175 @@ pub struct ExportMetrics {
 
     /// Cache misses (reads that required S3 fetch)
     pub cache_misses: AtomicU64,
+
+    // Latency tracking for diagnosing performance issues
+    /// Read operation latencies (microseconds)
+    read_latencies: Mutex<LatencyHistogram>,
+    /// Write operation latencies (microseconds)
+    write_latencies: Mutex<LatencyHistogram>,
+    /// S3 fetch latencies (microseconds)
+    s3_fetch_latencies: Mutex<LatencyHistogram>,
+    /// Local file read latencies (microseconds)
+    file_read_latencies: Mutex<LatencyHistogram>,
+    /// Local file write latencies (microseconds)
+    file_write_latencies: Mutex<LatencyHistogram>,
+}
+
+/// Simple histogram for latency tracking.
+/// Buckets: <100us, <1ms, <10ms, <100ms, <1s, >=1s
+#[derive(Debug, Default)]
+pub struct LatencyHistogram {
+    pub count: u64,
+    pub sum_us: u64,
+    pub min_us: u64,
+    pub max_us: u64,
+    /// Buckets: [<100us, <1ms, <10ms, <100ms, <1s, >=1s]
+    pub buckets: [u64; 6],
+}
+
+impl LatencyHistogram {
+    pub fn record(&mut self, duration: Duration) {
+        let us = duration.as_micros() as u64;
+        self.count += 1;
+        self.sum_us += us;
+        if self.min_us == 0 || us < self.min_us {
+            self.min_us = us;
+        }
+        if us > self.max_us {
+            self.max_us = us;
+        }
+        // Bucket assignment
+        let bucket = if us < 100 {
+            0
+        } else if us < 1_000 {
+            1
+        } else if us < 10_000 {
+            2
+        } else if us < 100_000 {
+            3
+        } else if us < 1_000_000 {
+            4
+        } else {
+            5
+        };
+        self.buckets[bucket] += 1;
+    }
+
+    pub fn avg_us(&self) -> f64 {
+        if self.count > 0 {
+            self.sum_us as f64 / self.count as f64
+        } else {
+            0.0
+        }
+    }
+
+    pub fn snapshot(&self) -> LatencySnapshot {
+        LatencySnapshot {
+            count: self.count,
+            avg_us: self.avg_us(),
+            min_us: self.min_us,
+            max_us: self.max_us,
+            p50_bucket: self.percentile_bucket(50),
+            p99_bucket: self.percentile_bucket(99),
+        }
+    }
+
+    fn percentile_bucket(&self, pct: u64) -> &'static str {
+        if self.count == 0 {
+            return "n/a";
+        }
+        let target = (self.count * pct) / 100;
+        let mut cumulative = 0u64;
+        let bucket_names = ["<100us", "<1ms", "<10ms", "<100ms", "<1s", ">=1s"];
+        for (i, &count) in self.buckets.iter().enumerate() {
+            cumulative += count;
+            if cumulative >= target {
+                return bucket_names[i];
+            }
+        }
+        ">=1s"
+    }
+}
+
+/// Snapshot of latency histogram data.
+#[derive(Debug, Clone, Serialize)]
+pub struct LatencySnapshot {
+    pub count: u64,
+    pub avg_us: f64,
+    pub min_us: u64,
+    pub max_us: u64,
+    pub p50_bucket: &'static str,
+    pub p99_bucket: &'static str,
+}
+
+impl Default for ExportMetrics {
+    fn default() -> Self {
+        Self {
+            guest_bytes_written: AtomicU64::new(0),
+            guest_write_ops: AtomicU64::new(0),
+            guest_bytes_read: AtomicU64::new(0),
+            guest_read_ops: AtomicU64::new(0),
+            s3_bytes_written: AtomicU64::new(0),
+            s3_write_ops: AtomicU64::new(0),
+            batches_written: AtomicU64::new(0),
+            s3_bytes_read: AtomicU64::new(0),
+            s3_read_ops: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            read_latencies: Mutex::new(LatencyHistogram::default()),
+            write_latencies: Mutex::new(LatencyHistogram::default()),
+            s3_fetch_latencies: Mutex::new(LatencyHistogram::default()),
+            file_read_latencies: Mutex::new(LatencyHistogram::default()),
+            file_write_latencies: Mutex::new(LatencyHistogram::default()),
+        }
+    }
 }
 
 impl ExportMetrics {
     /// Create new metrics with all counters at zero.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record read operation latency.
+    #[inline]
+    pub fn record_read_latency(&self, duration: Duration) {
+        if let Ok(mut hist) = self.read_latencies.lock() {
+            hist.record(duration);
+        }
+    }
+
+    /// Record write operation latency.
+    #[inline]
+    pub fn record_write_latency(&self, duration: Duration) {
+        if let Ok(mut hist) = self.write_latencies.lock() {
+            hist.record(duration);
+        }
+    }
+
+    /// Record S3 fetch latency.
+    #[inline]
+    pub fn record_s3_fetch_latency(&self, duration: Duration) {
+        if let Ok(mut hist) = self.s3_fetch_latencies.lock() {
+            hist.record(duration);
+        }
+    }
+
+    /// Record local file read latency.
+    #[inline]
+    pub fn record_file_read_latency(&self, duration: Duration) {
+        if let Ok(mut hist) = self.file_read_latencies.lock() {
+            hist.record(duration);
+        }
+    }
+
+    /// Record local file write latency.
+    #[inline]
+    #[allow(dead_code)] // Available for future instrumentation
+    pub fn record_file_write_latency(&self, duration: Duration) {
+        if let Ok(mut hist) = self.file_write_latencies.lock() {
+            hist.record(duration);
+        }
     }
 
     /// Record a guest write operation.
@@ -128,6 +294,13 @@ impl ExportMetrics {
             0.0
         };
 
+        // Get latency snapshots
+        let read_latency = self.read_latencies.lock().ok().map(|h| h.snapshot());
+        let write_latency = self.write_latencies.lock().ok().map(|h| h.snapshot());
+        let s3_fetch_latency = self.s3_fetch_latencies.lock().ok().map(|h| h.snapshot());
+        let file_read_latency = self.file_read_latencies.lock().ok().map(|h| h.snapshot());
+        let file_write_latency = self.file_write_latencies.lock().ok().map(|h| h.snapshot());
+
         MetricsSnapshot {
             guest_bytes_written,
             guest_write_ops,
@@ -145,6 +318,11 @@ impl ExportMetrics {
             write_amplification,
             coalesce_ratio,
             cache_hit_rate,
+            read_latency,
+            write_latency,
+            s3_fetch_latency,
+            file_read_latency,
+            file_write_latency,
         }
     }
 }
@@ -185,6 +363,23 @@ pub struct MetricsSnapshot {
 
     /// Cache hits / (hits + misses)
     pub cache_hit_rate: f64,
+
+    // Latency breakdown
+    /// Read operation latencies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_latency: Option<LatencySnapshot>,
+    /// Write operation latencies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_latency: Option<LatencySnapshot>,
+    /// S3 fetch latencies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_fetch_latency: Option<LatencySnapshot>,
+    /// Local file read latencies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_read_latency: Option<LatencySnapshot>,
+    /// Local file write latencies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_write_latency: Option<LatencySnapshot>,
 }
 
 impl MetricsSnapshot {
@@ -233,7 +428,80 @@ impl MetricsSnapshot {
         writeln!(out, "zerofs_coalesce_ratio{{{label}}} {:.6}", self.coalesce_ratio).unwrap();
         writeln!(out, "zerofs_cache_hit_rate{{{label}}} {:.6}", self.cache_hit_rate).unwrap();
 
+        // Latency metrics
+        if let Some(ref lat) = self.read_latency {
+            if lat.count > 0 {
+                writeln!(out, "zerofs_read_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
+                writeln!(out, "zerofs_read_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
+                writeln!(out, "zerofs_read_latency_count{{{label}}} {}", lat.count).unwrap();
+            }
+        }
+        if let Some(ref lat) = self.write_latency {
+            if lat.count > 0 {
+                writeln!(out, "zerofs_write_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
+                writeln!(out, "zerofs_write_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
+                writeln!(out, "zerofs_write_latency_count{{{label}}} {}", lat.count).unwrap();
+            }
+        }
+        if let Some(ref lat) = self.s3_fetch_latency {
+            if lat.count > 0 {
+                writeln!(out, "zerofs_s3_fetch_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
+                writeln!(out, "zerofs_s3_fetch_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
+                writeln!(out, "zerofs_s3_fetch_latency_count{{{label}}} {}", lat.count).unwrap();
+            }
+        }
+        if let Some(ref lat) = self.file_read_latency {
+            if lat.count > 0 {
+                writeln!(out, "zerofs_file_read_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
+                writeln!(out, "zerofs_file_read_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
+                writeln!(out, "zerofs_file_read_latency_count{{{label}}} {}", lat.count).unwrap();
+            }
+        }
+        if let Some(ref lat) = self.file_write_latency {
+            if lat.count > 0 {
+                writeln!(out, "zerofs_file_write_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
+                writeln!(out, "zerofs_file_write_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
+                writeln!(out, "zerofs_file_write_latency_count{{{label}}} {}", lat.count).unwrap();
+            }
+        }
+
         out
+    }
+
+    /// Print a human-readable latency breakdown summary.
+    #[allow(dead_code)] // Useful for debugging
+    pub fn print_latency_summary(&self) {
+        eprintln!("\n=== Latency Breakdown ===");
+        if let Some(ref lat) = self.read_latency {
+            if lat.count > 0 {
+                eprintln!("  Read:       {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
+                    lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
+            }
+        }
+        if let Some(ref lat) = self.write_latency {
+            if lat.count > 0 {
+                eprintln!("  Write:      {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
+                    lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
+            }
+        }
+        if let Some(ref lat) = self.s3_fetch_latency {
+            if lat.count > 0 {
+                eprintln!("  S3 Fetch:   {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
+                    lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
+            }
+        }
+        if let Some(ref lat) = self.file_read_latency {
+            if lat.count > 0 {
+                eprintln!("  File Read:  {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
+                    lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
+            }
+        }
+        if let Some(ref lat) = self.file_write_latency {
+            if lat.count > 0 {
+                eprintln!("  File Write: {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
+                    lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
+            }
+        }
     }
 }
 

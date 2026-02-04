@@ -12,6 +12,7 @@ use super::write_cache::WriteCache;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// NBD device descriptor used during transmission phase.
 #[derive(Clone)]
@@ -96,6 +97,8 @@ impl NBDBlockHandler {
     ///
     /// Uses read-through caching: blocks not present locally are fetched from S3.
     pub async fn read(&self, offset: u64, length: u32) -> CommandResult<Bytes> {
+        let start = Instant::now();
+
         if offset + length as u64 > self.device_size {
             return Err(CommandError::InvalidArgument);
         }
@@ -110,6 +113,8 @@ impl NBDBlockHandler {
             .cache
             .read_with_fetch(offset, length as usize, &self.s3_store, &self.metrics)
             .await?;
+
+        self.metrics.record_read_latency(start.elapsed());
         Ok(data)
     }
 
@@ -118,6 +123,8 @@ impl NBDBlockHandler {
     /// Writes go to local SSD immediately. S3 sync happens in background.
     /// Returns error if the export is readonly.
     pub fn write(&self, offset: u64, data: &[u8], fua: bool) -> CommandResult<()> {
+        let start = Instant::now();
+
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
         }
@@ -137,6 +144,7 @@ impl NBDBlockHandler {
             self.flush()?;
         }
 
+        self.metrics.record_write_latency(start.elapsed());
         Ok(())
     }
 

@@ -22,6 +22,7 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::{debug, info, instrument, warn};
@@ -915,11 +916,16 @@ impl WriteCache<Active> {
         // Fetch missing blocks from S3 using batch prefetching
         // Groups blocks by S3 batch to reduce round-trips
         if !blocks_to_fetch.is_empty() {
+            let s3_start = Instant::now();
             self.fetch_blocks_batched(s3, blocks_to_fetch, metrics).await?;
+            metrics.record_s3_fetch_latency(s3_start.elapsed());
         }
 
         // Now read from local cache
-        self.read_local(offset, len)
+        let file_read_start = Instant::now();
+        let result = self.read_local(offset, len);
+        metrics.record_file_read_latency(file_read_start.elapsed());
+        result
     }
 
     /// Fetch multiple blocks from S3, grouping by batch to reduce round-trips.

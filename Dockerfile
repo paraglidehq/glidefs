@@ -9,10 +9,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /usr/src
 
-COPY zerofs/Cargo.toml zerofs/Cargo.lock ./zerofs/
-COPY zerofs/src ./zerofs/src
+COPY glidefs/Cargo.toml glidefs/Cargo.lock ./glidefs/
+COPY glidefs/src ./glidefs/src
 
-WORKDIR /usr/src/zerofs
+WORKDIR /usr/src/glidefs
 
 RUN cargo build --release
 
@@ -23,12 +23,12 @@ RUN apt-get update && apt-get install -y \
     libssl3t64 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/src/zerofs/target/release/zerofs /usr/local/bin/zerofs
+COPY --from=builder /usr/src/glidefs/target/release/glidefs /usr/local/bin/glidefs
 
-RUN useradd -m -u 1001 zerofs
-USER zerofs
+RUN useradd -m -u 1001 glidefs
+USER glidefs
 
 # Default ports that might be used - actual configuration comes from TOML file
 EXPOSE 2049 5564 10809
 
-ENTRYPOINT ["zerofs"]
+ENTRYPOINT ["glidefs"]

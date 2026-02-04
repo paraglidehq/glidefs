@@ -1,12 +1,12 @@
 #!/bin/sh
-# Install script for ZeroFS
+# Install script for GlideFS
 
 set -e
 
 REPO_OWNER="Barre"
-REPO_NAME="ZeroFS"
-BINARY_NAME="zerofs"
-TARBALL_NAME="zerofs-pgo-multiplatform.tar.gz"
+REPO_NAME="GlideFS"
+BINARY_NAME="glidefs"
+TARBALL_NAME="glidefs-pgo-multiplatform.tar.gz"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 SKIP_CHECKSUM="${SKIP_CHECKSUM:-false}"
 

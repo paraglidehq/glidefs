@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: zerofs
+        working-directory: glidefs
 
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +74,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crashes-${{ github.run_id }}
-          path: zerofs/fuzz/artifacts/
+          path: glidefs/fuzz/artifacts/
           retention-days: 30
 
       - name: Upload corpus
@@ -82,5 +82,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-corpus-${{ github.run_id }}
-          path: zerofs/fuzz/corpus/
+          path: glidefs/fuzz/corpus/
           retention-days: 7

@@ -44,12 +44,12 @@ jobs:
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           ./mc mb myminio/multi-node-test || true
 
-      - name: Build ZeroFS
-        working-directory: zerofs
+      - name: Build GlideFS
+        working-directory: glidefs
         run: cargo build --profile ci
 
       - name: Test 1 - Lease Prevents Concurrent Writers
-        working-directory: zerofs
+        working-directory: glidefs
         run: |
           echo "=== TEST: Lease prevents concurrent writers ==="
 
@@ -106,7 +106,7 @@ jobs:
 
           # Start Node A (should acquire lease)
           echo "Starting Node A..."
-          ./target/ci/zerofs run -c /tmp/node-a.toml &
+          ./target/ci/glidefs run -c /tmp/node-a.toml &
           NODE_A_PID=$!
 
           # Wait for Node A to start and acquire lease
@@ -120,7 +120,7 @@ jobs:
 
           # Start Node B (should fail to start or operate in readonly)
           echo "Starting Node B (should fail to acquire lease)..."
-          ./target/ci/zerofs run -c /tmp/node-b.toml 2>&1 &
+          ./target/ci/glidefs run -c /tmp/node-b.toml 2>&1 &
           NODE_B_PID=$!
 
           # Give Node B time to try acquiring lease
@@ -144,7 +144,7 @@ jobs:
           echo "✓ Lease test passed"
 
       - name: Test 2 - Live Migration Protocol
-        working-directory: zerofs
+        working-directory: glidefs
         run: |
           echo "=== TEST: Live migration protocol ==="
 
@@ -184,7 +184,7 @@ jobs:
 
           # Start source node
           echo "Starting source node..."
-          ./target/ci/zerofs run -c /tmp/source.toml &
+          ./target/ci/glidefs run -c /tmp/source.toml &
           SOURCE_PID=$!
 
           for i in {1..30}; do
@@ -266,7 +266,7 @@ jobs:
 
           # Start destination node
           echo "Starting destination node..."
-          ./target/ci/zerofs run -c /tmp/dest.toml &
+          ./target/ci/glidefs run -c /tmp/dest.toml &
           DEST_PID=$!
 
           for i in {1..30}; do
@@ -308,7 +308,7 @@ jobs:
           echo "✓ Live migration test passed"
 
       - name: Test 3 - Wake From Different Node
-        working-directory: zerofs
+        working-directory: glidefs
         run: |
           echo "=== TEST: Wake from different node (cold cache read) ==="
 
@@ -341,7 +341,7 @@ jobs:
           EOF
 
           # Start writer
-          ./target/ci/zerofs run -c /tmp/writer.toml &
+          ./target/ci/glidefs run -c /tmp/writer.toml &
           WRITER_PID=$!
 
           for i in {1..30}; do
@@ -403,7 +403,7 @@ jobs:
 
           # Start reader (cold cache)
           echo "Starting reader with cold cache..."
-          ./target/ci/zerofs run -c /tmp/reader.toml &
+          ./target/ci/glidefs run -c /tmp/reader.toml &
           READER_PID=$!
 
           for i in {1..30}; do
@@ -434,7 +434,7 @@ jobs:
           echo "✓ Wake from different node test passed"
 
       - name: Test 4 - Rapid Lease Handoff Under Load
-        working-directory: zerofs
+        working-directory: glidefs
         run: |
           echo "=== TEST: Rapid lease handoff without data loss ==="
 
@@ -473,7 +473,7 @@ jobs:
             echo "--- Round $round ---"
 
             # Start node
-            ./target/ci/zerofs run -c /tmp/handoff-a.toml &
+            ./target/ci/glidefs run -c /tmp/handoff-a.toml &
             NODE_PID=$!
 
             for i in {1..30}; do
@@ -515,7 +515,7 @@ jobs:
 
           # Final verification
           echo "--- Final Verification ---"
-          ./target/ci/zerofs run -c /tmp/handoff-a.toml &
+          ./target/ci/glidefs run -c /tmp/handoff-a.toml &
           FINAL_PID=$!
 
           for i in {1..30}; do
@@ -565,8 +565,8 @@ jobs:
             sudo nbd-client -d /dev/nbd$i 2>/dev/null || true
           done
 
-          # Kill any remaining ZeroFS processes
-          pkill -f "zerofs run" || true
+          # Kill any remaining GlideFS processes
+          pkill -f "glidefs run" || true
 
           # Stop MinIO
           docker stop minio || true

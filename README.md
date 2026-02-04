@@ -83,40 +83,63 @@ cargo install glidefs
 
 ---
 
-## Configure
+## Quick Start
 
 ```toml
+# glidefs.toml
 [cache]
 dir = "/var/cache/glidefs"
 disk_size_gb = 100.0
 
 [storage]
 url = "s3://my-bucket/vms"
+encryption_password = "${GLIDEFS_PASSWORD}"
 
 [servers.nbd]
-addresses = ["127.0.0.1:10809"]
-api_address = "127.0.0.1:8080"
+unix_socket = "/var/run/glidefs.sock"
+auto_create_size_gb = 500.0
+```
 
-[[servers.nbd.exports]]
-name = "vm-001"
-size_gb = 100.0
+```bash
+glidefs run -c glidefs.toml
+```
 
-[aws]
-access_key_id = "${AWS_ACCESS_KEY_ID}"
-secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+Connect a VM:
+
+```bash
+sudo nbd-client -unix /var/run/glidefs.sock /dev/nbd0 -N my-vm
+```
+
+Done. Export created automatically. No API calls.
+
+---
+
+## Per-VM Usage
+
+Each VM gets its own export. Just connect with the VM name:
+
+```bash
+sudo nbd-client -unix /var/run/glidefs.sock /dev/nbd0 -N vm-alice
+sudo nbd-client -unix /var/run/glidefs.sock /dev/nbd1 -N vm-bob
+sudo nbd-client -unix /var/run/glidefs.sock /dev/nbd2 -N vm-charlie
+```
+
+Each export is isolated. Data stored at `s3://my-bucket/vms/nbd/{name}/`.
+
+Need a different size? Grow it:
+
+```bash
+curl -X PUT localhost:8080/api/exports/vm-alice -d '{"size_gb": 1000}'
+# Reconnect NBD client to see new size
 ```
 
 ---
 
-## Run
+## With ZFS
 
 ```bash
-glidefs run -c glidefs.toml
-
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N vm-001
-
+sudo nbd-client -unix /var/run/glidefs.sock /dev/nbd0 -N my-vm
 sudo zpool create vmpool /dev/nbd0
-
 time sudo zfs snapshot vmpool@snap1  # <100ms
 ```
 
@@ -128,24 +151,19 @@ time sudo zfs snapshot vmpool@snap1  # <100ms
 
 ```bash
 # Drain dirty blocks to S3
-curl -X POST http://localhost:8080/api/exports/vm-001/drain
+curl -X POST localhost:8080/api/exports/my-vm/drain
 
-# Remove export
-curl -X DELETE http://localhost:8080/api/exports/vm-001
-
-# Data in S3. Zero local resources. Zero cost.
+# Remove export (keeps S3 data)
+curl -X DELETE localhost:8080/api/exports/my-vm
 ```
+
+Data in S3. Zero local resources. Zero cost.
 
 ### Wake Anywhere
 
 ```bash
-# Any node in the region
-curl -X POST http://localhost:8080/api/exports \
-  -d '{"name": "vm-001", "size_gb": 100}'
-
-sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N vm-001
-
-# Reads pull from S3 on demand
+# On any node - just connect, data pulls from S3
+sudo nbd-client -unix /var/run/glidefs.sock /dev/nbd0 -N my-vm
 ```
 
 ### Live Migration
@@ -154,15 +172,11 @@ sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N vm-001
 Node A                         Node B
 ──────                         ──────
 VM running
-                               Create readonly export
-                               (pre-warm from S3)
-Drain to S3
-
+                               Connect (readonly auto-created)
+Drain: POST /drain
 Pause VM
-
-Delete export
-                               Promote to read-write
-
+Disconnect NBD
+                               Promote: POST /promote
                                Resume VM
 
 Downtime: 100-500ms
@@ -172,15 +186,17 @@ Downtime: 100-500ms
 
 ## API
 
+For operations beyond connect/disconnect:
+
 | Endpoint | Method | What it does |
 |----------|--------|--------------|
 | `/api/exports` | GET | List exports |
-| `/api/exports` | POST | Create export |
+| `/api/exports/{name}` | PUT | Resize export (grow only) |
 | `/api/exports/{name}` | DELETE | Remove export |
 | `/api/exports/{name}/drain` | POST | Sync dirty blocks to S3 |
 | `/api/exports/{name}/promote` | POST | Readonly → read-write |
 | `/api/exports/{name}/metrics` | GET | I/O stats |
-| `/health` | GET | Health check |
+| `/metrics` | GET | Prometheus metrics |
 
 ---
 

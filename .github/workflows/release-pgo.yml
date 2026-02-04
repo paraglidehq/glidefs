@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        test: [9p, zfs-on-zerofs, nfs-kernel-compile]
+        test: [9p, zfs-on-glidefs, nfs-kernel-compile]
 
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
             sudo modprobe 9p
             sudo modprobe 9pnet
             sudo modprobe 9pnet_virtio
-          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
+          elif [ "${{ matrix.test }}" = "zfs-on-glidefs" ]; then
             sudo apt-get install -y nbd-client zfsutils-linux wget pigz pixz parallel
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             sudo apt-get install -y nfs-common
@@ -65,14 +65,14 @@ jobs:
 
           if [ "${{ matrix.test }}" = "9p" ]; then
             ./mc mb myminio/pgo-profile || true
-          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
+          elif [ "${{ matrix.test }}" = "zfs-on-glidefs" ]; then
             ./mc mb myminio/pgo-zfs-test || true
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
             ./mc mb myminio/pgo-nfs-test || true
           fi
 
       - name: Build with PGO instrumentation
-        working-directory: zerofs
+        working-directory: glidefs
         run: |
           rm -rf /tmp/pgo-data
 
@@ -81,13 +81,13 @@ jobs:
 
       - name: Run profiling workloads
         run: |
-          mkdir -p /tmp/zerofs-cache
+          mkdir -p /tmp/glidefs-cache
 
-          # Create ZeroFS configuration based on test type
+          # Create GlideFS configuration based on test type
           if [ "${{ matrix.test }}" = "9p" ]; then
-            cat > zerofs-pgo.toml << EOF
+            cat > glidefs-pgo.toml << EOF
           [cache]
-          dir = "/tmp/zerofs-cache"
+          dir = "/tmp/glidefs-cache"
           disk_size_gb = 0.5
           memory_size_gb = 2.0
 
@@ -104,37 +104,37 @@ jobs:
           endpoint = "http://localhost:9000"
           allow_http = "true"
           EOF
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
-            ZEROFS_PID=$!
-            echo "Waiting for ZeroFS 9P server to start..."
+            ./glidefs/target/x86_64-unknown-linux-gnu/release/glidefs run -c glidefs-pgo.toml &
+            GLIDEFS_PID=$!
+            echo "Waiting for GlideFS 9P server to start..."
             for i in {1..30}; do
               if nc -z 127.0.0.1 5564 2>/dev/null; then
-                echo "ZeroFS 9P server is ready"
+                echo "GlideFS 9P server is ready"
                 break
               fi
               sleep 1
             done
 
-            sudo mkdir -p /mnt/zerofs
-            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
-            cd /mnt/zerofs
+            sudo mkdir -p /mnt/glidefs
+            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/glidefs
+            cd /mnt/glidefs
             wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
             tar -xf linux-6.11.tar.xz
             cd linux-6.11
             make tinyconfig
             make -j$(nproc)
-            cd /mnt/zerofs
+            cd /mnt/glidefs
             dd if=/dev/urandom of=500mb.bin bs=1M count=500
             dd if=500mb.bin of=/dev/null bs=1M
             cd /
-            sudo umount /mnt/zerofs || true
-            kill -TERM $ZEROFS_PID || true
-            wait $ZEROFS_PID || true
+            sudo umount /mnt/glidefs || true
+            kill -TERM $GLIDEFS_PID || true
+            wait $GLIDEFS_PID || true
 
-          elif [ "${{ matrix.test }}" = "zfs-on-zerofs" ]; then
-            cat > zerofs-pgo.toml << EOF
+          elif [ "${{ matrix.test }}" = "zfs-on-glidefs" ]; then
+            cat > glidefs-pgo.toml << EOF
           [cache]
-          dir = "/tmp/zerofs-cache"
+          dir = "/tmp/glidefs-cache"
           disk_size_gb = 5.0
           memory_size_gb = 2.0
 
@@ -154,22 +154,22 @@ jobs:
           endpoint = "http://localhost:9000"
           allow_http = "true"
           EOF
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
-            ZEROFS_PID=$!
-            echo "Waiting for ZeroFS NBD server to start..."
+            ./glidefs/target/x86_64-unknown-linux-gnu/release/glidefs run -c glidefs-pgo.toml &
+            GLIDEFS_PID=$!
+            echo "Waiting for GlideFS NBD server to start..."
             for i in {1..30}; do
               if nc -z 127.0.0.1 10809; then
-                echo "ZeroFS NBD server is ready"
+                echo "GlideFS NBD server is ready"
                 break
               fi
               sleep 1
             done
 
-            sudo mkdir -p /mnt/zerofs
-            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/zerofs
-            sudo mkdir -p /mnt/zerofs/.nbd
-            sudo truncate -s 3G /mnt/zerofs/.nbd/test-device
-            sudo umount /mnt/zerofs
+            sudo mkdir -p /mnt/glidefs
+            sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L 127.0.0.1 /mnt/glidefs
+            sudo mkdir -p /mnt/glidefs/.nbd
+            sudo truncate -s 3G /mnt/glidefs/.nbd/test-device
+            sudo umount /mnt/glidefs
             sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
             sudo zpool create testpool /dev/nbd0
             sudo zfs create testpool/data
@@ -178,13 +178,13 @@ jobs:
             sudo wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
             sudo tar -xf linux-6.11.tar.xz
             sudo zfs snapshot testpool/data@snapshot1
-            kill -TERM $ZEROFS_PID || true
-            wait $ZEROFS_PID || true
+            kill -TERM $GLIDEFS_PID || true
+            wait $GLIDEFS_PID || true
 
           elif [ "${{ matrix.test }}" = "nfs-kernel-compile" ]; then
-            cat > zerofs-pgo.toml << EOF
+            cat > glidefs-pgo.toml << EOF
           [cache]
-          dir = "/tmp/zerofs-cache"
+          dir = "/tmp/glidefs-cache"
           disk_size_gb = 5.0
           memory_size_gb = 2.0
 
@@ -201,29 +201,29 @@ jobs:
           endpoint = "http://localhost:9000"
           allow_http = "true"
           EOF
-            ./zerofs/target/x86_64-unknown-linux-gnu/release/zerofs run -c zerofs-pgo.toml &
-            ZEROFS_PID=$!
-            echo "Waiting for ZeroFS NFS server to start..."
+            ./glidefs/target/x86_64-unknown-linux-gnu/release/glidefs run -c glidefs-pgo.toml &
+            GLIDEFS_PID=$!
+            echo "Waiting for GlideFS NFS server to start..."
             for i in {1..30}; do
               if nc -z 127.0.0.1 2049; then
-                echo "ZeroFS NFS server is ready"
+                echo "GlideFS NFS server is ready"
                 break
               fi
               sleep 1
             done
 
-            sudo mkdir -p /mnt/zerofs
-            sudo mount -t nfs -o vers=3,async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/zerofs
-            cd /mnt/zerofs
+            sudo mkdir -p /mnt/glidefs
+            sudo mount -t nfs -o vers=3,async,nolock,rsize=1048576,wsize=1048576,tcp,port=2049,mountport=2049,hard 127.0.0.1:/ /mnt/glidefs
+            cd /mnt/glidefs
             wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
             tar -xf linux-6.11.tar.xz
             cd linux-6.11
             make tinyconfig
             make -j$(nproc)
             cd /
-            sudo umount /mnt/zerofs || true
-            kill -TERM $ZEROFS_PID || true
-            wait $ZEROFS_PID || true
+            sudo umount /mnt/glidefs || true
+            kill -TERM $GLIDEFS_PID || true
+            wait $GLIDEFS_PID || true
           fi
 
       - name: Generate PGO data
@@ -238,8 +238,8 @@ jobs:
 
           mkdir -p pgo-data
           cp merged.profdata pgo-data/
-          cp zerofs/Cargo.toml pgo-data/
-          cp zerofs/Cargo.lock pgo-data/
+          cp glidefs/Cargo.toml pgo-data/
+          cp glidefs/Cargo.lock pgo-data/
 
       - name: Upload PGO profile data
         uses: actions/upload-artifact@v4
@@ -374,28 +374,28 @@ jobs:
       - name: Setup PGO profile
         if: matrix.platform != 'freebsd'
         run: |
-          cp pgo-data/merged.profdata zerofs/
-          cp pgo-data/Cargo.lock zerofs/
+          cp pgo-data/merged.profdata glidefs/
+          cp pgo-data/Cargo.lock glidefs/
 
       - name: Build with PGO (cross)
         if: matrix.use_cross && !matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --target ${{ matrix.target }}
+          cd glidefs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cross build --release --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cross)
         if: matrix.use_cross && matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --target ${{ matrix.target }}
+          cd glidefs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cross build --release --target ${{ matrix.target }}
 
       - name: Build with PGO (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd' && !matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --target ${{ matrix.target }}
+          cd glidefs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release --target ${{ matrix.target }}
 
       - name: Build with PGO + BOLT relocs (cargo)
         if: matrix.use_cross == false && matrix.platform != 'freebsd' && matrix.bolt
         run: |
-          cd zerofs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --target ${{ matrix.target }}
+          cd glidefs && RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata -C link-arg=-Wl,--emit-relocs -C strip=none" cargo build --release --target ${{ matrix.target }}
 
       - name: Build on FreeBSD with PGO
         if: matrix.platform == 'freebsd'
@@ -407,31 +407,31 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           run: |
             . $HOME/.cargo/env
-            echo "Building ZeroFS for FreeBSD with PGO..."
+            echo "Building GlideFS for FreeBSD with PGO..."
             echo "Rust version: $(rustc --version)"
 
             # Copy PGO data into VM
-            cp pgo-data/merged.profdata zerofs/
-            cp pgo-data/Cargo.lock zerofs/
+            cp pgo-data/merged.profdata glidefs/
+            cp pgo-data/Cargo.lock glidefs/
 
-            cd zerofs
+            cd glidefs
             RUSTFLAGS="--cfg tokio_unstable -C profile-use=$(pwd)/merged.profdata" cargo build --release
 
-            file target/release/zerofs
-            ls -lh target/release/zerofs
+            file target/release/glidefs
+            ls -lh target/release/glidefs
 
-            cp target/release/zerofs ../zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+            cp target/release/glidefs ../glidefs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
             rm -rf target/
 
       - name: Prepare binary
         run: |
           mkdir -p artifacts
           if [ "${{ matrix.platform }}" = "freebsd" ]; then
-            mv zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo artifacts/
+            mv glidefs-${{ matrix.platform }}-${{ matrix.arch }}-pgo artifacts/
           else
-            cp zerofs/target/${{ matrix.target }}/release/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+            cp glidefs/target/${{ matrix.target }}/release/glidefs artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
           fi
-          chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          chmod +x artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
 
       - name: Install BOLT dependencies
         if: matrix.bolt
@@ -467,16 +467,16 @@ jobs:
       - name: Collect BOLT profile on PGO binary
         if: matrix.bolt
         run: |
-          BINARY="$(pwd)/artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
-          mkdir -p /tmp/zerofs-cache /tmp/bolt-profile
+          BINARY="$(pwd)/artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
+          mkdir -p /tmp/glidefs-cache /tmp/bolt-profile
 
           llvm-bolt $BINARY -instrument -o ${BINARY}.inst \
             -instrumentation-file=/tmp/bolt-profile/prof \
             -instrumentation-file-append-pid
 
-          cat > zerofs-bolt.toml << EOF
+          cat > glidefs-bolt.toml << EOF
           [cache]
-          dir = "/tmp/zerofs-cache"
+          dir = "/tmp/glidefs-cache"
           disk_size_gb = 0.5
           memory_size_gb = 2.0
 
@@ -494,34 +494,34 @@ jobs:
           allow_http = "true"
           EOF
 
-          ${BINARY}.inst run -c zerofs-bolt.toml &
-          ZEROFS_PID=$!
+          ${BINARY}.inst run -c glidefs-bolt.toml &
+          GLIDEFS_PID=$!
 
           for i in {1..30}; do
             if nc -z 127.0.0.1 5564 2>/dev/null; then
-              echo "ZeroFS 9P server is ready"
+              echo "GlideFS 9P server is ready"
               break
             fi
             sleep 1
           done
 
-          sudo mkdir -p /mnt/zerofs
-          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/zerofs
+          sudo mkdir -p /mnt/glidefs
+          sudo mount -t 9p -o trans=tcp,port=5564,version=9p2000.L,cache=mmap,access=user 127.0.0.1 /mnt/glidefs
 
-          cd /mnt/zerofs
+          cd /mnt/glidefs
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
           tar -xf linux-6.11.tar.xz
           cd linux-6.11
           make tinyconfig
           make -j$(nproc)
-          cd /mnt/zerofs
+          cd /mnt/glidefs
           dd if=/dev/urandom of=500mb.bin bs=1M count=500
           dd if=500mb.bin of=/dev/null bs=1M
           cd /
 
-          sudo umount /mnt/zerofs || true
-          kill -TERM $ZEROFS_PID || true
-          wait $ZEROFS_PID || true
+          sudo umount /mnt/glidefs || true
+          kill -TERM $GLIDEFS_PID || true
+          wait $GLIDEFS_PID || true
 
           echo "BOLT profile files:"
           ls -lh /tmp/bolt-profile/
@@ -531,7 +531,7 @@ jobs:
       - name: Apply BOLT optimization
         if: matrix.bolt
         run: |
-          BINARY="artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
+          BINARY="artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}-pgo"
 
           llvm-bolt $BINARY -o ${BINARY}.bolt \
             -data=/tmp/bolt.fdata \
@@ -549,12 +549,12 @@ jobs:
       - name: Generate attestation for binary
         uses: actions/attest-build-provenance@v1
         with:
-          subject-path: artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          subject-path: artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
+          name: glidefs-${{ matrix.platform }}-${{ matrix.arch }}-pgo
           path: artifacts/
           retention-days: 30
 
@@ -582,22 +582,22 @@ jobs:
             fi
           done
           cd release
-          tar czf ../zerofs-pgo-multiplatform.tar.gz zerofs-*-pgo*
+          tar czf ../glidefs-pgo-multiplatform.tar.gz glidefs-*-pgo*
           cd ..
-          sha256sum zerofs-pgo-multiplatform.tar.gz > zerofs-pgo-multiplatform.tar.gz.sha256
+          sha256sum glidefs-pgo-multiplatform.tar.gz > glidefs-pgo-multiplatform.tar.gz.sha256
 
       - name: Upload combined release
         uses: actions/upload-artifact@v4
         with:
-          name: zerofs-pgo-release
+          name: glidefs-pgo-release
           path: |
-            zerofs-pgo-multiplatform.tar.gz
-            zerofs-pgo-multiplatform.tar.gz.sha256
+            glidefs-pgo-multiplatform.tar.gz
+            glidefs-pgo-multiplatform.tar.gz.sha256
           retention-days: 90
 
       - name: Generate attestations
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: |
-            zerofs-pgo-multiplatform.tar.gz
-            release/zerofs-*-pgo*
+            glidefs-pgo-multiplatform.tar.gz
+            release/glidefs-*-pgo*

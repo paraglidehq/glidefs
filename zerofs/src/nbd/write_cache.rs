@@ -19,7 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::marker::PhantomData;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,15 +27,26 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::{debug, info, instrument, warn};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
+
 use super::block_store::{BlockStoreError, S3BlockStore};
 use super::state::{Active, BlockState, Draining, Initializing, Recovering};
 
-/// A file handle safe for concurrent positional I/O.
+/// Buffer alignment for O_DIRECT I/O (must be at least filesystem block size).
+#[cfg(target_os = "linux")]
+const DIRECT_IO_ALIGNMENT: usize = 4096;
+
+/// A file handle safe for concurrent positional I/O with optional direct I/O.
 ///
 /// This wrapper allows sharing a `File` across threads when using only
 /// positional I/O methods (`read_at`, `write_at`, `read_exact_at`, `write_all_at`).
 /// These methods use `pread`/`pwrite` system calls which are atomic and don't
 /// use the internal file position, making them thread-safe per POSIX semantics.
+///
+/// On Linux, the file is opened with O_DIRECT to bypass the page cache.
+/// On macOS, F_NOCACHE is used to disable caching.
+/// This eliminates page cache contention during mixed read/write workloads.
 ///
 /// # Safety
 ///
@@ -45,37 +56,246 @@ use super::state::{Active, BlockState, Draining, Initializing, Recovering};
 /// 3. We never use seek-based read/write which would race on file position
 /// 4. `sync_all()` is safe to call concurrently (just triggers fsync)
 #[derive(Debug)]
-pub struct SyncFile(File);
+pub struct SyncFile {
+    file: File,
+    /// Whether direct I/O is enabled (O_DIRECT on Linux, F_NOCACHE on macOS).
+    /// When true on Linux, I/O must use aligned buffers.
+    #[allow(dead_code)] // Used on Linux for alignment decisions
+    direct_io: bool,
+}
 
 impl SyncFile {
-    /// Create a new SyncFile from a File.
+    /// Create a new SyncFile from a File (without direct I/O).
+    #[allow(dead_code)] // Used by tests and fallback paths
     pub fn new(file: File) -> Self {
-        SyncFile(file)
+        SyncFile { file, direct_io: false }
+    }
+
+    /// Open a file with direct I/O enabled (bypasses page cache).
+    ///
+    /// On Linux: Uses O_DIRECT (requires aligned I/O).
+    /// On macOS: Uses F_NOCACHE (no alignment requirements).
+    ///
+    /// Falls back to regular buffered I/O if direct I/O is not supported.
+    pub fn open_direct(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            Self::open_direct_linux(path, create, device_size)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            Self::open_direct_macos(path, create, device_size)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // Fallback for other platforms
+            Self::open_buffered(path, create, device_size)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_direct_linux(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
+        // Try O_DIRECT first
+        let result = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .custom_flags(libc::O_DIRECT)
+            .open(path);
+
+        match result {
+            Ok(file) => {
+                Self::setup_file_size(&file, device_size)?;
+                info!(path = %path.display(), "opened cache file with O_DIRECT");
+                Ok(SyncFile { file, direct_io: true })
+            }
+            Err(e) => {
+                // O_DIRECT not supported (e.g., tmpfs), fall back to buffered
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "O_DIRECT not supported, falling back to buffered I/O"
+                );
+                Self::open_buffered(path, create, device_size)
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_direct_macos(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .open(path)?;
+
+        // Enable F_NOCACHE to bypass the unified buffer cache
+        let fd = file.as_raw_fd();
+        let result = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+
+        if result == -1 {
+            let err = std::io::Error::last_os_error();
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "F_NOCACHE not supported, using buffered I/O"
+            );
+            Self::setup_file_size(&file, device_size)?;
+            return Ok(SyncFile { file, direct_io: false });
+        }
+
+        Self::setup_file_size(&file, device_size)?;
+        info!(path = %path.display(), "opened cache file with F_NOCACHE");
+        Ok(SyncFile { file, direct_io: true })
+    }
+
+    #[allow(dead_code)] // Used on platforms without direct I/O or as fallback
+    fn open_buffered(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .open(path)?;
+
+        Self::setup_file_size(&file, device_size)?;
+        info!(path = %path.display(), "opened cache file with buffered I/O");
+        Ok(SyncFile { file, direct_io: false })
+    }
+
+    fn setup_file_size(file: &File, device_size: u64) -> std::io::Result<()> {
+        let file_size = file.metadata()?.len();
+        if file_size < device_size {
+            file.set_len(device_size)?;
+        }
+        Ok(())
     }
 
     /// Read exact bytes at a specific offset (pread).
+    ///
+    /// On Linux with O_DIRECT, uses an aligned intermediate buffer if needed.
     #[inline]
     pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-        self.0.read_exact_at(buf, offset)
+        #[cfg(target_os = "linux")]
+        if self.direct_io && !Self::is_aligned(buf.as_ptr() as usize, buf.len(), offset) {
+            return self.read_exact_at_aligned(buf, offset);
+        }
+
+        self.file.read_exact_at(buf, offset)
     }
 
     /// Write all bytes at a specific offset (pwrite).
+    ///
+    /// On Linux with O_DIRECT, uses an aligned intermediate buffer if needed.
     #[inline]
     pub fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
-        self.0.write_all_at(buf, offset)
+        #[cfg(target_os = "linux")]
+        if self.direct_io && !Self::is_aligned(buf.as_ptr() as usize, buf.len(), offset) {
+            return self.write_all_at_aligned(buf, offset);
+        }
+
+        self.file.write_all_at(buf, offset)
+    }
+
+    /// Check if buffer, size, and offset meet O_DIRECT alignment requirements.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    fn is_aligned(ptr: usize, len: usize, offset: u64) -> bool {
+        ptr % DIRECT_IO_ALIGNMENT == 0
+            && len % DIRECT_IO_ALIGNMENT == 0
+            && offset as usize % DIRECT_IO_ALIGNMENT == 0
+    }
+
+    /// Read using an aligned intermediate buffer (for O_DIRECT with unaligned input).
+    #[cfg(target_os = "linux")]
+    fn read_exact_at_aligned(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        // Round up to alignment boundary
+        let aligned_len = (buf.len() + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
+        let mut aligned_buf = AlignedBuffer::new(aligned_len);
+
+        self.file.read_exact_at(aligned_buf.as_mut_slice(), offset)?;
+        buf.copy_from_slice(&aligned_buf.as_slice()[..buf.len()]);
+        Ok(())
+    }
+
+    /// Write using an aligned intermediate buffer (for O_DIRECT with unaligned input).
+    #[cfg(target_os = "linux")]
+    fn write_all_at_aligned(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        // Round up to alignment boundary
+        let aligned_len = (buf.len() + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
+        let mut aligned_buf = AlignedBuffer::new(aligned_len);
+
+        aligned_buf.as_mut_slice()[..buf.len()].copy_from_slice(buf);
+        // Zero-fill the padding (shouldn't matter for writes, but be safe)
+        for byte in &mut aligned_buf.as_mut_slice()[buf.len()..] {
+            *byte = 0;
+        }
+
+        self.file.write_all_at(aligned_buf.as_slice(), offset)
     }
 
     /// Sync all data and metadata to disk.
     #[inline]
     pub fn sync_all(&self) -> std::io::Result<()> {
-        self.0.sync_all()
+        self.file.sync_all()
     }
 
     /// Get the raw file descriptor (for fallocate, etc).
     #[cfg(target_os = "linux")]
     pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         use std::os::unix::io::AsRawFd;
-        self.0.as_raw_fd()
+        self.file.as_raw_fd()
+    }
+}
+
+
+/// A buffer with guaranteed alignment for O_DIRECT I/O.
+#[cfg(target_os = "linux")]
+struct AlignedBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl AlignedBuffer {
+    fn new(len: usize) -> Self {
+        use std::alloc::{alloc, Layout};
+
+        let layout = Layout::from_size_align(len, DIRECT_IO_ALIGNMENT)
+            .expect("Invalid alignment");
+
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+
+        AlignedBuffer { ptr, len }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        use std::alloc::{dealloc, Layout};
+
+        let layout = Layout::from_size_align(self.len, DIRECT_IO_ALIGNMENT)
+            .expect("Invalid alignment");
+
+        unsafe { dealloc(self.ptr, layout) };
     }
 }
 
@@ -528,27 +748,10 @@ impl WriteCache<Initializing> {
         // Ensure cache directory exists
         std::fs::create_dir_all(&config.cache_dir)?;
 
-        // Open or create data file (sparse file - only allocates on write)
-        // We don't truncate because we want to preserve existing cache data
+        // Open or create data file with direct I/O (bypasses page cache).
+        // This eliminates page cache contention during mixed read/write workloads.
         let data_path = config.data_path();
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&data_path)?;
-
-        // Set file size (sparse - doesn't allocate disk space until written)
-        let file_size = data_file.metadata()?.len();
-        if file_size < config.device_size {
-            data_file.set_len(config.device_size)?;
-            info!(
-                path = %data_path.display(),
-                old_size = file_size,
-                new_size = config.device_size,
-                "extended cache file (sparse)"
-            );
-        }
+        let data_file = SyncFile::open_direct(&data_path, true, config.device_size)?;
 
         // Load block states and presence (or create fresh)
         let num_blocks = config.num_blocks();
@@ -583,7 +786,7 @@ impl WriteCache<Initializing> {
 
         let inner = Arc::new(CacheInner {
             config,
-            data_file: SyncFile::new(data_file),
+            data_file,
             block_states,
             present_chunks,
             num_blocks,

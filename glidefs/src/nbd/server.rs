@@ -656,7 +656,10 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                         let result = h.read(offset, length).await;
                         let response = match result {
                             Ok(data) => Response::Simple { cookie, error: NBD_SUCCESS, data },
-                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                            Err(ref e) => {
+                                error!(offset, length, error = ?e, "NBD read failed");
+                                Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() }
+                            }
                         };
                         let _ = tx.send(response).await;
                     });

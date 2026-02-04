@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Notify;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::block_store::{BlockStoreError, S3BlockStore};
 use super::state::{Active, BlockState, Draining, Initializing, Recovering};
@@ -1003,7 +1003,13 @@ impl WriteCache<Active> {
         for (batch_num, _block_nums) in blocks_by_batch {
             // Fetch the entire batch from S3
             // Note: get_batch_with_etag returns zeros (not error) if batch doesn't exist
-            let batch_result = s3.get_batch_with_etag(batch_num).await?;
+            let batch_result = match s3.get_batch_with_etag(batch_num).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(batch = batch_num, error = %e, "S3 batch fetch failed");
+                    return Err(e.into());
+                }
+            };
             metrics.record_s3_read(batch_result.data.len() as u64);
             let batch_data = batch_result.data;
 
@@ -1070,7 +1076,10 @@ impl WriteCache<Active> {
                 }
 
                 // We own this block now (we set present). Write S3 data to cache.
-                self.inner.data_file.write_all_at(block_data, cache_offset)?;
+                if let Err(e) = self.inner.data_file.write_all_at(block_data, cache_offset) {
+                    error!(block = block_num, offset = cache_offset, error = %e, "Failed to write S3 data to cache file");
+                    return Err(e.into());
+                }
 
                 blocks_cached += 1;
             }

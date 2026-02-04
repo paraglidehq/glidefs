@@ -55,9 +55,15 @@ const DIRECT_IO_ALIGNMENT: usize = 4096;
 /// 2. POSIX guarantees pread/pwrite are atomic with respect to each other
 /// 3. We never use seek-based read/write which would race on file position
 /// 4. `sync_all()` is safe to call concurrently (just triggers fsync)
+///
+/// Uses separate file descriptors for reads and writes to reduce kernel-level
+/// contention during mixed workloads (each FD has its own kernel state).
 #[derive(Debug)]
 pub struct SyncFile {
-    file: File,
+    /// File descriptor used exclusively for reads (pread)
+    read_file: File,
+    /// File descriptor used exclusively for writes (pwrite)
+    write_file: File,
     /// Whether direct I/O is enabled (O_DIRECT on Linux, F_NOCACHE on macOS).
     /// When true on Linux, I/O must use aligned buffers.
     #[allow(dead_code)] // Used on Linux for alignment decisions
@@ -66,9 +72,16 @@ pub struct SyncFile {
 
 impl SyncFile {
     /// Create a new SyncFile from a File (without direct I/O).
+    /// Duplicates the file descriptor to create separate read/write handles.
     #[allow(dead_code)] // Used by tests and fallback paths
     pub fn new(file: File) -> Self {
-        SyncFile { file, direct_io: false }
+        // Duplicate the file descriptor for separate read/write handles
+        let read_file = file.try_clone().expect("failed to duplicate file descriptor");
+        SyncFile {
+            read_file,
+            write_file: file,
+            direct_io: false,
+        }
     }
 
     /// Open a file with direct I/O enabled (bypasses page cache).
@@ -107,10 +120,12 @@ impl SyncFile {
             .open(path);
 
         match result {
-            Ok(file) => {
-                Self::setup_file_size(&file, device_size)?;
-                info!(path = %path.display(), "opened cache file with O_DIRECT");
-                Ok(SyncFile { file, direct_io: true })
+            Ok(write_file) => {
+                Self::setup_file_size(&write_file, device_size)?;
+                // Duplicate for separate read handle
+                let read_file = write_file.try_clone()?;
+                info!(path = %path.display(), "opened cache file with O_DIRECT (separate read/write FDs)");
+                Ok(SyncFile { read_file, write_file, direct_io: true })
             }
             Err(e) => {
                 // O_DIRECT not supported (e.g., tmpfs), fall back to buffered
@@ -128,7 +143,7 @@ impl SyncFile {
     fn open_direct_macos(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
         use std::os::unix::io::AsRawFd;
 
-        let file = OpenOptions::new()
+        let write_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(create)
@@ -136,7 +151,7 @@ impl SyncFile {
             .open(path)?;
 
         // Enable F_NOCACHE to bypass the unified buffer cache
-        let fd = file.as_raw_fd();
+        let fd = write_file.as_raw_fd();
         let result = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
 
         if result == -1 {
@@ -146,27 +161,32 @@ impl SyncFile {
                 error = %err,
                 "F_NOCACHE not supported, using buffered I/O"
             );
-            Self::setup_file_size(&file, device_size)?;
-            return Ok(SyncFile { file, direct_io: false });
+            Self::setup_file_size(&write_file, device_size)?;
+            let read_file = write_file.try_clone()?;
+            return Ok(SyncFile { read_file, write_file, direct_io: false });
         }
 
-        Self::setup_file_size(&file, device_size)?;
-        info!(path = %path.display(), "opened cache file with F_NOCACHE");
-        Ok(SyncFile { file, direct_io: true })
+        Self::setup_file_size(&write_file, device_size)?;
+        // Duplicate for separate read handle (F_NOCACHE is per-fd, so duplicated fd also has it)
+        let read_file = write_file.try_clone()?;
+        info!(path = %path.display(), "opened cache file with F_NOCACHE (separate read/write FDs)");
+        Ok(SyncFile { read_file, write_file, direct_io: true })
     }
 
     #[allow(dead_code)] // Used on platforms without direct I/O or as fallback
     fn open_buffered(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
+        let write_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(create)
             .truncate(false)
             .open(path)?;
 
-        Self::setup_file_size(&file, device_size)?;
-        info!(path = %path.display(), "opened cache file with buffered I/O");
-        Ok(SyncFile { file, direct_io: false })
+        Self::setup_file_size(&write_file, device_size)?;
+        // Duplicate for separate read handle
+        let read_file = write_file.try_clone()?;
+        info!(path = %path.display(), "opened cache file with buffered I/O (separate read/write FDs)");
+        Ok(SyncFile { read_file, write_file, direct_io: false })
     }
 
     fn setup_file_size(file: &File, device_size: u64) -> std::io::Result<()> {
@@ -178,6 +198,7 @@ impl SyncFile {
     }
 
     /// Read exact bytes at a specific offset (pread).
+    /// Uses the dedicated read file descriptor to avoid contention with writes.
     ///
     /// On Linux with O_DIRECT, uses an aligned intermediate buffer if needed.
     #[inline]
@@ -187,10 +208,11 @@ impl SyncFile {
             return self.read_exact_at_aligned(buf, offset);
         }
 
-        self.file.read_exact_at(buf, offset)
+        self.read_file.read_exact_at(buf, offset)
     }
 
     /// Write all bytes at a specific offset (pwrite).
+    /// Uses the dedicated write file descriptor to avoid contention with reads.
     ///
     /// On Linux with O_DIRECT, uses an aligned intermediate buffer if needed.
     #[inline]
@@ -200,7 +222,7 @@ impl SyncFile {
             return self.write_all_at_aligned(buf, offset);
         }
 
-        self.file.write_all_at(buf, offset)
+        self.write_file.write_all_at(buf, offset)
     }
 
     /// Check if buffer, size, and offset meet O_DIRECT alignment requirements.
@@ -219,7 +241,7 @@ impl SyncFile {
         let aligned_len = (buf.len() + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
         let mut aligned_buf = AlignedBuffer::new(aligned_len);
 
-        self.file.read_exact_at(aligned_buf.as_mut_slice(), offset)?;
+        self.read_file.read_exact_at(aligned_buf.as_mut_slice(), offset)?;
         buf.copy_from_slice(&aligned_buf.as_slice()[..buf.len()]);
         Ok(())
     }
@@ -237,20 +259,22 @@ impl SyncFile {
             *byte = 0;
         }
 
-        self.file.write_all_at(aligned_buf.as_slice(), offset)
+        self.write_file.write_all_at(aligned_buf.as_slice(), offset)
     }
 
     /// Sync all data and metadata to disk.
+    /// Syncs the write file descriptor (reads don't need syncing).
     #[inline]
     pub fn sync_all(&self) -> std::io::Result<()> {
-        self.file.sync_all()
+        self.write_file.sync_all()
     }
 
     /// Get the raw file descriptor (for fallocate, etc).
+    /// Returns the write file descriptor since fallocate modifies the file.
     #[cfg(target_os = "linux")]
     pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         use std::os::unix::io::AsRawFd;
-        self.file.as_raw_fd()
+        self.write_file.as_raw_fd()
     }
 }
 
@@ -748,10 +772,28 @@ impl WriteCache<Initializing> {
         // Ensure cache directory exists
         std::fs::create_dir_all(&config.cache_dir)?;
 
-        // Open or create data file with direct I/O (bypasses page cache).
-        // This eliminates page cache contention during mixed read/write workloads.
+        // Open or create data file (sparse file - only allocates on write)
         let data_path = config.data_path();
-        let data_file = SyncFile::open_direct(&data_path, true, config.device_size)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&data_path)?;
+
+        // Set file size (sparse - doesn't allocate disk space until written)
+        let file_size = file.metadata()?.len();
+        if file_size < config.device_size {
+            file.set_len(config.device_size)?;
+            info!(
+                path = %data_path.display(),
+                old_size = file_size,
+                new_size = config.device_size,
+                "extended cache file (sparse)"
+            );
+        }
+
+        let data_file = SyncFile::new(file);
 
         // Load block states and presence (or create fresh)
         let num_blocks = config.num_blocks();

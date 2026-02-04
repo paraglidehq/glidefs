@@ -589,12 +589,12 @@ async fn test_corrupted_magic_bytes() {
     assert!(result.is_err(), "Should reject corrupted magic bytes");
 }
 
-/// Test: Device size mismatch between config and metadata is rejected.
+/// Test: Device size shrink between config and metadata is rejected.
 ///
-/// Scenario: Metadata was saved with different device size than current config.
-/// This prevents using wrong metadata with wrong device.
+/// Scenario: Metadata was saved with larger device size than current config.
+/// Shrinking is rejected to prevent data loss (growing is allowed).
 #[tokio::test]
-async fn test_device_size_mismatch() {
+async fn test_device_size_shrink_rejected() {
     let s3_backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let s3 = test_s3(Arc::clone(&s3_backend));
     let temp_dir = TempDir::new().unwrap();
@@ -607,11 +607,11 @@ async fn test_device_size_mismatch() {
         cache.save_metadata().unwrap();
     }
 
-    // Create new config with different device size
+    // Create new config with smaller device size (shrink is rejected)
     let new_config = WriteCacheConfig {
         cache_dir: config.cache_dir.clone(),
         device_name: config.device_name.clone(),
-        device_size: config.device_size * 2, // Double the size
+        device_size: config.device_size / 2, // Halve the size
         block_size: config.block_size,
     };
 
@@ -622,9 +622,9 @@ async fn test_device_size_mismatch() {
     )
     .unwrap();
 
-    // Attempt to open with mismatched config: should fail
+    // Attempt to open with smaller size: should fail
     let result = WriteCache::<Initializing>::open(new_config);
-    assert!(result.is_err(), "Should reject device size mismatch");
+    assert!(result.is_err(), "Should reject device size shrink");
 }
 
 /// Test: Recovery from repeated crashes during metadata save operations.

@@ -38,8 +38,7 @@ Compute Node (ONE zerofs process):
 
 ```
 Guest write → NBD handler → WriteCache (local SSD)
-                               ├── Write to local file
-                               ├── Capture block data in memory (DashMap)
+                               ├── Write to local file (page cache + disk)
                                ├── Mark block present (atomic OR)
                                ├── Mark block dirty (CAS)
                                ├── Push to dirty_queue (lock-free)
@@ -50,8 +49,6 @@ Guest write → NBD handler → WriteCache (local SSD)
 ```
 
 The key insight: FLUSH returns after local SSD fsync, not after S3 sync. This makes ZFS snapshot/clone operations fast (~100ms instead of ~10s).
-
-**DashMap optimization**: Dirty block data is captured in memory at write time. This allows the sync worker to read from memory instead of re-reading from disk, eliminating I/O contention during mixed read/write workloads.
 
 ### Read Path (Read-Through Caching)
 
@@ -198,7 +195,6 @@ impl WriteCache<Active> {
 - `block_states`: `AtomicU8` array with CAS for state transitions
 - `present_chunks`: `AtomicU64` bitmap with atomic OR
 - `dirty_queue`: Lock-free `SegQueue<u64>` for O(1) dirty block tracking
-- `dirty_data`: `DashMap<u64, Bytes>` holds dirty block data in memory for sync worker
 - `dirty_notify`: `Notify` to wake sync worker on writes
 
 ### S3BlockStore (`nbd/block_store.rs`)
@@ -261,12 +257,10 @@ loop {
             // Sync: GET-modify-PUT
             batch_data = s3.get_batch_or_empty(batch_num);
             for block in blocks {
-                // Read from in-memory DashMap (no disk I/O!)
-                batch_data[offset] = dirty_data.get(block);
+                // Read from local disk (likely still in page cache)
+                batch_data[offset] = read_local_block(block);
             }
             s3.put_batch(batch_num, batch_data);
-            // Remove from memory after successful sync
-            for block in blocks { dirty_data.remove(block); }
             mark_hot(batch_num);  // Track for cooldown
         }
     }
@@ -276,7 +270,7 @@ loop {
 **Design**:
 - **Event-driven**: Sleeps when idle, wakes instantly on writes
 - **O(1) dirty tracking**: Lock-free queue (`SegQueue`) - no scanning
-- **In-memory dirty data**: DashMap holds block data until synced (no disk re-reads)
+- **Page cache friendly**: Recently written blocks are read from page cache
 - **Lease fencing**: Stops immediately if lease lost
 - **Hot batch deferral**: Recently-synced batches are deferred to reduce write amplification
 - **Back-pressure**: Warnings/errors when dirty queue exceeds thresholds

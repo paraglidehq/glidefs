@@ -1662,6 +1662,19 @@ pub struct SyncWorkerConfig {
     /// Set to 0 to disable.
     pub dirty_queue_critical_threshold: u64,
 
+    /// Sparse batch threshold: minimum dirty blocks in a batch before syncing.
+    ///
+    /// Batches with fewer than this many dirty blocks are considered "sparse"
+    /// and deferred to allow more blocks to accumulate. This reduces write
+    /// amplification by avoiding GET-modify-PUT of nearly-empty batches.
+    ///
+    /// Example: With threshold=10 and 100 blocks/batch:
+    /// - Batch with 3 dirty blocks → deferred (only 3% full)
+    /// - Batch with 15 dirty blocks → synced immediately
+    ///
+    /// Set to 0 to disable (sync all batches regardless of density).
+    pub sparse_batch_threshold: u32,
+
 }
 
 impl Default for SyncWorkerConfig {
@@ -1682,6 +1695,9 @@ impl Default for SyncWorkerConfig {
             dirty_queue_warn_threshold: 1_000,
             // 10000 blocks @ 128KB = 1.28GB uncommitted - serious problem
             dirty_queue_critical_threshold: 10_000,
+            // Defer batches with fewer than 5 dirty blocks (5% of 100-block batch)
+            // Allows sparse batches to accumulate more blocks before sync
+            sparse_batch_threshold: 5,
         }
     }
 }
@@ -1853,11 +1869,13 @@ pub async fn sync_worker(
             blocks_by_batch.entry(batch_num).or_default().push(block_num);
         }
 
-        // Separate into ready-to-sync and deferred (hot batch)
+        // Separate into ready-to-sync and deferred (hot or sparse batch)
         let mut blocks_to_sync = Vec::new();
         let mut deferred_count = 0u64;
         let mut force_synced_count = 0u64;
+        let mut sparse_deferred_count = 0u64;
         let max_deferrals_enabled = config.max_deferrals > 0;
+        let sparse_threshold_enabled = config.sparse_batch_threshold > 0;
 
         for (batch_num, blocks) in blocks_by_batch {
             let is_hot = cooldown_enabled
@@ -1866,8 +1884,12 @@ pub async fn sync_worker(
                     .map(|last_sync| now.duration_since(*last_sync) < config.hot_batch_cooldown)
                     .unwrap_or(false);
 
-            if is_hot {
-                // Batch is hot - check each block's deferral count
+            // Check if batch is sparse (fewer dirty blocks than threshold)
+            let is_sparse = sparse_threshold_enabled
+                && (blocks.len() as u32) < config.sparse_batch_threshold;
+
+            if is_hot || is_sparse {
+                // Batch is hot or sparse - check each block's deferral count
                 for block_num in blocks {
                     let count = deferral_counts.entry(block_num).or_insert(0);
                     *count += 1;
@@ -1879,21 +1901,26 @@ pub async fn sync_worker(
                     } else {
                         // Defer this block
                         cache.mark_sync_failed(block_num);
-                        deferred_count += 1;
+                        if is_sparse && !is_hot {
+                            sparse_deferred_count += 1;
+                        } else {
+                            deferred_count += 1;
+                        }
                     }
                 }
             } else {
-                // Batch is cool - include these blocks for sync
+                // Batch is cool and dense - include these blocks for sync
                 blocks_to_sync.extend(blocks);
             }
         }
 
-        if deferred_count > 0 || force_synced_count > 0 {
+        if deferred_count > 0 || force_synced_count > 0 || sparse_deferred_count > 0 {
             debug!(
-                deferred = deferred_count,
+                hot_deferred = deferred_count,
+                sparse_deferred = sparse_deferred_count,
                 force_synced = force_synced_count,
                 syncing = blocks_to_sync.len(),
-                "hot batch filtering complete"
+                "batch filtering complete"
             );
         }
 
@@ -2664,6 +2691,7 @@ mod tests {
                 metadata_save_interval: 100,
                 dirty_queue_warn_threshold: 0,
                 dirty_queue_critical_threshold: 0,
+                sparse_batch_threshold: 0, // Disable for test
             },
             shutdown_rx,
             None,

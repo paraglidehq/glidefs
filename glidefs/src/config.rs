@@ -40,8 +40,6 @@ pub struct CacheConfig {
 pub struct StorageConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub url: String,
-    #[serde(deserialize_with = "deserialize_expandable_string")]
-    pub encryption_password: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -363,7 +361,6 @@ impl Settings {
             },
             storage: StorageConfig {
                 url: "s3://your-bucket/glidefs-data".to_string(),
-                encryption_password: "${GLIDEFS_PASSWORD}".to_string(),
             },
             servers: ServerConfig {
                 nbd: Some(NbdConfig {
@@ -426,7 +423,6 @@ mod tests {
     #[test]
     fn test_env_var_expansion() {
         unsafe {
-            env::set_var("GLIDEFS_TEST_PASSWORD", "secret123");
             env::set_var("GLIDEFS_TEST_BUCKET", "my-bucket");
         }
 
@@ -437,7 +433,6 @@ disk_size_gb = 1.0
 
 [storage]
 url = "s3://${GLIDEFS_TEST_BUCKET}/data"
-encryption_password = "${GLIDEFS_TEST_PASSWORD}"
 
 [servers]
 "#;
@@ -447,7 +442,6 @@ encryption_password = "${GLIDEFS_TEST_PASSWORD}"
 
         let settings = Settings::from_file(temp_file.path().to_str().unwrap()).unwrap();
         assert_eq!(settings.storage.url, "s3://my-bucket/data");
-        assert_eq!(settings.storage.encryption_password, "secret123");
     }
 
     #[test]
@@ -464,7 +458,6 @@ disk_size_gb = 1.0
 
 [storage]
 url = "file://${GLIDEFS_TEST_HOME}/data"
-encryption_password = "test"
 
 [servers]
 
@@ -497,8 +490,7 @@ dir = "/tmp/cache"
 disk_size_gb = 1.0
 
 [storage]
-url = "s3://bucket/data"
-encryption_password = "${GLIDEFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}"
+url = "s3://${GLIDEFS_TEST_UNDEFINED_VAR_THAT_SHOULD_NOT_EXIST}/data"
 
 [servers]
 "#;
@@ -524,7 +516,6 @@ disk_size_gb = 1.0
 
 [storage]
 url = "s3://bucket/data"
-encryption_password = "test"
 
 [servers]
 

@@ -7,6 +7,160 @@ on:
     branches: ["main"]
 
 jobs:
+  iops-benchmark:
+    name: IOPS Benchmark (4K Random)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nbd-client fio jq
+
+      - name: Setup MinIO bucket
+        run: |
+          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc rm --recursive --force myminio/zerofs-iops-test/ || true
+          ./mc mb myminio/zerofs-iops-test || true
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS
+        working-directory: zerofs
+        run: |
+          mkdir -p /tmp/zerofs-cache
+
+          cat > zerofs-iops.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 4.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-iops-test/bench"
+
+          [servers.nbd]
+          addresses = ["127.0.0.1:10809"]
+
+          [[servers.nbd.exports]]
+          name = "bench-device"
+          size_gb = 10.0
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
+          ./target/ci/zerofs run -c zerofs-iops.toml &
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809; then
+              echo "ZeroFS ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Connect NBD device
+        run: |
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N bench-device
+          sudo blockdev --getsize64 /dev/nbd0
+
+      - name: Warm up cache
+        run: |
+          echo "Writing 1GB to warm cache..."
+          sudo dd if=/dev/urandom of=/dev/nbd0 bs=1M count=1024 conv=fsync
+          echo "Cache warmed"
+
+      - name: Run FIO IOPS Benchmarks
+        run: |
+          echo ""
+          echo "╔═══════════════════════════════════════════════════════════════╗"
+          echo "║              GLIDEFS IOPS BENCHMARK RESULTS                   ║"
+          echo "║                  (4K Random, iodepth=64)                      ║"
+          echo "╚═══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          # 4K Random Read
+          echo "Running 4K random read test (30s)..."
+          READ_RESULT=$(sudo fio --name=randread --ioengine=libaio --direct=1 \
+            --bs=4k --iodepth=64 --rw=randread --runtime=30 --time_based \
+            --filename=/dev/nbd0 --output-format=json)
+
+          READ_IOPS=$(echo "$READ_RESULT" | jq -r '.jobs[0].read.iops')
+          READ_BW=$(echo "$READ_RESULT" | jq -r '.jobs[0].read.bw / 1024' | xargs printf "%.1f")
+          READ_LAT_AVG=$(echo "$READ_RESULT" | jq -r '.jobs[0].read.lat_ns.mean / 1000000' | xargs printf "%.2f")
+          READ_LAT_P99=$(echo "$READ_RESULT" | jq -r '.jobs[0].read.clat_ns.percentile["99.000000"] / 1000000' | xargs printf "%.2f")
+
+          # 4K Random Write
+          echo "Running 4K random write test (30s)..."
+          WRITE_RESULT=$(sudo fio --name=randwrite --ioengine=libaio --direct=1 \
+            --bs=4k --iodepth=64 --rw=randwrite --runtime=30 --time_based \
+            --filename=/dev/nbd0 --output-format=json)
+
+          WRITE_IOPS=$(echo "$WRITE_RESULT" | jq -r '.jobs[0].write.iops')
+          WRITE_BW=$(echo "$WRITE_RESULT" | jq -r '.jobs[0].write.bw / 1024' | xargs printf "%.1f")
+          WRITE_LAT_AVG=$(echo "$WRITE_RESULT" | jq -r '.jobs[0].write.lat_ns.mean / 1000000' | xargs printf "%.2f")
+          WRITE_LAT_P99=$(echo "$WRITE_RESULT" | jq -r '.jobs[0].write.clat_ns.percentile["99.000000"] / 1000000' | xargs printf "%.2f")
+
+          # Mixed 70/30 R/W
+          echo "Running mixed 70/30 read/write test (30s)..."
+          MIXED_RESULT=$(sudo fio --name=mixed --ioengine=libaio --direct=1 \
+            --bs=4k --iodepth=64 --rw=randrw --rwmixread=70 --runtime=30 --time_based \
+            --filename=/dev/nbd0 --output-format=json)
+
+          MIXED_READ_IOPS=$(echo "$MIXED_RESULT" | jq -r '.jobs[0].read.iops')
+          MIXED_WRITE_IOPS=$(echo "$MIXED_RESULT" | jq -r '.jobs[0].write.iops')
+          MIXED_TOTAL_IOPS=$(echo "$MIXED_READ_IOPS + $MIXED_WRITE_IOPS" | bc)
+          MIXED_BW=$(echo "$MIXED_RESULT" | jq -r '(.jobs[0].read.bw + .jobs[0].write.bw) / 1024' | xargs printf "%.1f")
+          MIXED_LAT_AVG=$(echo "$MIXED_RESULT" | jq -r '.jobs[0].read.lat_ns.mean / 1000000' | xargs printf "%.2f")
+          MIXED_LAT_P99=$(echo "$MIXED_RESULT" | jq -r '.jobs[0].read.clat_ns.percentile["99.000000"] / 1000000' | xargs printf "%.2f")
+
+          echo ""
+          echo "┌────────────────┬──────────┬────────────┬────────────┬────────────┐"
+          echo "│ Test           │ IOPS     │ Bandwidth  │ Avg Latency│ p99 Latency│"
+          echo "├────────────────┼──────────┼────────────┼────────────┼────────────┤"
+          printf "│ Random Read    │ %8.0f │ %7s MB/s│ %7sms  │ %7sms  │\n" "$READ_IOPS" "$READ_BW" "$READ_LAT_AVG" "$READ_LAT_P99"
+          printf "│ Random Write   │ %8.0f │ %7s MB/s│ %7sms  │ %7sms  │\n" "$WRITE_IOPS" "$WRITE_BW" "$WRITE_LAT_AVG" "$WRITE_LAT_P99"
+          printf "│ Mixed (70/30)  │ %8.0f │ %7s MB/s│ %7sms  │ %7sms  │\n" "$MIXED_TOTAL_IOPS" "$MIXED_BW" "$MIXED_LAT_AVG" "$MIXED_LAT_P99"
+          echo "└────────────────┴──────────┴────────────┴────────────┴────────────┘"
+          echo ""
+          echo "Environment: GitHub Actions runner (ubuntu-latest)"
+          echo "Device: NBD over localhost → MinIO (in-memory S3)"
+          echo ""
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo nbd-client -d /dev/nbd0 || true
+          pkill -f "zerofs run" || true
+          docker stop minio || true
+
   zfs-test:
     name: Run ZFS on top of ZeroFS
     runs-on: ubuntu-latest

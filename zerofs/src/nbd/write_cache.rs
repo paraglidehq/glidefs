@@ -8,12 +8,13 @@
 //!
 //! Block states and presence tracking use lock-free atomics to avoid contention
 //! under high write concurrency. State transitions use compare-and-swap (CAS)
-//! operations, and presence bits use atomic OR. The only lock is on the file
-//! handle for metadata operations (not data path).
+//! operations, and presence bits use atomic OR.
+//!
+//! The data file uses positional I/O (pread/pwrite) which is thread-safe per
+//! POSIX semantics, eliminating the need for any locking on the hot path.
 
 use bytes::Bytes;
 use crossbeam::queue::SegQueue;
-use parking_lot::RwLock;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::marker::PhantomData;
@@ -28,15 +29,116 @@ use tracing::{debug, info, instrument, warn};
 use super::block_store::{BlockStoreError, S3BlockStore};
 use super::state::{Active, BlockState, Draining, Initializing, Recovering};
 
+/// A file handle safe for concurrent positional I/O.
+///
+/// This wrapper allows sharing a `File` across threads when using only
+/// positional I/O methods (`read_at`, `write_at`, `read_exact_at`, `write_all_at`).
+/// These methods use `pread`/`pwrite` system calls which are atomic and don't
+/// use the internal file position, making them thread-safe per POSIX semantics.
+///
+/// # Safety
+///
+/// This type implements `Sync` because:
+/// 1. We only expose positional I/O methods (pread/pwrite)
+/// 2. POSIX guarantees pread/pwrite are atomic with respect to each other
+/// 3. We never use seek-based read/write which would race on file position
+/// 4. `sync_all()` is safe to call concurrently (just triggers fsync)
+#[derive(Debug)]
+pub struct SyncFile(File);
+
+impl SyncFile {
+    /// Create a new SyncFile from a File.
+    pub fn new(file: File) -> Self {
+        SyncFile(file)
+    }
+
+    /// Read exact bytes at a specific offset (pread).
+    #[inline]
+    pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        self.0.read_exact_at(buf, offset)
+    }
+
+    /// Write all bytes at a specific offset (pwrite).
+    #[inline]
+    pub fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        self.0.write_all_at(buf, offset)
+    }
+
+    /// Sync all data and metadata to disk.
+    #[inline]
+    pub fn sync_all(&self) -> std::io::Result<()> {
+        self.0.sync_all()
+    }
+
+    /// Get the raw file descriptor (for fallocate, etc).
+    #[cfg(target_os = "linux")]
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.0.as_raw_fd()
+    }
+}
+
+// Safety: SyncFile only exposes positional I/O methods which are thread-safe.
+// pread/pwrite are atomic per POSIX and don't use the shared file position.
+unsafe impl Sync for SyncFile {}
+unsafe impl Send for SyncFile {}
+
 
 /// Check if a block is all zeros.
 ///
-/// Uses 64-bit word comparison for performance - much faster than byte-by-byte.
-/// A 128KB block has 16,384 u64s to check vs 131,072 bytes.
+/// Uses SIMD when available (AVX2 on x86_64), falling back to 64-bit word
+/// comparison. For a 128KB block:
+/// - Byte-by-byte: 131,072 comparisons
+/// - u64 fallback: 16,384 comparisons
+/// - AVX2 (256-bit): 4,096 comparisons
 #[inline]
 fn is_zero_block(data: &[u8]) -> bool {
-    // Process as u64 for 8x fewer comparisons
-    // Safety: we're just reading, alignment doesn't matter for correctness
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: We've verified AVX2 is available
+            return unsafe { is_zero_block_avx2(data) };
+        }
+    }
+    is_zero_block_u64(data)
+}
+
+/// AVX2 implementation - checks 32 bytes at a time.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn is_zero_block_avx2(data: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+
+    let mut ptr = data.as_ptr();
+    let end = ptr.add(data.len());
+
+    // Process 32-byte chunks with AVX2
+    // _mm256_loadu_si256 handles unaligned loads
+    while ptr.add(32) <= end {
+        let chunk = _mm256_loadu_si256(ptr as *const __m256i);
+        // testz returns 1 if all bits are zero: (chunk AND chunk) == 0
+        if _mm256_testz_si256(chunk, chunk) == 0 {
+            return false;
+        }
+        ptr = ptr.add(32);
+    }
+
+    // Handle remainder (0-31 bytes) with scalar code
+    while ptr < end {
+        if *ptr != 0 {
+            return false;
+        }
+        ptr = ptr.add(1);
+    }
+
+    true
+}
+
+/// Fallback implementation using 64-bit words.
+#[inline]
+fn is_zero_block_u64(data: &[u8]) -> bool {
+    // Process as u64 for 8x fewer comparisons than byte-by-byte
+    // SAFETY: we're just reading, alignment doesn't matter for correctness
     let (prefix, middle, suffix) = unsafe { data.align_to::<u64>() };
 
     // Check unaligned prefix bytes
@@ -138,14 +240,15 @@ impl WriteCacheConfig {
 /// Internal state shared across all cache states.
 ///
 /// Uses lock-free atomics for block states and presence to avoid contention
-/// under high write concurrency. The file lock is only for metadata operations.
+/// under high write concurrency. The data file uses positional I/O which is
+/// inherently thread-safe, eliminating all locking on the hot path.
 pub(crate) struct CacheInner {
     /// Configuration
     config: WriteCacheConfig,
 
     /// Local cache file (data) - encrypted at rest
-    /// RwLock is for metadata ops only; pwrite_all_at is thread-safe
-    data_file: RwLock<File>,
+    /// Uses positional I/O (pread/pwrite) which is lock-free and thread-safe
+    data_file: SyncFile,
 
     /// Block states (indexed by block number) - LOCK-FREE
     /// Uses AtomicU8 with CAS for state transitions
@@ -475,7 +578,7 @@ impl WriteCache<Initializing> {
 
         let inner = Arc::new(CacheInner {
             config,
-            data_file: RwLock::new(data_file),
+            data_file: SyncFile::new(data_file),
             block_states,
             present_chunks,
             num_blocks,
@@ -607,8 +710,7 @@ impl WriteCache<Recovering> {
         let offset = block_num * self.inner.config.block_size as u64;
         let mut buf = vec![0u8; self.inner.config.block_size];
 
-        let file = self.inner.data_file.read();
-        file.read_exact_at(&mut buf, offset)?;
+        self.inner.data_file.read_exact_at(&mut buf, offset)?;
 
         Ok(Bytes::from(buf))
     }
@@ -690,10 +792,7 @@ impl WriteCache<Active> {
         }
 
         // Now write to local file (after claiming blocks via set_present)
-        {
-            let file = self.inner.data_file.read();
-            file.write_all_at(data, offset)?;
-        }
+        self.inner.data_file.write_all_at(data, offset)?;
 
         // Mark affected blocks as dirty (lock-free)
         let mut newly_dirty = false;
@@ -927,10 +1026,7 @@ impl WriteCache<Active> {
                 }
 
                 // We own this block now (we set present). Write S3 data to cache.
-                {
-                    let file = self.inner.data_file.read();
-                    file.write_all_at(block_data, cache_offset)?;
-                }
+                self.inner.data_file.write_all_at(block_data, cache_offset)?;
 
                 blocks_cached += 1;
             }
@@ -962,10 +1058,7 @@ impl WriteCache<Active> {
         }
 
         let mut buf = vec![0u8; len];
-        {
-            let file = self.inner.data_file.read();
-            file.read_exact_at(&mut buf, offset)?;
-        }
+        self.inner.data_file.read_exact_at(&mut buf, offset)?;
 
         Ok(Bytes::from(buf))
     }
@@ -985,8 +1078,7 @@ impl WriteCache<Active> {
     /// It does NOT wait for S3 sync - that happens in the background.
     #[instrument(skip(self))]
     pub fn flush(&self) -> Result<(), CacheError> {
-        let file = self.inner.data_file.read();
-        file.sync_all()?;
+        self.inner.data_file.sync_all()?;
         debug!("local flush complete");
         Ok(())
     }
@@ -1013,9 +1105,7 @@ impl WriteCache<Active> {
         // Zero the file range
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::io::AsRawFd;
-            let file = self.inner.data_file.read();
-            let fd = file.as_raw_fd();
+            let fd = self.inner.data_file.as_raw_fd();
 
             // FALLOC_FL_ZERO_RANGE = 0x10
             // This zeros the range without deallocating - keeps the file contiguous
@@ -1059,13 +1149,12 @@ impl WriteCache<Active> {
             vec![0u8; ZERO_CHUNK_SIZE].into_boxed_slice()
         });
 
-        let file = self.inner.data_file.read();
         let mut remaining = len;
         let mut current_offset = offset;
 
         while remaining > 0 {
             let chunk_size = (remaining as usize).min(ZERO_CHUNK_SIZE);
-            file.write_all_at(&ZERO_CHUNK[..chunk_size], current_offset)?;
+            self.inner.data_file.write_all_at(&ZERO_CHUNK[..chunk_size], current_offset)?;
             remaining -= chunk_size as u64;
             current_offset += chunk_size as u64;
         }

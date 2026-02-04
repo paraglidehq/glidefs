@@ -485,7 +485,9 @@ impl LeaseState {
 
 /// Background task that renews the lease periodically.
 ///
-/// Renews at 50% of TTL. If renewal fails, marks the lease as lost.
+/// Renews at 50% of TTL. On transient failures (network, S3 errors), retries with
+/// exponential backoff. On fatal failures (lease held by another node), marks lost
+/// immediately.
 pub async fn lease_renewal_task(
     manager: Arc<LeaseManager>,
     export: String,
@@ -502,23 +504,18 @@ pub async fn lease_renewal_task(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(renewal_interval) => {
-                // Time to renew
-                match manager.acquire(&export).await {
-                    Ok(handle) => {
-                        state.update_generation(handle.lease.generation);
-                        debug!(
-                            export = %export,
-                            generation = handle.lease.generation,
-                            "lease renewed"
-                        );
+                // Time to renew - try with retries for transient errors
+                match renew_with_retry(&manager, &export, &state, &mut shutdown).await {
+                    RenewalResult::Success => {
+                        // Continue normal operation
                     }
-                    Err(e) => {
-                        warn!(
-                            export = %export,
-                            error = %e,
-                            "lease renewal failed, marking as lost"
-                        );
+                    RenewalResult::Fatal => {
+                        // Lease lost to another node or unrecoverable error
                         state.mark_lost();
+                        return;
+                    }
+                    RenewalResult::Shutdown => {
+                        // Shutdown requested during retry
                         return;
                     }
                 }
@@ -527,6 +524,108 @@ pub async fn lease_renewal_task(
                 if *shutdown.borrow() {
                     info!(export = %export, "lease renewal task shutting down");
                     return;
+                }
+            }
+        }
+    }
+}
+
+/// Result of a renewal attempt with retries.
+enum RenewalResult {
+    /// Renewal succeeded
+    Success,
+    /// Fatal error - lease lost, don't retry
+    Fatal,
+    /// Shutdown requested during retry loop
+    Shutdown,
+}
+
+/// Attempt lease renewal with exponential backoff for transient errors.
+///
+/// Retry strategy:
+/// - Max 5 attempts (initial + 4 retries)
+/// - Backoff: 1s, 2s, 4s, 8s (total ~15s worst case)
+/// - Fatal errors (LeaseHeldByOther) fail immediately
+/// - Transient errors (network, S3) retry with backoff
+async fn renew_with_retry(
+    manager: &LeaseManager,
+    export: &str,
+    state: &LeaseState,
+    shutdown: &mut watch::Receiver<bool>,
+) -> RenewalResult {
+    const MAX_ATTEMPTS: u32 = 5;
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(8);
+
+    let mut attempt = 0;
+    let mut backoff = INITIAL_BACKOFF;
+
+    loop {
+        attempt += 1;
+
+        match manager.acquire(export).await {
+            Ok(handle) => {
+                state.update_generation(handle.lease.generation);
+                if attempt > 1 {
+                    info!(
+                        export = %export,
+                        generation = handle.lease.generation,
+                        attempts = attempt,
+                        "lease renewed after retry"
+                    );
+                } else {
+                    debug!(
+                        export = %export,
+                        generation = handle.lease.generation,
+                        "lease renewed"
+                    );
+                }
+                return RenewalResult::Success;
+            }
+            Err(LeaseError::LeaseHeldByOther { owner, generation }) => {
+                // Fatal: another node legitimately holds the lease
+                // This shouldn't happen during normal operation - indicates
+                // either a bug or we were partitioned long enough for lease to expire
+                warn!(
+                    export = %export,
+                    other_owner = %owner,
+                    other_generation = generation,
+                    "lease held by another node, marking as lost"
+                );
+                return RenewalResult::Fatal;
+            }
+            Err(e) => {
+                // Transient error - retry with backoff if attempts remain
+                if attempt >= MAX_ATTEMPTS {
+                    warn!(
+                        export = %export,
+                        error = %e,
+                        attempts = attempt,
+                        "lease renewal failed after all retries, marking as lost"
+                    );
+                    return RenewalResult::Fatal;
+                }
+
+                warn!(
+                    export = %export,
+                    error = %e,
+                    attempt = attempt,
+                    backoff_secs = backoff.as_secs(),
+                    "lease renewal failed, retrying"
+                );
+
+                // Wait with backoff, but respect shutdown
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {
+                        // Exponential backoff with cap
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            info!(export = %export, "shutdown during lease renewal retry");
+                            return RenewalResult::Shutdown;
+                        }
+                    }
                 }
             }
         }

@@ -1741,22 +1741,6 @@ pub async fn sync_worker(
         "sync worker started (event-driven)"
     );
 
-    // Set I/O priority to idle class so sync doesn't compete with reads
-    #[cfg(target_os = "linux")]
-    {
-        const IOPRIO_WHO_PROCESS: i32 = 1;
-        const IOPRIO_CLASS_IDLE: i32 = 3;
-        unsafe {
-            libc::syscall(
-                libc::SYS_ioprio_set,
-                IOPRIO_WHO_PROCESS,
-                0, // current thread
-                (IOPRIO_CLASS_IDLE << 13) | 0,
-            );
-        }
-        debug!("sync worker set to idle I/O priority");
-    }
-
     let mut batches_since_save = 0;
     let mut last_backpressure_warn = std::time::Instant::now() - std::time::Duration::from_secs(60);
 

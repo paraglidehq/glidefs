@@ -175,8 +175,8 @@ pub struct MetricsSnapshot {
 
     // Derived metrics
     /// S3 bytes written / guest bytes written
-    /// > 1.0 = write amplification (S3 batching overhead)
-    /// < 1.0 = unlikely without compression
+    /// - `> 1.0` = write amplification (S3 batching overhead)
+    /// - `< 1.0` = unlikely without compression
     pub write_amplification: f64,
 
     /// Guest write ops / batches written
@@ -194,6 +194,85 @@ impl MetricsSnapshot {
         self.syncing_blocks = Some(syncing_blocks);
         self
     }
+
+    /// Format this snapshot as Prometheus metrics text for a single export.
+    pub fn to_prometheus(&self, export_name: &str) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        // Helper to write a metric line
+        let label = format!("export=\"{}\"", export_name);
+
+        // Guest I/O counters
+        writeln!(out, "zerofs_guest_bytes_written{{{label}}} {}", self.guest_bytes_written).unwrap();
+        writeln!(out, "zerofs_guest_write_ops{{{label}}} {}", self.guest_write_ops).unwrap();
+        writeln!(out, "zerofs_guest_bytes_read{{{label}}} {}", self.guest_bytes_read).unwrap();
+        writeln!(out, "zerofs_guest_read_ops{{{label}}} {}", self.guest_read_ops).unwrap();
+
+        // S3 I/O counters
+        writeln!(out, "zerofs_s3_bytes_written{{{label}}} {}", self.s3_bytes_written).unwrap();
+        writeln!(out, "zerofs_s3_write_ops{{{label}}} {}", self.s3_write_ops).unwrap();
+        writeln!(out, "zerofs_s3_batches_written{{{label}}} {}", self.batches_written).unwrap();
+        writeln!(out, "zerofs_s3_bytes_read{{{label}}} {}", self.s3_bytes_read).unwrap();
+        writeln!(out, "zerofs_s3_read_ops{{{label}}} {}", self.s3_read_ops).unwrap();
+
+        // Cache counters
+        writeln!(out, "zerofs_cache_hits{{{label}}} {}", self.cache_hits).unwrap();
+        writeln!(out, "zerofs_cache_misses{{{label}}} {}", self.cache_misses).unwrap();
+
+        // Cache state (gauges)
+        if let Some(dirty) = self.dirty_blocks {
+            writeln!(out, "zerofs_dirty_blocks{{{label}}} {dirty}").unwrap();
+        }
+        if let Some(syncing) = self.syncing_blocks {
+            writeln!(out, "zerofs_syncing_blocks{{{label}}} {syncing}").unwrap();
+        }
+
+        // Derived metrics (gauges)
+        writeln!(out, "zerofs_write_amplification{{{label}}} {:.6}", self.write_amplification).unwrap();
+        writeln!(out, "zerofs_coalesce_ratio{{{label}}} {:.6}", self.coalesce_ratio).unwrap();
+        writeln!(out, "zerofs_cache_hit_rate{{{label}}} {:.6}", self.cache_hit_rate).unwrap();
+
+        out
+    }
+}
+
+/// Generate Prometheus metrics header (TYPE and HELP lines).
+/// Call once before iterating exports.
+pub fn prometheus_header() -> &'static str {
+    r#"# HELP zerofs_guest_bytes_written Total bytes written by guest
+# TYPE zerofs_guest_bytes_written counter
+# HELP zerofs_guest_write_ops Total NBD write commands from guest
+# TYPE zerofs_guest_write_ops counter
+# HELP zerofs_guest_bytes_read Total bytes read by guest
+# TYPE zerofs_guest_bytes_read counter
+# HELP zerofs_guest_read_ops Total NBD read commands from guest
+# TYPE zerofs_guest_read_ops counter
+# HELP zerofs_s3_bytes_written Total bytes written to S3
+# TYPE zerofs_s3_bytes_written counter
+# HELP zerofs_s3_write_ops Total blocks written to S3
+# TYPE zerofs_s3_write_ops counter
+# HELP zerofs_s3_batches_written Total S3 batch objects written
+# TYPE zerofs_s3_batches_written counter
+# HELP zerofs_s3_bytes_read Total bytes read from S3
+# TYPE zerofs_s3_bytes_read counter
+# HELP zerofs_s3_read_ops Total S3 read operations
+# TYPE zerofs_s3_read_ops counter
+# HELP zerofs_cache_hits Cache hits (reads served from local cache)
+# TYPE zerofs_cache_hits counter
+# HELP zerofs_cache_misses Cache misses (reads requiring S3 fetch)
+# TYPE zerofs_cache_misses counter
+# HELP zerofs_dirty_blocks Blocks waiting to sync to S3
+# TYPE zerofs_dirty_blocks gauge
+# HELP zerofs_syncing_blocks Blocks currently syncing to S3
+# TYPE zerofs_syncing_blocks gauge
+# HELP zerofs_write_amplification S3 bytes / guest bytes written
+# TYPE zerofs_write_amplification gauge
+# HELP zerofs_coalesce_ratio Guest write ops / S3 batch writes
+# TYPE zerofs_coalesce_ratio gauge
+# HELP zerofs_cache_hit_rate Fraction of reads served from cache
+# TYPE zerofs_cache_hit_rate gauge
+"#
 }
 
 #[cfg(test)]

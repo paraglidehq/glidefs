@@ -31,6 +31,7 @@ pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 100;
 
 /// Errors that can occur during block store operations.
 #[derive(Error, Debug)]
+#[allow(dead_code)] // Public API for library consumers
 pub enum BlockStoreError {
     #[error("S3 operation failed: {0}")]
     ObjectStore(#[from] object_store::Error),
@@ -142,6 +143,7 @@ impl S3BlockStore {
     ///
     /// Returns NotFound if the batch doesn't exist.
     /// S3 SSE handles decryption transparently - no client-side decryption needed.
+    #[allow(dead_code)] // Public API for library consumers
     #[instrument(skip(self), fields(block = block_num))]
     pub async fn read_block(&self, block_num: u64) -> Result<Bytes, BlockStoreError> {
         let batch_num = self.batch_num(block_num);

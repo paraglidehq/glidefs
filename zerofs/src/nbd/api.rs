@@ -4,6 +4,7 @@
 //! Used by orchestrators for microVM scale-to-zero and live migration.
 
 use crate::config::ExportConfig;
+use crate::nbd::metrics::prometheus_header;
 use crate::nbd::router::{ExportRouter, RouterError};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -229,6 +230,22 @@ async fn handle_request(
         // Health check
         (Method::GET, ["health"]) => {
             json_response(StatusCode::OK, &ApiResponse::success("healthy"))
+        }
+
+        // GET /metrics - Prometheus metrics for all exports
+        (Method::GET, ["metrics"]) => {
+            let mut output = String::from(prometheus_header());
+            let names = router.list_export_names().await;
+            for name in names {
+                if let Some(snapshot) = router.get_export_metrics(&name).await {
+                    output.push_str(&snapshot.to_prometheus(&name));
+                }
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                .body(Full::new(Bytes::from(output)))
+                .unwrap()
         }
 
         // 404 for everything else

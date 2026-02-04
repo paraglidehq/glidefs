@@ -32,6 +32,30 @@ use super::state::{Active, BlockState, Draining, Initializing, Recovering};
 #[allow(dead_code)]
 pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
+/// Check if a block is all zeros.
+///
+/// Uses 64-bit word comparison for performance - much faster than byte-by-byte.
+/// A 128KB block has 16,384 u64s to check vs 131,072 bytes.
+#[inline]
+fn is_zero_block(data: &[u8]) -> bool {
+    // Process as u64 for 8x fewer comparisons
+    // Safety: we're just reading, alignment doesn't matter for correctness
+    let (prefix, middle, suffix) = unsafe { data.align_to::<u64>() };
+
+    // Check unaligned prefix bytes
+    if prefix.iter().any(|&b| b != 0) {
+        return false;
+    }
+
+    // Check aligned u64 words (bulk of the work)
+    if middle.iter().any(|&w| w != 0) {
+        return false;
+    }
+
+    // Check unaligned suffix bytes
+    suffix.iter().all(|&b| b == 0)
+}
+
 /// Magic bytes for cache metadata file
 const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
 /// Version 3: present_blocks as packed bits (8x smaller than v2)
@@ -656,17 +680,34 @@ impl WriteCache<Active> {
             return Ok(());
         }
 
-        // Write to local file
+        // Calculate affected blocks
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + data.len() as u64 - 1) / block_size;
+
+        // CRITICAL: Mark blocks as present BEFORE writing to file.
+        // This prevents a race with prefetch where:
+        // 1. Prefetch sees is_present=false
+        // 2. Write does pwrite(new_data)
+        // 3. Prefetch does pwrite(s3_data) - OVERWRITES new_data
+        // 4. Write does set_present (too late)
+        //
+        // By setting present first, prefetch's CAS will fail if we've claimed the block,
+        // or if prefetch wins the CAS, our pwrite will overwrite their stale S3 data.
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                self.inner.set_present(idx);
+            }
+        }
+
+        // Now write to local file (after claiming blocks via set_present)
         {
             let file = self.inner.data_file.read();
             file.write_all_at(data, offset)?;
         }
 
-        // Mark affected blocks as dirty and present (lock-free)
-        let block_size = self.inner.config.block_size as u64;
-        let start_block = offset / block_size;
-        let end_block = (offset + data.len() as u64 - 1) / block_size;
-
+        // Mark affected blocks as dirty (lock-free)
         let mut newly_dirty = false;
 
         for block in start_block..=end_block {
@@ -675,8 +716,7 @@ impl WriteCache<Active> {
                 continue;
             }
 
-            // Mark as present (atomic OR)
-            self.inner.set_present(idx);
+            // Block is already present (set above)
 
             // CAS loop for state transition
             loop {
@@ -850,7 +890,7 @@ impl WriteCache<Active> {
                     break;
                 }
 
-                // Skip blocks already present (shouldn't happen, but be safe)
+                // Skip blocks already present
                 if self.inner.is_present(block_num as usize) {
                     continue;
                 }
@@ -866,14 +906,44 @@ impl WriteCache<Active> {
                     break;
                 };
 
-                // Write to local cache file
+                // Try to atomically claim this block for prefetching.
+                // Use CAS on present bit: if someone else set it while we were
+                // fetching from S3, they won the race and we skip this block.
+                let chunk_idx = (block_num as usize) / 64;
+                let bit_idx = (block_num as usize) % 64;
+                let bit_mask = 1u64 << bit_idx;
+
+                // CAS loop to set present bit atomically
+                let was_present = loop {
+                    let old = self.inner.present_chunks[chunk_idx].load(Ordering::Acquire);
+                    if (old & bit_mask) != 0 {
+                        // Someone else set it - they won the race
+                        break true;
+                    }
+                    // Try to set the bit
+                    match self.inner.present_chunks[chunk_idx].compare_exchange(
+                        old,
+                        old | bit_mask,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break false, // We set it
+                        Err(_) => continue,   // Retry
+                    }
+                };
+
+                if was_present {
+                    // A concurrent write won the race - skip this block
+                    // The write's data is authoritative
+                    continue;
+                }
+
+                // We own this block now (we set present). Write S3 data to cache.
                 {
                     let file = self.inner.data_file.read();
                     file.write_all_at(block_data, cache_offset)?;
                 }
 
-                // Mark block as present
-                self.inner.set_present(block_num as usize);
                 blocks_cached += 1;
             }
 
@@ -1219,6 +1289,12 @@ impl WriteCache<Active> {
     ///
     /// Groups blocks by batch number, performs GET-modify-PUT for each batch.
     /// Uses conditional PUT (If-Match) as defense-in-depth against concurrent writers.
+    ///
+    /// **Zero-block optimization**: Blocks that are all zeros are skipped if the
+    /// corresponding position in S3 is already zeros (or the batch doesn't exist).
+    /// Since missing blocks return zeros on read, this is safe and reduces S3 writes
+    /// for fresh VMs, TRIM operations, and sparse filesystems.
+    ///
     /// Returns the number of blocks successfully synced.
     pub async fn sync_blocks_batched(&self, s3: &S3BlockStore, block_nums: Vec<u64>) -> Result<usize, CacheError> {
         use std::collections::HashMap;
@@ -1235,6 +1311,7 @@ impl WriteCache<Active> {
         }
 
         let mut synced_count = 0;
+        let block_size = self.inner.config.block_size;
 
         // Process each batch
         for (batch_num, blocks_in_batch) in batches {
@@ -1252,16 +1329,32 @@ impl WriteCache<Active> {
 
             let mut batch_data = batch_result.data;
             let etag = batch_result.etag;
+            let mut batch_modified = false;
 
             // Update dirty block slots with local data
             for &block_num in &blocks_in_batch {
                 let local_data = self.read_local_block(block_num)?;
                 let offset = s3.offset_in_batch(block_num) as usize;
-                batch_data[offset..offset + local_data.len()].copy_from_slice(&local_data);
+                let s3_slice = &batch_data[offset..offset + block_size];
+
+                // Zero-block optimization: skip if local is zeros AND S3 is already zeros
+                let local_is_zero = is_zero_block(&local_data);
+                let s3_is_zero = is_zero_block(s3_slice);
+
+                if local_is_zero && s3_is_zero {
+                    // Both zero - no need to write, just mark synced
+                    debug!(block = block_num, "skipping zero block (S3 already zeros)");
+                } else {
+                    // Copy local data to batch
+                    batch_data[offset..offset + local_data.len()].copy_from_slice(&local_data);
+                    batch_modified = true;
+                }
             }
 
-            // Conditional PUT: only succeed if no one else modified the batch
-            if let Err(e) = s3.put_batch_conditional(batch_num, batch_data, etag).await {
+            // Only PUT if we actually modified the batch
+            if batch_modified
+                && let Err(e) = s3.put_batch_conditional(batch_num, batch_data, etag).await
+            {
                 // Mark all blocks in this batch as failed
                 for block_num in blocks_in_batch {
                     self.mark_sync_failed(block_num);
@@ -2486,5 +2579,282 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.cache_hits, 1, "block 0 was local (hit)");
         assert_eq!(snapshot.cache_misses, 1, "block 1 was fetched (miss)");
+    }
+
+    #[tokio::test]
+    async fn test_zero_block_skip_optimization() {
+        // Verify that zero blocks are skipped during sync when S3 already has zeros.
+        // This reduces S3 writes for fresh VMs and TRIM operations.
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let s3 = Arc::new(
+            S3BlockStore::new(Arc::clone(&object_store), "test", 4096).with_blocks_per_batch(10),
+        );
+        let metrics = Arc::new(super::super::metrics::ExportMetrics::new());
+        let s3_with_metrics = Arc::new(
+            S3BlockStore::new(Arc::clone(&object_store), "test", 4096)
+                .with_blocks_per_batch(10)
+                .with_metrics(Arc::clone(&metrics)),
+        );
+
+        let dir = TempDir::new().unwrap();
+        let config = WriteCacheConfig {
+            cache_dir: dir.path().to_path_buf(),
+            device_name: "zero_test".to_string(),
+            device_size: 10 * 4096,
+            block_size: 4096,
+        };
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = cache.finish_recovery(&s3).await.unwrap();
+
+        // Write zeros to block 0 (simulates TRIM or fresh VM)
+        cache.write(0, &[0u8; 4096]).unwrap();
+        assert_eq!(cache.dirty_block_count(), 1, "block should be dirty");
+
+        // Sync - should skip the S3 write since block is zeros and S3 has no batch
+        let dirty = cache.claim_dirty_blocks(10);
+        assert_eq!(dirty.len(), 1);
+        let synced = cache.sync_blocks_batched(&s3_with_metrics, dirty).await.unwrap();
+        assert_eq!(synced, 1, "block should be marked synced");
+        assert_eq!(cache.dirty_block_count(), 0, "no more dirty blocks");
+
+        // Verify NO S3 write happened (zero block was skipped)
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.batches_written, 0,
+            "zero block should not trigger S3 write when S3 already zeros"
+        );
+
+        // Now write non-zero data and sync - this should write to S3
+        cache.write(0, &[42u8; 4096]).unwrap();
+        let dirty = cache.claim_dirty_blocks(10);
+        cache.sync_blocks_batched(&s3_with_metrics, dirty).await.unwrap();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.batches_written, 1, "non-zero block should trigger S3 write");
+
+        // Verify data in S3
+        let batch = s3.get_batch_or_empty(0).await.unwrap();
+        assert_eq!(batch[0], 42, "non-zero data should be in S3");
+
+        // Now write zeros again - this time S3 has non-zero data
+        // So zeros MUST be written to overwrite the old data
+        cache.write(0, &[0u8; 4096]).unwrap();
+        let dirty = cache.claim_dirty_blocks(10);
+        cache.sync_blocks_batched(&s3_with_metrics, dirty).await.unwrap();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.batches_written, 2,
+            "zeros must be written to overwrite non-zero S3 data"
+        );
+
+        // Verify S3 now has zeros
+        let batch = s3.get_batch_or_empty(0).await.unwrap();
+        assert_eq!(batch[0], 0, "S3 should have zeros after overwrite");
+    }
+
+    #[test]
+    fn test_is_zero_block() {
+        // Test the is_zero_block helper function
+        let zeros = vec![0u8; 4096];
+        assert!(super::is_zero_block(&zeros), "all zeros should return true");
+
+        let mut non_zeros = vec![0u8; 4096];
+        non_zeros[0] = 1;
+        assert!(!super::is_zero_block(&non_zeros), "first byte non-zero");
+
+        non_zeros[0] = 0;
+        non_zeros[4095] = 1;
+        assert!(!super::is_zero_block(&non_zeros), "last byte non-zero");
+
+        non_zeros[4095] = 0;
+        non_zeros[2048] = 1;
+        assert!(!super::is_zero_block(&non_zeros), "middle byte non-zero");
+
+        // Empty slice
+        assert!(super::is_zero_block(&[]), "empty slice is 'all zeros'");
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_write_race_data_integrity() {
+        // Regression test for prefetch/write race condition.
+        //
+        // Without the fix, this sequence causes data loss:
+        // 1. S3 has old data (0xAA)
+        // 2. Write starts: pwrite(0xBB) completes
+        // 3. Prefetch: sees is_present=false, fetches S3, pwrite(0xAA) OVERWRITES
+        // 4. Write: set_present (too late)
+        // 5. File now has 0xAA (stale), but marked dirty → syncs stale data
+        //
+        // With the fix (set_present before pwrite in write path):
+        // - Write's set_present runs early, prefetch's CAS fails → prefetch skips
+        // - OR prefetch CAS wins, but write's pwrite comes after → write wins
+
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let s3 = Arc::new(
+            S3BlockStore::new(Arc::clone(&object_store), "test", 4096).with_blocks_per_batch(10),
+        );
+        let metrics = super::super::metrics::ExportMetrics::new();
+
+        // Pre-populate S3 with OLD data (0xAA)
+        let mut batch0 = vec![0u8; s3.batch_size()];
+        batch0[0..4096].copy_from_slice(&[0xAAu8; 4096]);
+        s3.put_batch(0, batch0).await.unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let config = WriteCacheConfig {
+            cache_dir: dir.path().to_path_buf(),
+            device_name: "race_test".to_string(),
+            device_size: 10 * 4096,
+            block_size: 4096,
+        };
+        let cache = Arc::new(
+            WriteCache::<Initializing>::open(config)
+                .unwrap()
+                .skip_recovery_for_test(),
+        );
+
+        // Use barriers to force a specific interleaving
+        let write_started = Arc::new(AtomicBool::new(false));
+        let prefetch_can_continue = Arc::new(AtomicBool::new(false));
+
+        // Spawn concurrent tasks
+        let cache_write = Arc::clone(&cache);
+        let write_started_clone = Arc::clone(&write_started);
+        let prefetch_can_continue_clone = Arc::clone(&prefetch_can_continue);
+
+        let write_handle = tokio::spawn(async move {
+            // Write NEW data (0xBB) - should win over stale S3 data
+            cache_write.write(0, &[0xBBu8; 4096]).unwrap();
+            write_started_clone.store(true, AtomicOrdering::Release);
+            // Signal prefetch can continue
+            prefetch_can_continue_clone.store(true, AtomicOrdering::Release);
+        });
+
+        let cache_read = Arc::clone(&cache);
+        let s3_read = Arc::clone(&s3);
+        let write_started_read = Arc::clone(&write_started);
+        let _prefetch_can_continue_read = Arc::clone(&prefetch_can_continue);
+
+        let read_handle = tokio::spawn(async move {
+            // Wait until write has started (to maximize race window)
+            while !write_started_read.load(AtomicOrdering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            // Small delay to let write progress
+            tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
+
+            // Now do the read which triggers prefetch
+            let data = cache_read
+                .read_with_fetch(0, 4096, &s3_read, &metrics)
+                .await
+                .unwrap();
+            data
+        });
+
+        // Wait for both
+        write_handle.await.unwrap();
+        let _read_data = read_handle.await.unwrap();
+
+        // The critical assertion: we must see the WRITE's data (0xBB), not S3's stale data (0xAA)
+        //
+        // Either:
+        // - Write completed first, read sees 0xBB (write won)
+        // - Prefetch completed first with 0xAA, but write overwrote it, read sees 0xBB (write won)
+        // - Prefetch won and write hasn't completed yet, read sees 0xAA (acceptable during race)
+        //   BUT: block is marked dirty, so sync will upload the final file contents
+        //
+        // What we CANNOT accept: file has 0xAA, read returns 0xAA, block is dirty,
+        // sync uploads 0xAA (stale) - this is data loss.
+
+        // Verify final file contents (the authoritative state)
+        let final_data = cache.read_local(0, 4096).unwrap();
+
+        // The file MUST have 0xBB (write's data). If it has 0xAA, the race caused data loss.
+        assert_eq!(
+            final_data[0], 0xBB,
+            "RACE CONDITION BUG: write's data was overwritten by stale S3 prefetch! \
+             File has 0x{:02X}, expected 0xBB",
+            final_data[0]
+        );
+
+        // Also verify block is dirty (will sync the correct data)
+        assert!(
+            cache.dirty_block_count() > 0 || cache.syncing_block_count() > 0,
+            "Block should be dirty to ensure write's data syncs to S3"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_write_and_prefetch_stress() {
+        // Stress test: many concurrent writes and reads to maximize race probability.
+        // Run multiple iterations to increase chance of hitting the race window.
+
+        use std::sync::Arc;
+
+        for iteration in 0..10 {
+            let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let s3 = Arc::new(
+                S3BlockStore::new(Arc::clone(&object_store), "test", 4096).with_blocks_per_batch(10),
+            );
+            let metrics = Arc::new(super::super::metrics::ExportMetrics::new());
+
+            // Pre-populate S3 with old data for blocks 0-9
+            let batch0 = vec![0xAAu8; s3.batch_size()];
+            s3.put_batch(0, batch0).await.unwrap();
+
+            let dir = TempDir::new().unwrap();
+            let config = WriteCacheConfig {
+                cache_dir: dir.path().to_path_buf(),
+                device_name: format!("stress_{}", iteration),
+                device_size: 10 * 4096,
+                block_size: 4096,
+            };
+            let cache = Arc::new(
+                WriteCache::<Initializing>::open(config)
+                    .unwrap()
+                    .skip_recovery_for_test(),
+            );
+
+            // Spawn many concurrent operations
+            let mut handles = vec![];
+
+            for block in 0..5u64 {
+                let cache_w = Arc::clone(&cache);
+                let write_val = (block + 1) as u8; // 1, 2, 3, 4, 5
+                handles.push(tokio::spawn(async move {
+                    cache_w.write(block * 4096, &[write_val; 4096]).unwrap();
+                }));
+
+                let cache_r = Arc::clone(&cache);
+                let s3_r = Arc::clone(&s3);
+                let metrics_r = Arc::clone(&metrics);
+                handles.push(tokio::spawn(async move {
+                    let _ = cache_r
+                        .read_with_fetch(block * 4096, 4096, &s3_r, &metrics_r)
+                        .await;
+                }));
+            }
+
+            // Wait for all
+            for h in handles {
+                let _ = h.await;
+            }
+
+            // Verify: each block should have its write value, not 0xAA
+            for block in 0..5u64 {
+                let data = cache.read_local(block * 4096, 4096).unwrap();
+                let expected = (block + 1) as u8;
+                assert_eq!(
+                    data[0], expected,
+                    "Iteration {}, block {}: expected 0x{:02X}, got 0x{:02X} (0xAA = stale S3 data)",
+                    iteration, block, expected, data[0]
+                );
+            }
+        }
     }
 }

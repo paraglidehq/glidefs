@@ -257,32 +257,45 @@ jobs:
             echo "NBD device confirmed disconnected"
           fi
 
-          echo "Stopping ZeroFS..."
-          # ZeroFS automatically drains to S3 when NBD client disconnects,
-          # so we just need to stop the server gracefully
+          echo "Stopping ZeroFS gracefully..."
           ZEROFS_PID=$(pgrep -f "zerofs.*run.*zerofs-ci.toml" || true)
           if [ -n "$ZEROFS_PID" ]; then
             echo "Found ZeroFS process: $ZEROFS_PID"
+
+            # First, send SIGUSR1 to trigger a full drain to S3
+            # This ensures all dirty blocks are flushed before shutdown
+            echo "Sending SIGUSR1 to trigger S3 drain..."
+            kill -USR1 $ZEROFS_PID || true
+
+            # Wait for the drain to complete (up to 60 seconds for large datasets)
+            echo "Waiting for drain to complete..."
+            sleep 10
+
+            # Now send SIGTERM for graceful shutdown
+            echo "Sending SIGTERM..."
             kill -TERM $ZEROFS_PID || true
           else
             echo "No ZeroFS process found (may have already stopped)"
           fi
 
-          # Wait for ZeroFS to stop
-          for i in {1..10}; do
+          # Wait for ZeroFS to stop (up to 60 seconds - drain can take time)
+          echo "Waiting for ZeroFS to stop..."
+          for i in {1..60}; do
             if ! pgrep -f "zerofs.*run.*zerofs-ci.toml" > /dev/null; then
-              echo "ZeroFS stopped"
+              echo "ZeroFS stopped after $i seconds"
               break
             fi
-            echo "Waiting for ZeroFS to stop... attempt $i/10"
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "Still waiting for ZeroFS to stop... $i/60 seconds"
+            fi
             sleep 1
           done
 
-          # Final check if ZeroFS stopped
+          # Final check - DO NOT use SIGKILL as it causes data loss
           if pgrep -f "zerofs.*run.*zerofs-ci.toml" > /dev/null; then
-            echo "WARNING: ZeroFS may still be running, forcing kill..."
-            pkill -KILL -f "zerofs.*run.*zerofs-ci.toml" || true
-            sleep 1
+            echo "ERROR: ZeroFS did not stop gracefully after 60 seconds!"
+            echo "This likely indicates a bug - investigate rather than force kill"
+            exit 1
           fi
 
           # Ensure port is free

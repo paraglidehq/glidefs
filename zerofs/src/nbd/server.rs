@@ -748,51 +748,73 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
     }
 
     /// Writer task that serializes responses to the socket.
+    ///
+    /// Batches writes and only flushes when no more responses are waiting,
+    /// significantly improving throughput for high-concurrency workloads.
     async fn response_writer<Writer: AsyncWrite + Unpin>(
         mut writer: Writer,
         mut response_rx: mpsc::Receiver<Response>,
         router: Arc<ExportRouter>,
     ) {
-        while let Some(response) = response_rx.recv().await {
-            match response {
-                Response::Simple { cookie, error, data } => {
-                    let reply = NBDSimpleReply::new(cookie, error);
-                    let reply_bytes = match reply.to_bytes() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            debug!("Failed to serialize reply: {:?}", e);
-                            continue;
+        'outer: while let Some(mut response) = response_rx.recv().await {
+            // Process all available responses before flushing
+            loop {
+                match response {
+                    Response::Simple { cookie, error, data } => {
+                        let reply = NBDSimpleReply::new(cookie, error);
+                        let reply_bytes = match reply.to_bytes() {
+                            Ok(b) => b,
+                            Err(e) => {
+                                debug!("Failed to serialize reply: {:?}", e);
+                                // Try next response
+                                match response_rx.try_recv() {
+                                    Ok(next) => {
+                                        response = next;
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        };
+
+                        if let Err(e) = writer.write_all(&reply_bytes).await {
+                            debug!("Failed to write reply header: {:?}", e);
+                            break 'outer;
                         }
-                    };
 
-                    if let Err(e) = writer.write_all(&reply_bytes).await {
-                        debug!("Failed to write reply header: {:?}", e);
-                        break;
-                    }
-
-                    if !data.is_empty() {
-                        if let Err(e) = writer.write_all(&data).await {
-                            debug!("Failed to write reply data: {:?}", e);
-                            break;
+                        if !data.is_empty() {
+                            if let Err(e) = writer.write_all(&data).await {
+                                debug!("Failed to write reply data: {:?}", e);
+                                break 'outer;
+                            }
                         }
                     }
+                    Response::Disconnect { export_name } => {
+                        // Flush before drain
+                        let _ = writer.flush().await;
+                        if let Err(e) = router.drain_export(&export_name).await {
+                            warn!("Failed to drain on disconnect: {}", e);
+                        }
+                        info!("Client disconnected, drain complete");
+                        break 'outer;
+                    }
+                    Response::Shutdown => {
+                        debug!("Writer task shutting down");
+                        break 'outer;
+                    }
+                }
 
-                    if let Err(e) = writer.flush().await {
-                        debug!("Failed to flush: {:?}", e);
-                        break;
-                    }
+                // Try to get more responses without waiting
+                match response_rx.try_recv() {
+                    Ok(next) => response = next,
+                    Err(_) => break, // No more waiting, flush and wait
                 }
-                Response::Disconnect { export_name } => {
-                    if let Err(e) = router.drain_export(&export_name).await {
-                        warn!("Failed to drain on disconnect: {}", e);
-                    }
-                    info!("Client disconnected, drain complete");
-                    break;
-                }
-                Response::Shutdown => {
-                    debug!("Writer task shutting down");
-                    break;
-                }
+            }
+
+            // Flush once after processing all available responses
+            if let Err(e) = writer.flush().await {
+                debug!("Failed to flush: {:?}", e);
+                break;
             }
         }
     }

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -534,14 +535,25 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
         // Spawn writer task that serializes responses to the socket
         let writer_handle = tokio::spawn(Self::response_writer(writer, response_rx, Arc::clone(&router)));
 
+        // JoinSet to track all spawned request handler tasks
+        let mut tasks: JoinSet<()> = JoinSet::new();
+
         // Process requests until disconnect or shutdown
         let result = Self::request_reader_loop(
             &mut reader,
             &shutdown,
             &export_name,
             handler,
-            response_tx,
+            response_tx.clone(),
+            &mut tasks,
         ).await;
+
+        // Wait for all in-flight request tasks to complete
+        // This ensures all responses are sent before we close the channel
+        while tasks.join_next().await.is_some() {}
+
+        // Now drop the sender to signal writer task to finish
+        drop(response_tx);
 
         // Wait for writer to finish
         if let Err(e) = writer_handle.await {
@@ -558,6 +570,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
         export_name: &str,
         handler: Arc<NBDBlockHandler>,
         response_tx: mpsc::Sender<Response>,
+        tasks: &mut JoinSet<()>,
     ) -> Result<()> {
         loop {
             let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
@@ -604,7 +617,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let length = request.length;
                     let cookie = request.cookie;
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let result = h.read(offset, length).await;
                         let response = match result {
                             Ok(data) => Response::Simple { cookie, error: NBD_SUCCESS, data },
@@ -622,7 +635,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let offset = request.offset;
                     let cookie = request.cookie;
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let result = match write_data {
                             Ok(data) => h.write(offset, &data, fua),
                             Err(e) => Err(e),
@@ -645,7 +658,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let tx = response_tx.clone();
                     let cookie = request.cookie;
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let result = h.flush();
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
@@ -661,7 +674,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let length = request.length;
                     let cookie = request.cookie;
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let result = h.trim(offset, length, fua);
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
@@ -677,7 +690,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let length = request.length;
                     let cookie = request.cookie;
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let result = h.write_zeroes(offset, length, fua);
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
@@ -693,7 +706,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let length = request.length;
                     let cookie = request.cookie;
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let result = h.cache(offset, length);
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },

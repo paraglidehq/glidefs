@@ -75,12 +75,15 @@ tokio-test = "0.4"
 [[bench]]
 name = "flush_latency"
 harness = false
+required-features = ["test-utils"]
 
 [[bench]]
 name = "workloads"
 harness = false
+required-features = ["test-utils"]
 
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
+required-features = ["test-utils"]
 

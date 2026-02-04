@@ -13,6 +13,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+
+/// Check if verbose benchmark output is enabled via BENCH_VERBOSE=1
+fn is_verbose() -> bool {
+    std::env::var("BENCH_VERBOSE").map(|v| v == "1").unwrap_or(false)
+}
 use object_store::ObjectStore;
 use rand::{thread_rng, Rng};
 use tempfile::TempDir;
@@ -68,9 +73,12 @@ impl TestHarness {
         (DEVICE_SIZE_MB * 1024 * 1024) / BLOCK_SIZE as u64
     }
 
-    /// Print metrics summary.
+    /// Print metrics summary (only when BENCH_VERBOSE=1).
     #[allow(dead_code)]
     fn print_metrics(&self, label: &str) {
+        if !is_verbose() {
+            return;
+        }
         let snap = self.metrics.snapshot();
         eprintln!("\n=== {} Metrics ===", label);
         eprintln!(
@@ -459,14 +467,16 @@ fn bench_drain_latency(c: &mut Criterion) {
                         harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
                         total += start.elapsed();
 
-                        // Report metrics on last iteration
-                        let snap = harness.metrics.snapshot();
-                        eprintln!(
-                            "\n  {}MB drain: {} batches, {:.2}x write amp",
-                            blocks * BLOCK_SIZE as u64 / 1024 / 1024,
-                            snap.batches_written,
-                            snap.write_amplification
-                        );
+                        // Report metrics on last iteration (only when BENCH_VERBOSE=1)
+                        if is_verbose() {
+                            let snap = harness.metrics.snapshot();
+                            eprintln!(
+                                "\n  {}MB drain: {} batches, {:.2}x write amp",
+                                blocks * BLOCK_SIZE as u64 / 1024 / 1024,
+                                snap.batches_written,
+                                snap.write_amplification
+                            );
+                        }
                     }
 
                     total

@@ -215,7 +215,7 @@ s3://bucket/path/{export_name}/batches/{batch_num:012x}
 
 ### Background Sync Worker
 
-Event-driven sync with O(1) dirty block tracking:
+Event-driven sync with O(1) dirty block tracking, hot batch deferral, and back-pressure:
 
 ```rust
 loop {
@@ -232,20 +232,34 @@ loop {
 
     if dirty_blocks.is_empty() {
         // Sleep until write path wakes us (or safety timeout)
+        // All sleeps are interruptible by shutdown signal
         select! {
             _ = cache.wait_for_dirty() => {}
             _ = sleep(1s) => {}
+            _ = shutdown.changed() => break
         }
         continue;
     }
 
-    // Group by S3 batch, GET-modify-PUT each batch
+    // Back-pressure: warn/error if dirty queue grows too large
+    if dirty_queue_size > critical_threshold {
+        error!("dirty queue critical: {} blocks", dirty_queue_size);
+    }
+
+    // Group by S3 batch, defer hot batches
     for (batch_num, blocks) in group_by_batch(dirty_blocks) {
-        batch_data = s3.get_batch_or_empty(batch_num);
-        for block in blocks {
-            batch_data[offset] = local_cache.read(block);
+        if recently_synced(batch_num, hot_batch_cooldown) {
+            // Defer: mark blocks dirty again, sync later
+            for block in blocks { mark_dirty(block); }
+        } else {
+            // Sync: GET-modify-PUT
+            batch_data = s3.get_batch_or_empty(batch_num);
+            for block in blocks {
+                batch_data[offset] = local_cache.read(block);
+            }
+            s3.put_batch(batch_num, batch_data);
+            mark_hot(batch_num);  // Track for cooldown
         }
-        s3.put_batch(batch_num, batch_data);
     }
 }
 ```
@@ -254,6 +268,9 @@ loop {
 - **Event-driven**: Sleeps when idle, wakes instantly on writes
 - **O(1) dirty tracking**: Lock-free queue (`SegQueue`) - no scanning
 - **Lease fencing**: Stops immediately if lease lost
+- **Hot batch deferral**: Recently-synced batches are deferred to reduce write amplification
+- **Back-pressure**: Warnings/errors when dirty queue exceeds thresholds
+- **Shutdown-responsive**: All sleeps are interruptible by shutdown signals
 
 **Benefits**:
 - Cross-host snapshots only wait for current batch
@@ -261,6 +278,7 @@ loop {
 - More even S3 write traffic
 - Network failures retry individual blocks
 - Zero CPU for idle VMs
+- Reduced write amplification via hot batch tracking
 
 ### NBDBlockHandler (`nbd/handler.rs`)
 
@@ -419,6 +437,9 @@ block_size = 16384           # Optional, 16KB for database workloads
 | `block_size` | 128KB | Match ZFS recordsize |
 | `blocks_per_batch` | 100 | Balance PUT cost vs latency |
 | `cache.dir` | ~/.cache/zerofs | Local SSD cache location |
+| `hot_batch_cooldown` | 100ms | Defer recently-synced batches to reduce write amplification |
+| `dirty_queue_warn_threshold` | 1000 | Warn when dirty queue exceeds (128MB @ 128KB blocks) |
+| `dirty_queue_critical_threshold` | 10000 | Error when dirty queue exceeds (1.28GB @ 128KB blocks) |
 
 ## Write Amplification & S3 Cost Mitigations
 
@@ -460,11 +481,22 @@ block_size = 262144  # 256KB - better throughput for sequential I/O
 
 **Trade-off**: Smaller blocks = less amplification but more batches to update.
 
-### 4. Configurable Sync Delay
+### 4. Hot Batch Cooldown
 
-Longer delays allow more writes to coalesce before S3 upload:
+Batches that were recently synced are marked "hot" and deferred:
 
-**Trade-off**: Longer delay = more coalescing but more data at risk on crash.
+```
+Write to block 42 (batch 0) → sync batch 0 to S3 → mark batch 0 hot
+Write to block 43 (batch 0) → batch 0 is hot → defer block 43
+...100ms later...
+batch 0 cools down → sync block 43 (and any others accumulated)
+```
+
+**Impact**: If a VM writes to blocks 0-99 (all in batch 0) sequentially:
+- Without cooldown: 100 GET-modify-PUT operations
+- With cooldown (100ms): ~1-2 GET-modify-PUT operations
+
+**Trade-off**: Slightly delayed sync for recently-written batches, but dramatically reduced write amplification for sequential/localized writes.
 
 ## Security Model
 

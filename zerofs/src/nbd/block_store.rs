@@ -221,7 +221,7 @@ impl S3BlockStore {
         self.object_store.put(&key, payload).await?;
 
         if let Some(metrics) = &self.metrics {
-            metrics.record_batch_write(size, size);
+            metrics.record_batch_write(size);
         }
 
         debug!(batch = batch_num, "wrote batch (unconditional)");
@@ -278,7 +278,7 @@ impl S3BlockStore {
             Ok(_) => {
                 // Record metrics if available
                 if let Some(metrics) = &self.metrics {
-                    metrics.record_batch_write(size, size);
+                    metrics.record_batch_write(size);
                 }
                 debug!(batch = batch_num, "wrote batch");
                 Ok(())

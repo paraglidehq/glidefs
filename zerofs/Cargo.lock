@@ -3060,6 +3060,7 @@ dependencies = [
  "lz4_flex",
  "mimalloc",
  "object_store",
+ "parking_lot",
  "rand 0.8.5",
  "serde",
  "serde_json",

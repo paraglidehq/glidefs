@@ -327,7 +327,12 @@ impl ExportRouter {
     /// Get metrics snapshot for an export.
     pub async fn get_export_metrics(&self, name: &str) -> Option<MetricsSnapshot> {
         let exports = self.exports.read().await;
-        exports.get(name).map(|s| s.metrics.snapshot())
+        exports.get(name).map(|s| {
+            s.metrics.snapshot().with_cache_state(
+                s.cache.dirty_block_count(),
+                s.cache.syncing_block_count(),
+            )
+        })
     }
 
     /// Drain an export's dirty blocks to S3.

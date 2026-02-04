@@ -1,9 +1,9 @@
-//! Metrics for tracking write amplification and compression effectiveness.
+//! Metrics for tracking write amplification and cache effectiveness.
 //!
 //! These metrics help answer:
 //! - How much write amplification are we seeing? (guest bytes vs S3 bytes)
-//! - How effective is compression? (raw bytes vs compressed bytes)
 //! - How well is the cache coalescing writes? (guest writes vs S3 writes)
+//! - How effective is read caching? (cache hits vs misses)
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,7 @@ pub struct ExportMetrics {
     /// Total number of NBD read commands from guest
     pub guest_read_ops: AtomicU64,
 
-    /// Total bytes written to S3 (after compression/encryption)
+    /// Total bytes written to S3
     pub s3_bytes_written: AtomicU64,
 
     /// Total number of blocks written to S3 (within batches)
@@ -32,17 +32,11 @@ pub struct ExportMetrics {
     /// Total number of batches written to S3
     pub batches_written: AtomicU64,
 
-    /// Total bytes read from S3 (before decompression)
+    /// Total bytes read from S3
     pub s3_bytes_read: AtomicU64,
 
     /// Total number of blocks read from S3
     pub s3_read_ops: AtomicU64,
-
-    /// Total uncompressed bytes before encoding (for compression ratio)
-    pub uncompressed_bytes: AtomicU64,
-
-    /// Total compressed bytes after encoding (for compression ratio)
-    pub compressed_bytes: AtomicU64,
 
     /// Cache hits (reads served from local cache)
     pub cache_hits: AtomicU64,
@@ -73,14 +67,9 @@ impl ExportMetrics {
 
     /// Record an S3 batch write operation.
     #[inline]
-    pub fn record_batch_write(&self, compressed_bytes: u64, uncompressed_bytes: u64) {
-        self.s3_bytes_written
-            .fetch_add(compressed_bytes, Ordering::Relaxed);
+    pub fn record_batch_write(&self, bytes: u64) {
+        self.s3_bytes_written.fetch_add(bytes, Ordering::Relaxed);
         self.batches_written.fetch_add(1, Ordering::Relaxed);
-        self.uncompressed_bytes
-            .fetch_add(uncompressed_bytes, Ordering::Relaxed);
-        self.compressed_bytes
-            .fetch_add(compressed_bytes, Ordering::Relaxed);
     }
 
     /// Record blocks synced within a batch.
@@ -116,8 +105,6 @@ impl ExportMetrics {
         let s3_bytes_written = self.s3_bytes_written.load(Ordering::Relaxed);
         let s3_write_ops = self.s3_write_ops.load(Ordering::Relaxed);
         let batches_written = self.batches_written.load(Ordering::Relaxed);
-        let uncompressed_bytes = self.uncompressed_bytes.load(Ordering::Relaxed);
-        let compressed_bytes = self.compressed_bytes.load(Ordering::Relaxed);
         let cache_hits = self.cache_hits.load(Ordering::Relaxed);
         let cache_misses = self.cache_misses.load(Ordering::Relaxed);
 
@@ -126,12 +113,6 @@ impl ExportMetrics {
             s3_bytes_written as f64 / guest_bytes_written as f64
         } else {
             0.0
-        };
-
-        let compression_ratio = if compressed_bytes > 0 {
-            uncompressed_bytes as f64 / compressed_bytes as f64
-        } else {
-            1.0
         };
 
         // Coalesce ratio: guest writes per S3 batch write
@@ -157,12 +138,11 @@ impl ExportMetrics {
             batches_written,
             s3_bytes_read: self.s3_bytes_read.load(Ordering::Relaxed),
             s3_read_ops: self.s3_read_ops.load(Ordering::Relaxed),
-            uncompressed_bytes,
-            compressed_bytes,
             cache_hits,
             cache_misses,
+            dirty_blocks: None,
+            syncing_blocks: None,
             write_amplification,
-            compression_ratio,
             coalesce_ratio,
             cache_hit_rate,
         }
@@ -182,19 +162,22 @@ pub struct MetricsSnapshot {
     pub batches_written: u64,
     pub s3_bytes_read: u64,
     pub s3_read_ops: u64,
-    pub uncompressed_bytes: u64,
-    pub compressed_bytes: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
 
+    // Cache state (populated by router)
+    /// Number of dirty blocks waiting to be synced to S3
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty_blocks: Option<u64>,
+    /// Number of blocks currently being synced to S3
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syncing_blocks: Option<u64>,
+
     // Derived metrics
     /// S3 bytes written / guest bytes written
-    /// < 1.0 = compression helping, > 1.0 = write amplification
+    /// > 1.0 = write amplification (S3 batching overhead)
+    /// < 1.0 = unlikely without compression
     pub write_amplification: f64,
-
-    /// Uncompressed bytes / compressed bytes
-    /// > 1.0 = compression effective
-    pub compression_ratio: f64,
 
     /// Guest write ops / batches written
     /// > 1.0 = batching coalescing multiple guest writes into fewer S3 batch writes
@@ -202,6 +185,15 @@ pub struct MetricsSnapshot {
 
     /// Cache hits / (hits + misses)
     pub cache_hit_rate: f64,
+}
+
+impl MetricsSnapshot {
+    /// Add cache state to the snapshot.
+    pub fn with_cache_state(mut self, dirty_blocks: u64, syncing_blocks: u64) -> Self {
+        self.dirty_blocks = Some(dirty_blocks);
+        self.syncing_blocks = Some(syncing_blocks);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -217,8 +209,8 @@ mod tests {
             metrics.record_guest_write(1024);
         }
 
-        // Simulate: batch write containing 10 blocks (compressed from 128KB to 100KB)
-        metrics.record_batch_write(100_000, 128_000);
+        // Simulate: batch write of 100KB containing 10 blocks
+        metrics.record_batch_write(100_000);
         metrics.record_blocks_synced(10);
 
         let snapshot = metrics.snapshot();
@@ -231,9 +223,6 @@ mod tests {
 
         // Write amplification: 100KB written to S3 for 10KB guest writes
         assert!((snapshot.write_amplification - 9.765).abs() < 0.1);
-
-        // Compression ratio: 128KB uncompressed → 100KB compressed
-        assert!((snapshot.compression_ratio - 1.28).abs() < 0.01);
 
         // Coalesce ratio: 10 guest writes → 1 batch write
         assert!((snapshot.coalesce_ratio - 10.0).abs() < 0.01);

@@ -258,7 +258,8 @@ jobs:
           fi
 
           echo "Stopping ZeroFS..."
-          # Find and kill the zerofs process
+          # ZeroFS automatically drains to S3 when NBD client disconnects,
+          # so we just need to stop the server gracefully
           ZEROFS_PID=$(pgrep -f "zerofs.*run.*zerofs-ci.toml" || true)
           if [ -n "$ZEROFS_PID" ]; then
             echo "Found ZeroFS process: $ZEROFS_PID"

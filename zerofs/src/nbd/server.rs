@@ -518,7 +518,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                     self.send_unit_result(request.cookie, result).await;
                 }
                 NBDCommand::Disconnect => {
-                    info!("Client disconnecting");
+                    let export_name = String::from_utf8_lossy(&device.name).to_string();
+                    info!("Client disconnecting from '{}', draining to S3...", export_name);
+                    if let Err(e) = self.router.drain_export(&export_name).await {
+                        warn!("Failed to drain on disconnect: {}", e);
+                    }
+                    info!("Client disconnected, drain complete");
                     return Ok(());
                 }
                 NBDCommand::Flush => {

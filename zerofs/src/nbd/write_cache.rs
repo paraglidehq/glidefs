@@ -1695,9 +1695,9 @@ impl Default for SyncWorkerConfig {
             dirty_queue_warn_threshold: 1_000,
             // 10000 blocks @ 128KB = 1.28GB uncommitted - serious problem
             dirty_queue_critical_threshold: 10_000,
-            // Defer batches with fewer than 5 dirty blocks (5% of 100-block batch)
-            // Allows sparse batches to accumulate more blocks before sync
-            sparse_batch_threshold: 5,
+            // Defer batches with fewer than N dirty blocks
+            // Set to 0 to disable sparse batch deferral (testing)
+            sparse_batch_threshold: 0,
         }
     }
 }

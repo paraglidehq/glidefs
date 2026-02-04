@@ -193,6 +193,283 @@ jobs:
           pkill -f "zerofs run" || true
           docker stop minio || true
 
+  real-world-benchmark:
+    name: Real-World Workload Benchmark
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nbd-client fio jq git build-essential
+
+      - name: Setup MinIO bucket
+        run: |
+          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc rm --recursive --force myminio/zerofs-realworld-test/ || true
+          ./mc mb myminio/zerofs-realworld-test || true
+
+      - name: Build ZeroFS
+        working-directory: zerofs
+        run: cargo build --profile ci
+
+      - name: Start ZeroFS
+        working-directory: zerofs
+        run: |
+          mkdir -p /tmp/zerofs-cache
+
+          cat > zerofs-realworld.toml << EOF
+          [cache]
+          dir = "/tmp/zerofs-cache"
+          disk_size_gb = 4.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://zerofs-realworld-test/bench"
+          encryption_password = "bench-password-123"
+
+          [servers.nbd]
+          addresses = ["127.0.0.1:10809"]
+          api_address = "127.0.0.1:8080"
+
+          [[servers.nbd.exports]]
+          name = "bench-device"
+          size_gb = 10.0
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
+          ./target/ci/zerofs run -c zerofs-realworld.toml &
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809; then
+              echo "ZeroFS ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Connect NBD and create filesystem
+        run: |
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N bench-device
+          sudo mkfs.ext4 -F /dev/nbd0
+          sudo mkdir -p /mnt/nbd
+          sudo mount /dev/nbd0 /mnt/nbd
+          sudo chmod 777 /mnt/nbd
+
+      - name: Run Real-World Workload Benchmark
+        run: |
+          echo ""
+          echo "╔═══════════════════════════════════════════════════════════════╗"
+          echo "║           REAL-WORLD WORKLOAD BENCHMARK                       ║"
+          echo "║  (Filesystem ops, bursty I/O, idle periods)                   ║"
+          echo "╚═══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          dump_metrics() {
+            local label="$1"
+            echo ""
+            echo "=== $label ==="
+            if curl -sf http://127.0.0.1:8080/metrics > /tmp/metrics_$$.txt 2>/dev/null; then
+              grep -E 'dirty_blocks|s3_batches_written|coalesce_ratio|write_amplification' /tmp/metrics_$$.txt | \
+                sed 's/zerofs_/  /' | sed 's/{[^}]*}//' || true
+              rm -f /tmp/metrics_$$.txt
+            fi
+          }
+
+          dump_metrics "Baseline"
+
+          # === WORKLOAD 1: File extraction (many small files, metadata heavy) ===
+          echo ""
+          echo ">>> WORKLOAD 1: File extraction (simulates unpacking tarball)"
+          START=$(date +%s%3N)
+
+          # Create directory structure with many small files
+          mkdir -p /mnt/nbd/project
+          for i in {1..500}; do
+            mkdir -p /mnt/nbd/project/dir_$((i % 50))
+            echo "file content $i with some padding to make it realistic" > /mnt/nbd/project/dir_$((i % 50))/file_$i.txt
+          done
+          sync
+
+          END=$(date +%s%3N)
+          echo "Created 500 files in $((END - START))ms"
+          dump_metrics "After file extraction"
+
+          # === IDLE PERIOD ===
+          echo ""
+          echo ">>> IDLE PERIOD (5s) - letting sync catch up"
+          sleep 5
+          dump_metrics "After idle period 1"
+
+          # === WORKLOAD 2: Sequential log writes (append-heavy) ===
+          echo ""
+          echo ">>> WORKLOAD 2: Sequential log writes (simulates application logging)"
+          START=$(date +%s%3N)
+
+          for i in {1..100}; do
+            echo "[$(date -Iseconds)] INFO: Log entry $i with request_id=$(uuidgen) status=200 latency_ms=$((RANDOM % 100))" >> /mnt/nbd/app.log
+          done
+          sync
+
+          END=$(date +%s%3N)
+          echo "Wrote 100 log entries in $((END - START))ms"
+          dump_metrics "After log writes"
+
+          # === WORKLOAD 3: Random reads (simulates serving cached content) ===
+          echo ""
+          echo ">>> WORKLOAD 3: Random file reads (simulates web server)"
+          START=$(date +%s%3N)
+
+          for i in {1..200}; do
+            FILE_NUM=$((RANDOM % 500 + 1))
+            DIR_NUM=$((FILE_NUM % 50))
+            cat /mnt/nbd/project/dir_$DIR_NUM/file_$FILE_NUM.txt > /dev/null 2>/dev/null || true
+          done
+
+          END=$(date +%s%3N)
+          echo "Read 200 random files in $((END - START))ms"
+          dump_metrics "After random reads"
+
+          # === WORKLOAD 4: Database-like mixed I/O (random read/write to data files) ===
+          echo ""
+          echo ">>> WORKLOAD 4: Database-like I/O (random read/write)"
+          START=$(date +%s%3N)
+
+          # Create "database" files
+          dd if=/dev/urandom of=/mnt/nbd/db_data.bin bs=1M count=50 2>/dev/null
+          dd if=/dev/urandom of=/mnt/nbd/db_index.bin bs=1M count=10 2>/dev/null
+
+          # Random reads and writes using fio with realistic DB pattern
+          sudo fio --name=db_workload --filename=/mnt/nbd/db_data.bin \
+            --ioengine=libaio --direct=1 --bs=8k --iodepth=16 \
+            --rw=randrw --rwmixread=80 --runtime=10 --time_based \
+            --output-format=json > /tmp/db_fio.json
+
+          DB_IOPS=$(jq -r '.jobs[0].read.iops + .jobs[0].write.iops' /tmp/db_fio.json)
+
+          END=$(date +%s%3N)
+          echo "Database workload: $DB_IOPS IOPS over $((END - START))ms"
+          dump_metrics "After DB workload"
+
+          # === IDLE PERIOD ===
+          echo ""
+          echo ">>> IDLE PERIOD (5s) - letting sync catch up"
+          sleep 5
+          dump_metrics "After idle period 2"
+
+          # === WORKLOAD 5: Burst write (simulates backup or bulk import) ===
+          echo ""
+          echo ">>> WORKLOAD 5: Burst write (simulates backup dump)"
+          START=$(date +%s%3N)
+
+          dd if=/dev/urandom of=/mnt/nbd/backup_dump.bin bs=1M count=100 2>/dev/null
+          sync
+
+          END=$(date +%s%3N)
+          echo "Wrote 100MB burst in $((END - START))ms"
+          dump_metrics "After burst write"
+
+          # === WORKLOAD 6: Bursty mixed with idle (realistic VM pattern) ===
+          echo ""
+          echo ">>> WORKLOAD 6: Bursty pattern with idle gaps"
+          for burst in {1..5}; do
+            echo "  Burst $burst/5..."
+            # Short burst of activity
+            sudo fio --name=burst_$burst --filename=/mnt/nbd/burst_test.bin \
+              --ioengine=libaio --direct=1 --bs=4k --size=20M --iodepth=32 \
+              --rw=randrw --rwmixread=70 --runtime=3 --time_based \
+              --output-format=json > /dev/null 2>&1
+            # Idle gap
+            sleep 2
+          done
+          dump_metrics "After bursty pattern"
+
+          # === FINAL IDLE - let everything sync ===
+          echo ""
+          echo ">>> FINAL IDLE (10s) - letting all syncs complete"
+          sleep 10
+          dump_metrics "Final state"
+
+          # === SUMMARY ===
+          echo ""
+          echo "╔═══════════════════════════════════════════════════════════════╗"
+          echo "║                    BENCHMARK SUMMARY                          ║"
+          echo "╚═══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          # Get final metrics
+          curl -sf http://127.0.0.1:8080/metrics > /tmp/final_metrics.txt
+
+          BATCHES=$(grep 's3_batches_written' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "N/A")
+          COALESCE=$(grep 'coalesce_ratio' /tmp/final_metrics.txt | grep -oE '[0-9.]+$' || echo "N/A")
+          WRITE_AMP=$(grep 'write_amplification' /tmp/final_metrics.txt | grep -oE '[0-9.]+$' || echo "N/A")
+          DIRTY=$(grep 'dirty_blocks{' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "N/A")
+          GUEST_WRITES=$(grep 'guest_write_ops' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "N/A")
+
+          echo "┌─────────────────────────────────────────┐"
+          echo "│ Metric                │ Value           │"
+          echo "├─────────────────────────────────────────┤"
+          printf "│ S3 Batches Written    │ %-15s │\n" "$BATCHES"
+          printf "│ Coalesce Ratio        │ %-15s │\n" "$COALESCE"
+          printf "│ Write Amplification   │ %-15s │\n" "$WRITE_AMP"
+          printf "│ Remaining Dirty       │ %-15s │\n" "$DIRTY"
+          printf "│ Total Guest Writes    │ %-15s │\n" "$GUEST_WRITES"
+          echo "└─────────────────────────────────────────┘"
+          echo ""
+
+          # Compare with synthetic benchmark expectations
+          echo "Real-world workload characteristics:"
+          echo "- Mixed file sizes (small files + large sequential)"
+          echo "- Bursty patterns with idle gaps"
+          echo "- Spatial locality (files in same directories)"
+          echo "- Read-heavy periods interspersed with writes"
+          echo ""
+
+          if [ "$DIRTY" != "N/A" ] && [ "$DIRTY" -lt 1000 ]; then
+            echo "✓ Dirty blocks drained well during idle periods"
+          else
+            echo "⚠ Elevated dirty blocks - sync may still be catching up"
+          fi
+
+      - name: Full Metrics Dump
+        run: |
+          echo "=== FULL SERVER METRICS ==="
+          curl -sf http://127.0.0.1:8080/metrics || echo "(not available)"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo umount /mnt/nbd || true
+          sudo nbd-client -d /dev/nbd0 || true
+          pkill -f "zerofs run" || true
+          docker stop minio || true
+
   zfs-test:
     name: Run ZFS on top of ZeroFS
     runs-on: ubuntu-latest

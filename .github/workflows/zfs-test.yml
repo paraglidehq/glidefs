@@ -70,6 +70,9 @@ jobs:
           name = "bench-device"
           size_gb = 10.0
 
+          [servers.api]
+          address = "127.0.0.1:8080"
+
           [aws]
           access_key_id = "minioadmin"
           secret_access_key = "minioadmin"
@@ -107,6 +110,25 @@ jobs:
           echo "╚═══════════════════════════════════════════════════════════════╝"
           echo ""
 
+          # Function to dump latency metrics
+          dump_latency_metrics() {
+            local label="$1"
+            echo ""
+            echo "=== $label: Server-Side Latency Breakdown ==="
+            if curl -sf http://127.0.0.1:8080/metrics > /tmp/metrics_$$.txt 2>/dev/null; then
+              echo "Latency (microseconds):"
+              grep -E 'latency_avg_us|latency_max_us|cache_hit' /tmp/metrics_$$.txt | \
+                sed 's/zerofs_/  /' | sed 's/{[^}]*}//' || echo "  (no latency data)"
+              rm -f /tmp/metrics_$$.txt
+            else
+              echo "  (metrics endpoint not available)"
+            fi
+            echo ""
+          }
+
+          # Baseline metrics
+          dump_latency_metrics "Baseline"
+
           # 4K Random Read
           echo "Running 4K random read test (30s)..."
           READ_RESULT=$(sudo fio --name=randread --ioengine=libaio --direct=1 \
@@ -118,6 +140,8 @@ jobs:
           READ_LAT_AVG=$(echo "$READ_RESULT" | jq -r '.jobs[0].read.lat_ns.mean / 1000000' | xargs printf "%.2f")
           READ_LAT_P99=$(echo "$READ_RESULT" | jq -r '.jobs[0].read.clat_ns.percentile["99.000000"] / 1000000' | xargs printf "%.2f")
 
+          dump_latency_metrics "After Pure Read"
+
           # 4K Random Write
           echo "Running 4K random write test (30s)..."
           WRITE_RESULT=$(sudo fio --name=randwrite --ioengine=libaio --direct=1 \
@@ -128,6 +152,8 @@ jobs:
           WRITE_BW=$(echo "$WRITE_RESULT" | jq -r '.jobs[0].write.bw / 1024' | xargs printf "%.1f")
           WRITE_LAT_AVG=$(echo "$WRITE_RESULT" | jq -r '.jobs[0].write.lat_ns.mean / 1000000' | xargs printf "%.2f")
           WRITE_LAT_P99=$(echo "$WRITE_RESULT" | jq -r '.jobs[0].write.clat_ns.percentile["99.000000"] / 1000000' | xargs printf "%.2f")
+
+          dump_latency_metrics "After Pure Write"
 
           # Mixed 70/30 R/W
           echo "Running mixed 70/30 read/write test (30s)..."
@@ -142,6 +168,8 @@ jobs:
           MIXED_LAT_AVG=$(echo "$MIXED_RESULT" | jq -r '.jobs[0].read.lat_ns.mean / 1000000' | xargs printf "%.2f")
           MIXED_LAT_P99=$(echo "$MIXED_RESULT" | jq -r '.jobs[0].read.clat_ns.percentile["99.000000"] / 1000000' | xargs printf "%.2f")
 
+          dump_latency_metrics "After Mixed 70/30"
+
           echo ""
           echo "┌────────────────┬──────────┬────────────┬────────────┬────────────┐"
           echo "│ Test           │ IOPS     │ Bandwidth  │ Avg Latency│ p99 Latency│"
@@ -153,6 +181,11 @@ jobs:
           echo ""
           echo "Environment: GitHub Actions runner (ubuntu-latest)"
           echo "Device: NBD over localhost → MinIO (in-memory S3)"
+          echo ""
+
+          # Final diagnostic: dump full metrics for analysis
+          echo "=== FULL SERVER METRICS (for debugging) ==="
+          curl -sf http://127.0.0.1:8080/metrics || echo "(metrics not available)"
           echo ""
 
       - name: Cleanup

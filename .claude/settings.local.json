@@ -22,7 +22,8 @@
       "Bash(wc:*)",
       "Bash(git -C /Users/jared/Code/OSS/ZeroFS log --oneline -20)",
       "Bash(cargo bench:*)",
-      "Bash(done)"
+      "Bash(done)",
+      "Bash(chmod:*)"
     ]
   }
 }

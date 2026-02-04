@@ -61,7 +61,6 @@ jobs:
 
           [storage]
           url = "s3://glidefs-iops-test/bench"
-          encryption_password = "bench-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
@@ -250,7 +249,6 @@ jobs:
 
           [storage]
           url = "s3://glidefs-realworld-batch${{ matrix.blocks_per_batch }}/bench"
-          encryption_password = "bench-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
@@ -540,7 +538,6 @@ jobs:
 
           [storage]
           url = "s3://glidefs-zfs-test/zfs-test"
-          encryption_password = "test-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]

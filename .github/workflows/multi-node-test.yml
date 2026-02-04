@@ -64,7 +64,6 @@ jobs:
 
           [storage]
           url = "s3://multi-node-test/lease-test"
-          encryption_password = "test-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
@@ -88,7 +87,6 @@ jobs:
 
           [storage]
           url = "s3://multi-node-test/lease-test"
-          encryption_password = "test-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10810"]
@@ -166,7 +164,6 @@ jobs:
 
           [storage]
           url = "s3://multi-node-test/migration-test"
-          encryption_password = "test-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
@@ -248,7 +245,6 @@ jobs:
 
           [storage]
           url = "s3://multi-node-test/migration-test"
-          encryption_password = "test-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
@@ -324,7 +320,6 @@ jobs:
 
           [storage]
           url = "s3://multi-node-test/wake-test"
-          encryption_password = "test-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
@@ -385,7 +380,6 @@ jobs:
 
           [storage]
           url = "s3://multi-node-test/wake-test"
-          encryption_password = "test-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
@@ -449,7 +443,6 @@ jobs:
 
           [storage]
           url = "s3://multi-node-test/handoff-test"
-          encryption_password = "test-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]

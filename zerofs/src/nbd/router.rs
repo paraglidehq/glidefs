@@ -240,20 +240,32 @@ impl ExportRouter {
             Arc::clone(&metrics),
         ));
 
-        // Start sync worker for this export
+        // Start sync worker for this export (unless disabled for benchmarking)
         let (sync_shutdown_tx, sync_shutdown_rx) = watch::channel(false);
-        let sync_cache = Arc::clone(&cache);
-        let sync_s3 = Arc::clone(&s3_store);
-        let export_name = name.clone();
-        let sync_config = super::write_cache::SyncWorkerConfig {
-            hot_batch_cooldown: std::time::Duration::from_millis(self.sync_delay_ms),
-            ..Default::default()
+        let disable_sync = std::env::var("ZEROFS_DISABLE_SYNC").is_ok();
+        let sync_handle = if disable_sync {
+            warn!("ZEROFS_DISABLE_SYNC is set - sync worker disabled (data will NOT persist to S3!)");
+            spawn_named(&format!("sync-{}", name), async move {
+                // No-op: just wait for shutdown
+                let mut rx = sync_shutdown_rx;
+                while !*rx.borrow() {
+                    rx.changed().await.ok();
+                }
+            })
+        } else {
+            let sync_cache = Arc::clone(&cache);
+            let sync_s3 = Arc::clone(&s3_store);
+            let export_name = name.clone();
+            let sync_config = super::write_cache::SyncWorkerConfig {
+                hot_batch_cooldown: std::time::Duration::from_millis(self.sync_delay_ms),
+                ..Default::default()
+            };
+            let sync_lease_state = lease_state.clone();
+            spawn_named(&format!("sync-{}", name), async move {
+                sync_worker(sync_cache, sync_s3, sync_config, sync_shutdown_rx, sync_lease_state).await;
+                info!("Sync worker for export '{}' stopped", export_name);
+            })
         };
-        let sync_lease_state = lease_state.clone();
-        let sync_handle = spawn_named(&format!("sync-{}", name), async move {
-            sync_worker(sync_cache, sync_s3, sync_config, sync_shutdown_rx, sync_lease_state).await;
-            info!("Sync worker for export '{}' stopped", export_name);
-        });
 
         // Start lease renewal task if we have a lease
         let lease_renewal_handle = if let Some(ref state) = lease_state {

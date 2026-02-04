@@ -1,0 +1,15 @@
+[package]
+name = "zerofs-loom-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Loom concurrency tests for ZeroFS state machine"
+
+# This crate ONLY contains loom tests - no regular tests
+# Run with: cd loom-tests && cargo test --release
+
+[dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

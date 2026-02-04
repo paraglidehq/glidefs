@@ -27,6 +27,8 @@ default = []
 tokio-console = ["dep:console-subscriber"]
 # Enable test utilities (skip_recovery_for_test, etc.) for integration tests
 test-utils = []
+# Expose protocol types for fuzzing
+fuzz = []
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
@@ -64,6 +66,13 @@ tempfile = "3.21"
 futures = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.4"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+# Allow loom cfg flag (standard pattern for loom concurrency testing)
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [[bench]]
 name = "flush_latency"

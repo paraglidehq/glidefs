@@ -11,6 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// Sample rate for latency histograms: record 1 in N operations.
+/// At 100k IOPS, this gives ~1.5k samples/sec - plenty for percentiles.
+/// Reduces mutex contention by ~98%.
+const LATENCY_SAMPLE_INTERVAL: u64 = 64;
+
 /// Metrics for a single export's I/O operations.
 #[derive(Debug)]
 pub struct ExportMetrics {
@@ -47,16 +52,19 @@ pub struct ExportMetrics {
     /// Cache misses (reads that required S3 fetch)
     pub cache_misses: AtomicU64,
 
-    // Latency tracking for diagnosing performance issues
-    /// Read operation latencies (microseconds)
+    /// Counter for latency sampling (reduces histogram mutex contention)
+    latency_sample_counter: AtomicU64,
+
+    // Latency tracking for diagnosing performance issues (sampled)
+    /// Read operation latencies (microseconds) - sampled 1:64
     read_latencies: Mutex<LatencyHistogram>,
-    /// Write operation latencies (microseconds)
+    /// Write operation latencies (microseconds) - sampled 1:64
     write_latencies: Mutex<LatencyHistogram>,
-    /// S3 fetch latencies (microseconds)
+    /// S3 fetch latencies (microseconds) - sampled 1:64
     s3_fetch_latencies: Mutex<LatencyHistogram>,
-    /// Local file read latencies (microseconds)
+    /// Local file read latencies (microseconds) - sampled 1:64
     file_read_latencies: Mutex<LatencyHistogram>,
-    /// Local file write latencies (microseconds)
+    /// Local file write latencies (microseconds) - sampled 1:64
     file_write_latencies: Mutex<LatencyHistogram>,
 }
 
@@ -161,6 +169,7 @@ impl Default for ExportMetrics {
             s3_read_ops: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            latency_sample_counter: AtomicU64::new(0),
             read_latencies: Mutex::new(LatencyHistogram::default()),
             write_latencies: Mutex::new(LatencyHistogram::default()),
             s3_fetch_latencies: Mutex::new(LatencyHistogram::default()),
@@ -176,44 +185,62 @@ impl ExportMetrics {
         Self::default()
     }
 
-    /// Record read operation latency.
+    /// Check if we should record this latency sample.
+    /// Uses a shared counter to sample ~1 in 64 operations.
+    #[inline]
+    fn should_sample(&self) -> bool {
+        // Relaxed is fine - we don't need precise sampling, just reduced contention
+        self.latency_sample_counter.fetch_add(1, Ordering::Relaxed) % LATENCY_SAMPLE_INTERVAL == 0
+    }
+
+    /// Record read operation latency (sampled to reduce mutex contention).
     #[inline]
     pub fn record_read_latency(&self, duration: Duration) {
-        if let Ok(mut hist) = self.read_latencies.lock() {
-            hist.record(duration);
+        if self.should_sample() {
+            if let Ok(mut hist) = self.read_latencies.lock() {
+                hist.record(duration);
+            }
         }
     }
 
-    /// Record write operation latency.
+    /// Record write operation latency (sampled to reduce mutex contention).
     #[inline]
     pub fn record_write_latency(&self, duration: Duration) {
-        if let Ok(mut hist) = self.write_latencies.lock() {
-            hist.record(duration);
+        if self.should_sample() {
+            if let Ok(mut hist) = self.write_latencies.lock() {
+                hist.record(duration);
+            }
         }
     }
 
-    /// Record S3 fetch latency.
+    /// Record S3 fetch latency (sampled to reduce mutex contention).
     #[inline]
     pub fn record_s3_fetch_latency(&self, duration: Duration) {
-        if let Ok(mut hist) = self.s3_fetch_latencies.lock() {
-            hist.record(duration);
+        if self.should_sample() {
+            if let Ok(mut hist) = self.s3_fetch_latencies.lock() {
+                hist.record(duration);
+            }
         }
     }
 
-    /// Record local file read latency.
+    /// Record local file read latency (sampled to reduce mutex contention).
     #[inline]
     pub fn record_file_read_latency(&self, duration: Duration) {
-        if let Ok(mut hist) = self.file_read_latencies.lock() {
-            hist.record(duration);
+        if self.should_sample() {
+            if let Ok(mut hist) = self.file_read_latencies.lock() {
+                hist.record(duration);
+            }
         }
     }
 
-    /// Record local file write latency.
+    /// Record local file write latency (sampled to reduce mutex contention).
     #[inline]
     #[allow(dead_code)] // Available for future instrumentation
     pub fn record_file_write_latency(&self, duration: Duration) {
-        if let Ok(mut hist) = self.file_write_latencies.lock() {
-            hist.record(duration);
+        if self.should_sample() {
+            if let Ok(mut hist) = self.file_write_latencies.lock() {
+                hist.record(duration);
+            }
         }
     }
 
@@ -429,41 +456,36 @@ impl MetricsSnapshot {
         writeln!(out, "zerofs_cache_hit_rate{{{label}}} {:.6}", self.cache_hit_rate).unwrap();
 
         // Latency metrics
-        if let Some(ref lat) = self.read_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.read_latency
+            && lat.count > 0 {
                 writeln!(out, "zerofs_read_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
                 writeln!(out, "zerofs_read_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
                 writeln!(out, "zerofs_read_latency_count{{{label}}} {}", lat.count).unwrap();
             }
-        }
-        if let Some(ref lat) = self.write_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.write_latency
+            && lat.count > 0 {
                 writeln!(out, "zerofs_write_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
                 writeln!(out, "zerofs_write_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
                 writeln!(out, "zerofs_write_latency_count{{{label}}} {}", lat.count).unwrap();
             }
-        }
-        if let Some(ref lat) = self.s3_fetch_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.s3_fetch_latency
+            && lat.count > 0 {
                 writeln!(out, "zerofs_s3_fetch_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
                 writeln!(out, "zerofs_s3_fetch_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
                 writeln!(out, "zerofs_s3_fetch_latency_count{{{label}}} {}", lat.count).unwrap();
             }
-        }
-        if let Some(ref lat) = self.file_read_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.file_read_latency
+            && lat.count > 0 {
                 writeln!(out, "zerofs_file_read_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
                 writeln!(out, "zerofs_file_read_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
                 writeln!(out, "zerofs_file_read_latency_count{{{label}}} {}", lat.count).unwrap();
             }
-        }
-        if let Some(ref lat) = self.file_write_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.file_write_latency
+            && lat.count > 0 {
                 writeln!(out, "zerofs_file_write_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
                 writeln!(out, "zerofs_file_write_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
                 writeln!(out, "zerofs_file_write_latency_count{{{label}}} {}", lat.count).unwrap();
             }
-        }
 
         out
     }
@@ -472,36 +494,31 @@ impl MetricsSnapshot {
     #[allow(dead_code)] // Useful for debugging
     pub fn print_latency_summary(&self) {
         eprintln!("\n=== Latency Breakdown ===");
-        if let Some(ref lat) = self.read_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.read_latency
+            && lat.count > 0 {
                 eprintln!("  Read:       {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
                     lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
             }
-        }
-        if let Some(ref lat) = self.write_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.write_latency
+            && lat.count > 0 {
                 eprintln!("  Write:      {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
                     lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
             }
-        }
-        if let Some(ref lat) = self.s3_fetch_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.s3_fetch_latency
+            && lat.count > 0 {
                 eprintln!("  S3 Fetch:   {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
                     lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
             }
-        }
-        if let Some(ref lat) = self.file_read_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.file_read_latency
+            && lat.count > 0 {
                 eprintln!("  File Read:  {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
                     lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
             }
-        }
-        if let Some(ref lat) = self.file_write_latency {
-            if lat.count > 0 {
+        if let Some(ref lat) = self.file_write_latency
+            && lat.count > 0 {
                 eprintln!("  File Write: {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
                     lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
             }
-        }
     }
 }
 

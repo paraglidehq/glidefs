@@ -5,8 +5,12 @@
 //! 2. Live migration - readonly staging → drain → promote with lease handoff
 //! 3. Instant snapshot - flush() is local SSD only
 //! 4. Failure recovery - graceful handling of S3/network failures
+//! 5. Crash recovery - Syncing blocks survive process crashes
+//! 6. Lease fencing - no S3 writes after lease loss
 
+mod crash_recovery;
 mod failure_injection;
+mod lease_fencing;
 mod live_migration;
 mod property_tests;
 mod wake_any_node;

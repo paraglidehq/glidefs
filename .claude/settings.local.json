@@ -26,7 +26,14 @@
       "Bash(chmod:*)",
       "WebFetch(domain:www.zerofs.net)",
       "Bash(cargo install:*)",
-      "Bash(cargo machete:*)"
+      "Bash(cargo machete:*)",
+      "Bash(xargs cat:*)",
+      "Bash(tree:*)",
+      "Bash(rustup show:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:matklad.github.io)",
+      "Bash(RUSTFLAGS=\"--cfg loom\" cargo test:*)",
+      "Bash(cargo +nightly fuzz:*)"
     ]
   }
 }

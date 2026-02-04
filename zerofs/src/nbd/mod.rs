@@ -8,7 +8,15 @@ pub mod protocol;
 pub mod router;
 pub mod server;
 pub mod state;
+pub mod sync;
 pub mod write_cache;
+
+// Re-export protocol types for fuzzing
+#[cfg(feature = "fuzz")]
+pub use protocol::{
+    NBDClientFlags, NBDCommand, NBDOptionHeader, NBDRequest, NBDServerHandshake,
+    NBD_IHAVEOPT, NBD_MAGIC, NBD_REQUEST_MAGIC,
+};
 
 // Re-exports for library API
 #[allow(unused_imports)]

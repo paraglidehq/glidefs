@@ -782,12 +782,11 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                             break 'outer;
                         }
 
-                        if !data.is_empty() {
-                            if let Err(e) = writer.write_all(&data).await {
+                        if !data.is_empty()
+                            && let Err(e) = writer.write_all(&data).await {
                                 debug!("Failed to write reply data: {:?}", e);
                                 break 'outer;
                             }
-                        }
                     }
                     Response::Disconnect { export_name } => {
                         // Flush before drain

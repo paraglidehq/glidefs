@@ -1076,6 +1076,7 @@ impl WriteCache<Active> {
     ///
     /// **WARNING**: Returns zeros for blocks not present locally.
     /// Use `read_with_fetch` for NBD I/O to get proper S3 read-through.
+    #[allow(dead_code)] // Used by tests
     #[instrument(skip(self), fields(offset = offset, len = len))]
     pub fn read(&self, offset: u64, len: usize) -> Result<Bytes, CacheError> {
         self.read_local(offset, len)
@@ -1334,6 +1335,7 @@ impl WriteCache<Active> {
     }
 
     /// Read a single block from local cache.
+    #[allow(dead_code)] // Used by tests
     pub fn read_local_block(&self, block_num: u64) -> Result<Bytes, CacheError> {
         let offset = block_num * self.inner.config.block_size as u64;
         self.read(offset, self.inner.config.block_size)
@@ -1939,8 +1941,11 @@ pub async fn sync_worker(
                 warn!(
                     blocks = block_count,
                     error = %e,
-                    "sync batch failed"
+                    "sync batch failed, backing off 1s"
                 );
+                // Simple backoff: sleep 1s after any failure to avoid retry spam
+                // during S3 outages. Blocks are already re-queued by mark_sync_failed.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
 
@@ -3114,3 +3119,8 @@ mod tests {
         assert_eq!(&s3_data[..14], b"important data");
     }
 }
+
+// Loom concurrency tests are in a separate crate: zerofs/loom-tests/
+// This is necessary because loom disables tokio's networking which breaks
+// dependencies like hyper-util. Run loom tests with:
+//   cd loom-tests && cargo test --release

@@ -24,7 +24,9 @@
       "Bash(cargo bench:*)",
       "Bash(done)",
       "Bash(chmod:*)",
-      "WebFetch(domain:www.zerofs.net)"
+      "WebFetch(domain:www.zerofs.net)",
+      "Bash(cargo install:*)",
+      "Bash(cargo machete:*)"
     ]
   }
 }

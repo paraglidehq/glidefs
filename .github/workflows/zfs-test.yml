@@ -194,8 +194,11 @@ jobs:
           docker stop minio || true
 
   real-world-benchmark:
-    name: Real-World Workload Benchmark
+    name: Real-World Benchmark (batch=${{ matrix.blocks_per_batch }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        blocks_per_batch: [10, 25, 50, 100]
 
     steps:
       - uses: actions/checkout@v4
@@ -227,8 +230,8 @@ jobs:
           wget -q https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc rm --recursive --force myminio/zerofs-realworld-test/ || true
-          ./mc mb myminio/zerofs-realworld-test || true
+          ./mc rm --recursive --force myminio/zerofs-realworld-batch${{ matrix.blocks_per_batch }}/ || true
+          ./mc mb myminio/zerofs-realworld-batch${{ matrix.blocks_per_batch }} || true
 
       - name: Build ZeroFS
         working-directory: zerofs
@@ -246,12 +249,13 @@ jobs:
           memory_size_gb = 2.0
 
           [storage]
-          url = "s3://zerofs-realworld-test/bench"
+          url = "s3://zerofs-realworld-batch${{ matrix.blocks_per_batch }}/bench"
           encryption_password = "bench-password-123"
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
           api_address = "127.0.0.1:8080"
+          blocks_per_batch = ${{ matrix.blocks_per_batch }}
 
           [[servers.nbd.exports]]
           name = "bench-device"
@@ -287,7 +291,7 @@ jobs:
           echo ""
           echo "╔═══════════════════════════════════════════════════════════════╗"
           echo "║           REAL-WORLD WORKLOAD BENCHMARK                       ║"
-          echo "║  (Filesystem ops, bursty I/O, idle periods)                   ║"
+          echo "║  blocks_per_batch = ${{ matrix.blocks_per_batch }} (batch size = $(( ${{ matrix.blocks_per_batch }} * 128 ))KB)"
           echo "╚═══════════════════════════════════════════════════════════════╝"
           echo ""
 
@@ -419,7 +423,7 @@ jobs:
           # === SUMMARY ===
           echo ""
           echo "╔═══════════════════════════════════════════════════════════════╗"
-          echo "║                    BENCHMARK SUMMARY                          ║"
+          echo "║    BENCHMARK SUMMARY (blocks_per_batch=${{ matrix.blocks_per_batch }})"
           echo "╚═══════════════════════════════════════════════════════════════╝"
           echo ""
 
@@ -431,16 +435,23 @@ jobs:
           WRITE_AMP=$(grep 'write_amplification' /tmp/final_metrics.txt | grep -oE '[0-9.]+$' || echo "N/A")
           DIRTY=$(grep 'dirty_blocks{' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "N/A")
           GUEST_WRITES=$(grep 'guest_write_ops' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "N/A")
+          S3_BYTES=$(grep 's3_bytes_written' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "0")
+          GUEST_BYTES=$(grep 'guest_bytes_written' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "0")
 
-          echo "┌─────────────────────────────────────────┐"
-          echo "│ Metric                │ Value           │"
-          echo "├─────────────────────────────────────────┤"
-          printf "│ S3 Batches Written    │ %-15s │\n" "$BATCHES"
-          printf "│ Coalesce Ratio        │ %-15s │\n" "$COALESCE"
-          printf "│ Write Amplification   │ %-15s │\n" "$WRITE_AMP"
-          printf "│ Remaining Dirty       │ %-15s │\n" "$DIRTY"
-          printf "│ Total Guest Writes    │ %-15s │\n" "$GUEST_WRITES"
-          echo "└─────────────────────────────────────────┘"
+          # Calculate batch size in MB
+          BATCH_SIZE_KB=$(( ${{ matrix.blocks_per_batch }} * 128 ))
+
+          echo "┌───────────────────────────────────────────────────┐"
+          echo "│ Metric                │ Value                     │"
+          echo "├───────────────────────────────────────────────────┤"
+          printf "│ Batch Size            │ %-25s │\n" "${BATCH_SIZE_KB}KB (${{ matrix.blocks_per_batch }} blocks)"
+          printf "│ S3 Batches Written    │ %-25s │\n" "$BATCHES"
+          printf "│ Coalesce Ratio        │ %-25s │\n" "$COALESCE"
+          printf "│ Write Amplification   │ %-25s │\n" "$WRITE_AMP"
+          printf "│ S3 Bytes Written      │ %-25s │\n" "$(numfmt --to=iec $S3_BYTES 2>/dev/null || echo $S3_BYTES)"
+          printf "│ Guest Bytes Written   │ %-25s │\n" "$(numfmt --to=iec $GUEST_BYTES 2>/dev/null || echo $GUEST_BYTES)"
+          printf "│ Remaining Dirty       │ %-25s │\n" "$DIRTY"
+          echo "└───────────────────────────────────────────────────┘"
           echo ""
 
           # Compare with synthetic benchmark expectations

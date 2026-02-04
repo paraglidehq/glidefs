@@ -435,7 +435,7 @@ unix_socket = "/run/zerofs/nbd.sock"
 api_address = "127.0.0.1:8080"
 block_size = 131072      # 128KB (default)
 blocks_per_batch = 100   # S3 batching: 100 blocks × 128KB = 12.8MB per PUT
-sync_delay_ms = 3000     # Write coalescing delay (maps to hot batch cooldown, default 3s)
+sync_delay_ms = 8000     # Write coalescing delay (maps to hot batch cooldown, default 8s)
 
 [[servers.nbd.exports]]
 name = "vm-001"
@@ -454,7 +454,7 @@ block_size = 16384           # Optional, 16KB for database workloads
 |----------|---------|-----------|
 | `block_size` | 128KB | Match ZFS recordsize |
 | `blocks_per_batch` | 100 | Balance PUT cost vs latency |
-| `sync_delay_ms` | 3000ms | Write coalescing / hot batch cooldown (3s balances durability vs write amp) |
+| `sync_delay_ms` | 8000ms | Write coalescing / hot batch cooldown (8s reduces S3 PUTs via coalescing) |
 | `cache.dir` | ~/.cache/zerofs | Local SSD cache location |
 | `cache.disk_size_gb` | required | Cache size on disk |
 | `cache.memory_size_gb` | none | Optional in-memory cache |

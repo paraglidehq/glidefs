@@ -78,11 +78,12 @@ jobs:
           allow_http = "true"
           EOF
 
-          ./target/ci/zerofs run -c zerofs-iops.toml &
+          # ZEROFS_DISABLE_SYNC=1 disables the sync worker to test if it causes mixed workload contention
+          ZEROFS_DISABLE_SYNC=1 ./target/ci/zerofs run -c zerofs-iops.toml &
 
           for i in {1..30}; do
             if nc -z 127.0.0.1 10809; then
-              echo "ZeroFS ready"
+              echo "ZeroFS ready (sync worker DISABLED for benchmark)"
               break
             fi
             sleep 1

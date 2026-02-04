@@ -288,7 +288,7 @@ impl LeaseManager {
     /// Release the lease.
     ///
     /// **Idempotent**: If we don't hold the lease, returns Ok.
-    pub async fn release(&self, export: &str, current: &LeaseHandle) -> Result<(), LeaseError> {
+    pub async fn release(&self, export: &str, _current: &LeaseHandle) -> Result<(), LeaseError> {
         let path = self.lease_path(export);
 
         // Read current lease to verify we still hold it
@@ -318,16 +318,9 @@ impl LeaseManager {
             return Ok(());
         }
 
-        if existing.generation != current.lease.generation {
-            // Generation changed - we lost it at some point
-            debug!(
-                export,
-                expected_gen = current.lease.generation,
-                actual_gen = existing.generation,
-                "lease generation mismatch, treating as released"
-            );
-            return Ok(());
-        }
+        // Note: We don't check generation here because renewals increment it.
+        // The ownership check above is sufficient - if we own it, we can release it.
+        // The current.lease.generation may be stale if renewals happened after acquisition.
 
         // Release by writing a lease with empty owner and incremented generation
         // This allows another node to immediately acquire without waiting for TTL
@@ -678,18 +671,11 @@ mod tests {
         assert_eq!(handle_a_renewed.lease.generation, 2);
 
         // Now release using the ORIGINAL handle (simulating a race where
-        // release was called with stale handle info)
-        // The implementation should handle this gracefully
+        // release was called with stale handle info after renewals)
+        // The implementation handles this correctly: ownership check passes
+        // (we still own it), so the lease is released using the CURRENT
+        // generation from S3, not the stale generation in the handle.
         manager_a.release("export1", &handle_a).await.unwrap();
-
-        // Even though we used a stale handle, if node-a still owns it,
-        // release should have worked (the generation check in release()
-        // will see a mismatch and treat it as "already released")
-
-        // Let's do a proper release with the current handle
-        // First re-acquire to get fresh state
-        let handle_a_fresh = manager_a.acquire("export1").await.unwrap();
-        manager_a.release("export1", &handle_a_fresh).await.unwrap();
 
         // Now node B should be able to acquire
         let handle_b = manager_b.acquire("export1").await.unwrap();
@@ -731,10 +717,9 @@ mod tests {
         renewal_handle.await.unwrap();
 
         // 2. Now release the lease (renewal task is stopped, no race)
-        // Get fresh handle since generation may have changed
-        let current_lease = manager_a.get_lease("export1").await.unwrap().unwrap();
-        let fresh_handle = LeaseHandle { lease: current_lease };
-        manager_a.release("export1", &fresh_handle).await.unwrap();
+        // Note: We can use the original handle even though renewals may have
+        // changed the generation - release() only checks ownership, not generation.
+        manager_a.release("export1", &handle_a).await.unwrap();
 
         // 3. Verify node B can acquire immediately
         let handle_b = manager_b.acquire("export1").await.unwrap();

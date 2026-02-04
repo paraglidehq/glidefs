@@ -507,11 +507,19 @@ impl ExportRouter {
                 }
 
             // 3. Now release the lease (renewal task is stopped, no race condition)
-            if let Some(ref lease_handle) = state.lease
-                && let Err(e) = self.lease_manager.release(&name, lease_handle).await {
-                    warn!("Failed to release lease for '{}': {}", name, e);
-                    // Continue with shutdown - lease will expire eventually
+            if let Some(ref lease_handle) = state.lease {
+                match self.lease_manager.release(&name, lease_handle).await {
+                    Ok(()) => {
+                        info!("Released lease for export '{}'", name);
+                    }
+                    Err(e) => {
+                        warn!("Failed to release lease for '{}': {}", name, e);
+                        // Continue with shutdown - lease will expire eventually
+                    }
                 }
+            } else {
+                info!("No lease to release for export '{}' (was readonly)", name);
+            }
 
             // 4. Wait for sync worker to exit (releases its Arc clone)
             if let Err(e) = state.sync_handle.await {

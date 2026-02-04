@@ -481,11 +481,11 @@ jobs:
           echo ""
 
           echo "=== DIAGNOSTIC: Checking local cache data file ==="
-          echo "First 512 bytes of cache data file (block 0):"
-          sudo hexdump -C /tmp/zerofs-cache/bucket_*/test-device.data 2>/dev/null | head -20 || echo "Could not read cache data file"
+          echo "Cache files:"
+          ls -la /tmp/zerofs-cache/bucket_*/ 2>/dev/null || echo "No cache files"
           echo ""
-          echo "Cache metadata file:"
-          ls -la /tmp/zerofs-cache/bucket_*/test-device.meta 2>/dev/null || echo "No metadata file"
+          echo "First 512 bytes of cache data file (block 0):"
+          sudo hexdump -C /tmp/zerofs-cache/bucket_*/test-device.cache 2>/dev/null | head -20 || echo "Could not read cache data file"
           echo ""
 
           echo "Importing ZFS pool..."

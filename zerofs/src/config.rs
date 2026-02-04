@@ -140,7 +140,7 @@ impl ExportConfig {
 
 impl NbdConfig {
     pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
-    pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 100;
+    pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 25;
     pub const DEFAULT_DEVICE_SIZE_GB: f64 = 100.0;
     pub const DEFAULT_DEVICE_NAME: &'static str = "zerofs";
     pub const DEFAULT_SYNC_DELAY_MS: u64 = 8000;  // 8 seconds - testing PUT reduction

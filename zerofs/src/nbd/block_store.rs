@@ -26,8 +26,10 @@ pub struct BatchData {
 pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Default number of blocks per batch.
-/// 100 blocks × 128KB = 12.8MB per batch object.
-pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 100;
+/// 25 blocks × 128KB = 3.2MB per batch object.
+/// Smaller batches reduce storage overhead for sparse data while
+/// keeping API costs reasonable. See ARCHITECTURE.md for analysis.
+pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 25;
 
 /// Errors that can occur during block store operations.
 #[derive(Error, Debug)]

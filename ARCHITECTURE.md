@@ -206,12 +206,14 @@ s3://bucket/path/{export_name}/batches/{batch_num:012x}
 ```
 
 **Batch format**:
-- Each batch contains `blocks_per_batch` consecutive blocks (default: 100)
-- Fixed size: 100 blocks × 128KB = 12.8MB per batch object
+- Each batch contains `blocks_per_batch` consecutive blocks (default: 25)
+- Fixed size: 25 blocks × 128KB = 3.2MB per batch object
 - Reads use S3 range requests to fetch individual blocks from batches
 - Writes use GET-modify-PUT to update batch contents
 
-**Cost reduction**: ~10x fewer S3 PUTs compared to individual block storage.
+**Why 25 blocks?** Smaller batches reduce storage overhead for sparse/scattered data
+(typical of filesystems) while keeping API costs reasonable. Larger batches waste
+space when only a few blocks in each batch contain data.
 
 **No LSM tree** - direct batch addressing for O(1) predictable latency.
 
@@ -434,7 +436,7 @@ addresses = ["0.0.0.0:10809"]
 unix_socket = "/run/zerofs/nbd.sock"
 api_address = "127.0.0.1:8080"
 block_size = 131072      # 128KB (default)
-blocks_per_batch = 100   # S3 batching: 100 blocks × 128KB = 12.8MB per PUT
+blocks_per_batch = 25    # S3 batching: 25 blocks × 128KB = 3.2MB per PUT
 sync_delay_ms = 8000     # Write coalescing delay (maps to hot batch cooldown, default 8s)
 
 [[servers.nbd.exports]]
@@ -453,7 +455,7 @@ block_size = 16384           # Optional, 16KB for database workloads
 | Variable | Default | Rationale |
 |----------|---------|-----------|
 | `block_size` | 128KB | Match ZFS recordsize |
-| `blocks_per_batch` | 100 | Balance PUT cost vs latency |
+| `blocks_per_batch` | 25 | Balance storage efficiency vs API cost |
 | `sync_delay_ms` | 8000ms | Write coalescing / hot batch cooldown (8s reduces S3 PUTs via coalescing) |
 | `cache.dir` | ~/.cache/zerofs | Local SSD cache location |
 | `cache.disk_size_gb` | required | Cache size on disk |
@@ -477,9 +479,9 @@ Blocks are grouped into batches to reduce S3 PUT operations:
 | Approach | PUTs/day | PUT Cost/month |
 |----------|----------|----------------|
 | Individual blocks | ~115,000 | ~$17.40 |
-| Batched (100:1) | ~1,200 | ~$1.80 |
+| Batched (25:1) | ~4,600 | ~$0.70 |
 
-**Trade-off**: Slightly higher read latency for first access to a batch (fetches 12.8MB vs 128KB), but S3's range request support means subsequent reads within the same batch are fast.
+**Note**: Reads use S3 range requests to fetch individual 128KB blocks regardless of batch size, so read latency is unaffected by batching.
 
 ### 2. Zero-Block Detection
 

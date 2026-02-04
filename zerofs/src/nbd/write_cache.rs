@@ -1668,8 +1668,8 @@ impl Default for SyncWorkerConfig {
     fn default() -> Self {
         Self {
             batch_size: 100,
-            // 2 concurrent S3 uploads - reduces I/O contention with reads
-            max_concurrent_uploads: 2,
+            // 1 concurrent S3 upload - minimizes I/O contention with reads
+            max_concurrent_uploads: 1,
             // 3 second sync interval: balances durability vs write amplification.
             // Longer interval = more writes coalesce = less S3 traffic.
             // Recently written blocks are likely still in page cache when sync reads them.

@@ -806,28 +806,10 @@ impl WriteCache<Initializing> {
         // Ensure cache directory exists
         std::fs::create_dir_all(&config.cache_dir)?;
 
-        // Open or create data file (sparse file - only allocates on write)
+        // Open or create data file with O_DIRECT for sync worker reads
+        // This prevents sync worker from polluting/contending with the page cache
         let data_path = config.data_path();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&data_path)?;
-
-        // Set file size (sparse - doesn't allocate disk space until written)
-        let file_size = file.metadata()?.len();
-        if file_size < config.device_size {
-            file.set_len(config.device_size)?;
-            info!(
-                path = %data_path.display(),
-                old_size = file_size,
-                new_size = config.device_size,
-                "extended cache file (sparse)"
-            );
-        }
-
-        let data_file = SyncFile::new(file);
+        let data_file = SyncFile::open_direct(&data_path, true, config.device_size)?;
 
         // Load block states and presence (or create fresh)
         let num_blocks = config.num_blocks();

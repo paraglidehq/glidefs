@@ -19,7 +19,8 @@
       "Bash(cargo doc:*)",
       "Bash(grep:*)",
       "WebFetch(domain:docs.rs)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(git -C /Users/jared/Code/OSS/ZeroFS log --oneline -20)"
     ]
   }
 }

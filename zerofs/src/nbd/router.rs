@@ -30,10 +30,6 @@ pub enum RouterError {
     #[error("Export '{0}' not found")]
     ExportNotFound(String),
 
-    #[allow(dead_code)]
-    #[error("Export '{0}' is readonly")]
-    ExportReadonly(String),
-
     #[error("Lease error: {0}")]
     Lease(#[from] super::lease::LeaseError),
 
@@ -151,7 +147,8 @@ impl ExportRouter {
 
     /// Create a new export.
     ///
-    /// If `readonly` is true, the export will reject writes (used for pre-warming during migration).
+    /// If `readonly` is true, the export will reject writes. Used during live migration to
+    /// pre-stage the export on the destination node before promoting it to read-write.
     ///
     /// **Idempotent**: If export already exists, returns Ok(()) without error.
     pub async fn create_export(
@@ -249,7 +246,7 @@ impl ExportRouter {
         let sync_s3 = Arc::clone(&s3_store);
         let export_name = name.clone();
         let sync_config = super::write_cache::SyncWorkerConfig {
-            idle_sleep: std::time::Duration::from_millis(self.sync_delay_ms),
+            hot_batch_cooldown: std::time::Duration::from_millis(self.sync_delay_ms),
             ..Default::default()
         };
         let sync_lease_state = lease_state.clone();

@@ -28,9 +28,6 @@ use tracing::{debug, info, instrument, warn};
 use super::block_store::{BlockStoreError, S3BlockStore};
 use super::state::{Active, BlockState, Draining, Initializing, Recovering};
 
-/// Default block size: 128KB (matches ZFS default recordsize)
-#[allow(dead_code)]
-pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Check if a block is all zeros.
 ///
@@ -177,16 +174,6 @@ pub(crate) struct CacheInner {
 }
 
 impl CacheInner {
-    /// Get block state (lock-free read).
-    #[inline]
-    #[allow(dead_code)] // Part of lock-free API, may be used for diagnostics
-    fn get_state(&self, block_num: usize) -> BlockState {
-        if block_num >= self.num_blocks {
-            return BlockState::Clean;
-        }
-        BlockState::from_u8(self.block_states[block_num].load(Ordering::Acquire))
-    }
-
     /// Check if block is present (lock-free read).
     #[inline]
     fn is_present(&self, block_num: usize) -> bool {
@@ -1297,11 +1284,35 @@ impl WriteCache<Active> {
     ///
     /// Returns the number of blocks successfully synced.
     pub async fn sync_blocks_batched(&self, s3: &S3BlockStore, block_nums: Vec<u64>) -> Result<usize, CacheError> {
+        self.sync_blocks_batched_parallel(s3, block_nums, 1).await
+    }
+
+    /// Sync dirty blocks to S3 with parallel uploads.
+    ///
+    /// Like `sync_blocks_batched`, but processes up to `max_concurrent` batches
+    /// in parallel. This significantly improves throughput when syncing many
+    /// batches, as S3 latency (~100ms) is the bottleneck.
+    ///
+    /// Unlike the sequential version, this method does NOT fail-fast on errors.
+    /// Each batch is processed independently - if one fails, others continue.
+    /// Failed batches have their blocks marked for retry.
+    ///
+    /// Returns the number of blocks successfully synced.
+    pub async fn sync_blocks_batched_parallel(
+        &self,
+        s3: &S3BlockStore,
+        block_nums: Vec<u64>,
+        max_concurrent: usize,
+    ) -> Result<usize, CacheError> {
+        use futures::stream::{self, StreamExt};
         use std::collections::HashMap;
+        use std::sync::atomic::AtomicUsize;
 
         if block_nums.is_empty() {
             return Ok(0);
         }
+
+        let max_concurrent = max_concurrent.max(1); // At least 1
 
         // Group blocks by batch number
         let mut batches: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -1310,66 +1321,83 @@ impl WriteCache<Active> {
             batches.entry(batch_num).or_default().push(block_num);
         }
 
-        let mut synced_count = 0;
         let block_size = self.inner.config.block_size;
+        let synced_count = AtomicUsize::new(0);
 
-        // Process each batch
-        for (batch_num, blocks_in_batch) in batches {
-            // GET existing batch with ETag for conditional PUT
-            let batch_result = match s3.get_batch_with_etag(batch_num).await {
-                Ok(result) => result,
-                Err(e) => {
-                    // Mark all blocks in this batch as failed
-                    for block_num in blocks_in_batch {
-                        self.mark_sync_failed(block_num);
+        // Process batches in parallel with bounded concurrency
+        let results: Vec<_> = stream::iter(batches)
+            .map(|(batch_num, blocks_in_batch)| {
+                let synced_count = &synced_count;
+                async move {
+                    // GET existing batch with ETag for conditional PUT
+                    let batch_result = match s3.get_batch_with_etag(batch_num).await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            // Mark all blocks in this batch as failed
+                            for block_num in &blocks_in_batch {
+                                self.mark_sync_failed(*block_num);
+                            }
+                            warn!(batch = batch_num, error = %e, "failed to fetch batch for sync");
+                            return;
+                        }
+                    };
+
+                    let mut batch_data = batch_result.data;
+                    let etag = batch_result.etag;
+                    let mut batch_modified = false;
+
+                    // Update dirty block slots with local data
+                    for &block_num in &blocks_in_batch {
+                        let local_data = match self.read_local_block(block_num) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!(block = block_num, error = %e, "failed to read local block");
+                                self.mark_sync_failed(block_num);
+                                continue;
+                            }
+                        };
+                        let offset = s3.offset_in_batch(block_num) as usize;
+                        let s3_slice = &batch_data[offset..offset + block_size];
+
+                        // Zero-block optimization
+                        let local_is_zero = is_zero_block(&local_data);
+                        let s3_is_zero = is_zero_block(s3_slice);
+
+                        if local_is_zero && s3_is_zero {
+                            debug!(block = block_num, "skipping zero block (S3 already zeros)");
+                        } else {
+                            batch_data[offset..offset + local_data.len()].copy_from_slice(&local_data);
+                            batch_modified = true;
+                        }
                     }
-                    return Err(CacheError::BlockStore(e));
+
+                    // Only PUT if we actually modified the batch
+                    if batch_modified {
+                        if let Err(e) = s3.put_batch_conditional(batch_num, batch_data, etag).await {
+                            // Mark all blocks in this batch as failed
+                            for block_num in &blocks_in_batch {
+                                self.mark_sync_failed(*block_num);
+                            }
+                            warn!(batch = batch_num, error = %e, "failed to upload batch");
+                            return;
+                        }
+                    }
+
+                    // Mark all blocks in this batch as synced
+                    for block_num in blocks_in_batch {
+                        self.mark_synced(block_num);
+                        synced_count.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
-            };
+            })
+            .buffer_unordered(max_concurrent)
+            .collect()
+            .await;
 
-            let mut batch_data = batch_result.data;
-            let etag = batch_result.etag;
-            let mut batch_modified = false;
+        // All futures completed (results is Vec<()>)
+        drop(results);
 
-            // Update dirty block slots with local data
-            for &block_num in &blocks_in_batch {
-                let local_data = self.read_local_block(block_num)?;
-                let offset = s3.offset_in_batch(block_num) as usize;
-                let s3_slice = &batch_data[offset..offset + block_size];
-
-                // Zero-block optimization: skip if local is zeros AND S3 is already zeros
-                let local_is_zero = is_zero_block(&local_data);
-                let s3_is_zero = is_zero_block(s3_slice);
-
-                if local_is_zero && s3_is_zero {
-                    // Both zero - no need to write, just mark synced
-                    debug!(block = block_num, "skipping zero block (S3 already zeros)");
-                } else {
-                    // Copy local data to batch
-                    batch_data[offset..offset + local_data.len()].copy_from_slice(&local_data);
-                    batch_modified = true;
-                }
-            }
-
-            // Only PUT if we actually modified the batch
-            if batch_modified
-                && let Err(e) = s3.put_batch_conditional(batch_num, batch_data, etag).await
-            {
-                // Mark all blocks in this batch as failed
-                for block_num in blocks_in_batch {
-                    self.mark_sync_failed(block_num);
-                }
-                return Err(CacheError::BlockStore(e));
-            }
-
-            // Mark all blocks in this batch as synced
-            for block_num in blocks_in_batch {
-                self.mark_synced(block_num);
-                synced_count += 1;
-            }
-        }
-
-        Ok(synced_count)
+        Ok(synced_count.load(Ordering::Relaxed))
     }
 
     /// Graceful shutdown: sync all blocks and transition to Draining.
@@ -1466,6 +1494,11 @@ pub struct SyncWorkerConfig {
     /// Higher values reduce per-cycle overhead but increase memory usage during sync.
     pub batch_size: usize,
 
+    /// Maximum concurrent S3 uploads per sync cycle.
+    /// Higher values increase throughput but use more memory and connections.
+    /// Set to 1 for sequential uploads (original behavior).
+    pub max_concurrent_uploads: usize,
+
     /// Hot batch cooldown: don't re-sync an S3 batch within this duration.
     ///
     /// When a batch is synced, it enters a "cooldown" period. If more blocks
@@ -1504,15 +1537,14 @@ pub struct SyncWorkerConfig {
     /// Set to 0 to disable.
     pub dirty_queue_critical_threshold: u64,
 
-    /// Deprecated: kept for backwards compatibility.
-    #[allow(dead_code)]
-    pub idle_sleep: std::time::Duration,
 }
 
 impl Default for SyncWorkerConfig {
     fn default() -> Self {
         Self {
             batch_size: 100,
+            // 4 concurrent S3 uploads balances throughput vs resource usage
+            max_concurrent_uploads: 4,
             // 100ms hot batch cooldown: prevents repeated GET-modify-PUT of same batch
             hot_batch_cooldown: std::time::Duration::from_millis(100),
             // After 10 deferrals, force sync even if batch is hot
@@ -1523,7 +1555,6 @@ impl Default for SyncWorkerConfig {
             dirty_queue_warn_threshold: 1_000,
             // 10000 blocks @ 128KB = 1.28GB uncommitted - serious problem
             dirty_queue_critical_threshold: 10_000,
-            idle_sleep: std::time::Duration::from_millis(100),
         }
     }
 }
@@ -1755,7 +1786,7 @@ pub async fn sync_worker(
             .collect();
         let blocks_syncing: Vec<u64> = blocks_to_sync.clone();
 
-        match cache.sync_blocks_batched(&s3, blocks_to_sync).await {
+        match cache.sync_blocks_batched_parallel(&s3, blocks_to_sync, config.max_concurrent_uploads).await {
             Ok(synced) => {
                 let elapsed = start.elapsed();
 
@@ -2143,7 +2174,6 @@ mod tests {
             worker_s3,
             super::SyncWorkerConfig {
                 batch_size: 100,
-                idle_sleep: std::time::Duration::from_millis(10),
                 metadata_save_interval: 1,
                 ..Default::default()
             },
@@ -2198,7 +2228,6 @@ mod tests {
             worker_s3,
             super::SyncWorkerConfig {
                 batch_size: 100,
-                idle_sleep: std::time::Duration::from_millis(50),
                 metadata_save_interval: 10,
                 ..Default::default()
             },
@@ -2502,7 +2531,7 @@ mod tests {
             worker_s3,
             super::SyncWorkerConfig {
                 batch_size: 100,
-                idle_sleep: std::time::Duration::from_millis(10),
+                max_concurrent_uploads: 1, // Sequential for predictable test behavior
                 hot_batch_cooldown: std::time::Duration::from_secs(60), // Very long - batch stays hot
                 max_deferrals: 3, // Force sync after 3 deferrals
                 metadata_save_interval: 100,

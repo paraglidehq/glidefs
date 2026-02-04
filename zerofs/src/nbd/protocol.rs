@@ -67,12 +67,6 @@ pub const NBD_EXPORT_NAME_PADDING: usize = 124;
 pub const NBD_OPTION_HEADER_SIZE: usize = 16;
 pub const NBD_REQUEST_HEADER_SIZE: usize = 28;
 
-// Server configuration
-#[allow(dead_code)]
-pub const NBD_READDIR_DEFAULT_LIMIT: usize = 1000;
-#[allow(dead_code)]
-pub const NBD_ZERO_CHUNK_SIZE: usize = 1024 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, DekuRead, DekuWrite)]
 #[deku(id_type = "u16", endian = "big")]
 pub enum NBDCommand {

@@ -148,6 +148,12 @@ jobs:
         run: |
           echo "=== TEST: Live migration protocol ==="
 
+          # Clean up any stale NBD devices from previous tests
+          for i in 0 1 2 3; do
+            sudo nbd-client -d /dev/nbd$i 2>/dev/null || true
+          done
+          sleep 1
+
           rm -rf /tmp/source-cache /tmp/dest-cache
           mkdir -p /tmp/source-cache /tmp/dest-cache
 
@@ -189,7 +195,12 @@ jobs:
           # Connect NBD and create ZFS pool on source
           echo "Creating ZFS pool on source..."
           sudo modprobe nbd
-          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N migrate-vol
+          echo "Connecting NBD device..."
+          if ! sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N migrate-vol; then
+            echo "NBD connection failed! Checking dmesg..."
+            dmesg | tail -30
+            exit 1
+          fi
           sudo zpool create -f migrationpool /dev/nbd0
           sudo zfs create migrationpool/data
 

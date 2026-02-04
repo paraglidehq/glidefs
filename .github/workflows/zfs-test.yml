@@ -82,8 +82,8 @@ jobs:
           allow_http = "true"
           EOF
 
-          # Start ZeroFS with NBD support in the background
-          ./target/ci/zerofs run -c zerofs-ci.toml &
+          # Start ZeroFS with NBD support in the background, capture logs
+          ./target/ci/zerofs run -c zerofs-ci.toml 2>&1 | tee /tmp/zerofs-first.log &
 
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to start..."
@@ -429,12 +429,15 @@ jobs:
           ls -la /tmp/zerofs-cache/ || echo "Cache dir not found"
           du -sh /tmp/zerofs-cache/ || echo "Could not measure cache size"
 
+          echo "=== ZEROFS LOGS (first instance) ==="
+          tail -100 /tmp/zerofs-first.log || echo "No log file"
+
       - name: Restart ZeroFS
         working-directory: zerofs
         run: |
           echo "Starting ZeroFS again..."
           # Config file should still exist from earlier
-          ./target/ci/zerofs run -c zerofs-ci.toml &
+          ./target/ci/zerofs run -c zerofs-ci.toml 2>&1 | tee /tmp/zerofs-second.log &
 
           # Wait for ZeroFS NBD server to start
           echo "Waiting for ZeroFS NBD server to restart..."
@@ -454,8 +457,16 @@ jobs:
 
       - name: Reconnect NBD and import pool
         run: |
+          echo "Ensuring NBD device is clean..."
+          sudo nbd-client -d /dev/nbd0 2>/dev/null || true
+          sleep 1
+
           echo "Reconnecting NBD device..."
-          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device
+          if ! sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N test-device; then
+            echo "NBD connection failed! Checking dmesg..."
+            dmesg | tail -30
+            exit 1
+          fi
 
           # Verify NBD device is available
           sudo blockdev --getsize64 /dev/nbd0
@@ -469,9 +480,25 @@ jobs:
           sudo dd if=/dev/nbd0 bs=8192 count=1 skip=0 2>/dev/null | hexdump -C | head -10
           echo ""
 
+          echo "=== DIAGNOSTIC: Checking local cache data file ==="
+          echo "First 512 bytes of cache data file (block 0):"
+          sudo hexdump -C /tmp/zerofs-cache/bucket_*/test-device.data 2>/dev/null | head -20 || echo "Could not read cache data file"
+          echo ""
+          echo "Cache metadata file:"
+          ls -la /tmp/zerofs-cache/bucket_*/test-device.meta 2>/dev/null || echo "No metadata file"
+          echo ""
+
           echo "Importing ZFS pool..."
           # Use -d /dev to tell ZFS where to search (it caches device paths from export)
-          sudo zpool import -d /dev testpool
+          if ! sudo zpool import -d /dev testpool; then
+            echo "=== ZPOOL IMPORT FAILED ==="
+            echo "ZeroFS logs (second instance):"
+            tail -50 /tmp/zerofs-second.log || echo "No log file"
+            echo ""
+            echo "Checking dmesg:"
+            dmesg | tail -20
+            exit 1
+          fi
 
           # Check pool status
           sudo zpool status testpool

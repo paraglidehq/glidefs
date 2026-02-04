@@ -259,6 +259,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
             // Write same block 1000 times
             for _ in 0..1000 {
                 harness.cache.write(0, &data).unwrap();
+                harness.metrics.record_guest_write(BLOCK_SIZE as u64);
             }
             // Drain to S3
             harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
@@ -280,6 +281,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
             for i in 0..100 {
                 let data = vec![i as u8; BLOCK_SIZE];
                 harness.cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
+                harness.metrics.record_guest_write(BLOCK_SIZE as u64);
             }
             harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
             let elapsed = start.elapsed();
@@ -323,13 +325,18 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                         // Sequential read (boot loading)
                         let block: u64 = rng.gen_range(0..512);
                         let _ = harness.cache.read_local(block * BLOCK_SIZE as u64, BLOCK_SIZE);
+                        harness.metrics.record_guest_read(BLOCK_SIZE as u64);
                     } else {
                         // Random write (boot activity)
                         let block: u64 = rng.gen_range(0..512);
                         let data = vec![0xBBu8; 4096]; // 4KB write
                         harness.cache.write(block * BLOCK_SIZE as u64, &data).unwrap();
+                        harness.metrics.record_guest_write(4096);
                     }
                 }
+
+                // Drain to get S3 metrics
+                harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
 
                 total += start.elapsed();
                 harness.print_metrics("VM Boot");
@@ -355,12 +362,16 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 for i in 0..1000 {
                     let block: u64 = rng.gen_range(0..100);
                     harness.cache.write(block * BLOCK_SIZE as u64, &data).unwrap();
+                    harness.metrics.record_guest_write(data.len() as u64);
 
                     // fsync every 10 writes (simulates transaction commits)
                     if i % 10 == 9 {
                         harness.cache.flush().unwrap();
                     }
                 }
+
+                // Drain to S3 to get write amplification metrics
+                harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
 
                 total += start.elapsed();
                 harness.print_metrics("Database Random I/O");
@@ -387,18 +398,24 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                     let data = vec![i as u8; size];
                     let offset = (i as u64 * 32768) % (harness.device_blocks() * BLOCK_SIZE as u64);
                     harness.cache.write(offset, &data).unwrap();
+                    harness.metrics.record_guest_write(size as u64);
                 }
 
                 // Phase 2: Read back for linking (sequential)
                 for i in 0..200 {
                     let offset = (i as u64 * 32768) % (harness.device_blocks() * BLOCK_SIZE as u64);
                     let _ = harness.cache.read_local(offset, 32768);
+                    harness.metrics.record_guest_read(32768);
                 }
 
                 // Phase 3: Write final binary
                 let binary = vec![0xEEu8; 512 * 1024]; // 512KB binary
                 harness.cache.write(0, &binary).unwrap();
+                harness.metrics.record_guest_write(binary.len() as u64);
                 harness.cache.flush().unwrap();
+
+                // Drain to get S3 metrics
+                harness.cache.drain_for_snapshot(&harness.s3_store).await.unwrap();
 
                 total += start.elapsed();
                 harness.print_metrics("Compilation Workload");
@@ -437,6 +454,7 @@ fn bench_drain_latency(c: &mut Criterion) {
                         for i in 0..blocks {
                             let data = vec![i as u8; BLOCK_SIZE];
                             harness.cache.write(i * BLOCK_SIZE as u64, &data).unwrap();
+                            harness.metrics.record_guest_write(BLOCK_SIZE as u64);
                         }
 
                         let start = Instant::now();

@@ -339,6 +339,12 @@ jobs:
 
       - name: Disconnect NBD and stop ZeroFS
         run: |
+          echo "=== S3 STATE BEFORE SHUTDOWN ==="
+          echo "Object count in S3:"
+          ./mc ls --recursive myminio/zerofs-zfs-test | wc -l
+          echo "S3 bucket size:"
+          ./mc du myminio/zerofs-zfs-test
+
           echo "Disconnecting NBD device..."
           sudo nbd-client -d /dev/nbd0
 
@@ -367,17 +373,9 @@ jobs:
           if [ -n "$ZEROFS_PID" ]; then
             echo "Found ZeroFS process: $ZEROFS_PID"
 
-            # First, send SIGUSR1 to trigger a full drain to S3
-            # This ensures all dirty blocks are flushed before shutdown
-            echo "Sending SIGUSR1 to trigger S3 drain..."
-            kill -USR1 $ZEROFS_PID || true
-
-            # Wait for the drain to complete (up to 60 seconds for large datasets)
-            echo "Waiting for drain to complete..."
-            sleep 10
-
-            # Now send SIGTERM for graceful shutdown
-            echo "Sending SIGTERM..."
+            # SIGTERM triggers graceful shutdown which includes full drain to S3
+            # (see router.shutdown() in the code)
+            echo "Sending SIGTERM for graceful shutdown (includes S3 drain)..."
             kill -TERM $ZEROFS_PID || true
           else
             echo "No ZeroFS process found (may have already stopped)"
@@ -420,6 +418,17 @@ jobs:
             exit 1
           fi
 
+          echo "=== S3 STATE AFTER SHUTDOWN ==="
+          echo "Object count in S3:"
+          ./mc ls --recursive myminio/zerofs-zfs-test | wc -l
+          echo "S3 bucket size:"
+          ./mc du myminio/zerofs-zfs-test
+
+          echo "=== LOCAL CACHE STATE ==="
+          echo "Cache directory contents:"
+          ls -la /tmp/zerofs-cache/ || echo "Cache dir not found"
+          du -sh /tmp/zerofs-cache/ || echo "Could not measure cache size"
+
       - name: Restart ZeroFS
         working-directory: zerofs
         run: |
@@ -452,8 +461,17 @@ jobs:
           sudo blockdev --getsize64 /dev/nbd0
           sudo fdisk -l /dev/nbd0
 
+          echo "=== DIAGNOSTIC: Testing if NBD device is serving data ==="
+          echo "Reading first 512 bytes (should contain ZFS label if data persisted):"
+          sudo dd if=/dev/nbd0 bs=512 count=1 2>/dev/null | hexdump -C | head -20
+          echo ""
+          echo "Reading ZFS label area (offset 0):"
+          sudo dd if=/dev/nbd0 bs=8192 count=1 skip=0 2>/dev/null | hexdump -C | head -10
+          echo ""
+
           echo "Importing ZFS pool..."
-          sudo zpool import testpool
+          # Use -d /dev to tell ZFS where to search (it caches device paths from export)
+          sudo zpool import -d /dev testpool
 
           # Check pool status
           sudo zpool status testpool

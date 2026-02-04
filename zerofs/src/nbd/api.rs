@@ -309,3 +309,13 @@ impl ApiServer {
         Ok(())
     }
 }
+
+// Note: API endpoint tests are covered via the router tests and integration tests.
+// The handle_request function is a thin routing layer over ExportRouter methods.
+// Testing the full HTTP stack with hyper's Incoming type requires complex setup.
+// See tests/integration/ for end-to-end HTTP API tests.
+//
+// The core API functionality is tested through:
+// - router.rs unit tests (create_export, drain_export, promote_export, etc.)
+// - integration tests (multi-node scenarios)
+// - GitHub Actions workflows (full HTTP API with real server)

@@ -39,7 +39,7 @@ jobs:
         run: cargo test --features test-utils --verbose
 
   benchmarks:
-    name: Benchmarks (Dry Run)
+    name: Benchmarks
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -49,7 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build benchmarks
         run: cargo build --features test-utils --benches
-      - name: Run flush latency benchmark (short)
+      - name: Run flush latency benchmarks
         run: cargo bench --features test-utils --bench flush_latency -- --noplot
-      - name: Run workloads benchmark (short)
-        run: cargo bench --features test-utils --bench workloads -- --noplot "random_writes" "mixed_workload"
+      - name: Run all workload benchmarks
+        run: cargo bench --features test-utils --bench workloads -- --noplot

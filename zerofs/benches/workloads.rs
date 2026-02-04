@@ -462,12 +462,142 @@ fn bench_drain_latency(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: Concurrent access from multiple threads.
+///
+/// This stress-tests the lock-free CAS-based state machine.
+fn bench_concurrent_access(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent");
+
+    for num_threads in [2usize, 4, 8] {
+        group.bench_with_input(
+            BenchmarkId::new("writers", num_threads),
+            &num_threads,
+            |b, &threads| {
+                b.iter_custom(|iters| {
+                    let harness = Arc::new(TestHarness::new());
+                    let iterations_per_thread = (iters as usize / threads).max(1);
+
+                    let start = Instant::now();
+
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let cache = Arc::clone(&harness);
+                            let thread_id = t;
+                            thread::spawn(move || {
+                                let mut rng = rand::thread_rng();
+                                let data = vec![thread_id as u8; BLOCK_SIZE];
+
+                                for _ in 0..iterations_per_thread {
+                                    let block: u64 = rng.gen_range(0..100);
+                                    cache.cache.write(block * BLOCK_SIZE as u64, &data).unwrap();
+                                }
+                            })
+                        })
+                        .collect();
+
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+
+                    start.elapsed()
+                });
+            },
+        );
+    }
+
+    // Mixed concurrent read/write
+    group.bench_function("mixed_4_threads", |b| {
+        b.iter_custom(|iters| {
+            let harness = Arc::new(TestHarness::new());
+
+            // Pre-populate
+            for i in 0..100 {
+                let data = vec![i as u8; BLOCK_SIZE];
+                harness.cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
+            }
+
+            let iterations_per_thread = (iters as usize / 4).max(1);
+            let start = Instant::now();
+
+            let handles: Vec<_> = (0..4)
+                .map(|t| {
+                    let cache = Arc::clone(&harness);
+                    let is_writer = t % 2 == 0;
+                    thread::spawn(move || {
+                        let mut rng = rand::thread_rng();
+                        let data = vec![t as u8; BLOCK_SIZE];
+
+                        for _ in 0..iterations_per_thread {
+                            let block: u64 = rng.gen_range(0..100);
+                            let offset = block * BLOCK_SIZE as u64;
+
+                            if is_writer {
+                                cache.cache.write(offset, &data).unwrap();
+                            } else {
+                                let _ = cache.cache.read_local(offset, BLOCK_SIZE);
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            start.elapsed()
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark: Large sequential writes (like dd).
+fn bench_sequential_writes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sequential_writes");
+
+    // 1MB sequential write
+    group.throughput(Throughput::Bytes(1024 * 1024));
+    group.bench_function("1mb_sequential", |b| {
+        let harness = TestHarness::new();
+        let data = vec![0xAAu8; BLOCK_SIZE];
+        let blocks_per_mb = 1024 * 1024 / BLOCK_SIZE;
+
+        b.iter(|| {
+            for i in 0..blocks_per_mb {
+                harness.cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
+            }
+        });
+    });
+
+    // 10MB sequential write
+    group.throughput(Throughput::Bytes(10 * 1024 * 1024));
+    group.bench_function("10mb_sequential", |b| {
+        let harness = TestHarness::new();
+        let data = vec![0xBBu8; BLOCK_SIZE];
+        let blocks_per_10mb = 10 * 1024 * 1024 / BLOCK_SIZE;
+
+        b.iter(|| {
+            for i in 0..blocks_per_10mb {
+                harness.cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_random_writes,
     bench_sequential_reads,
+    bench_sequential_writes,
     bench_mixed_workload,
     bench_write_coalescing,
+    bench_concurrent_access,
     bench_real_world_workloads,
     bench_drain_latency,
 );

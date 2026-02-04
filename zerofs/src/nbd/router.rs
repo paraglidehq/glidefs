@@ -553,4 +553,309 @@ impl ExportRouter {
         info!("All exports shut down");
         Ok(())
     }
+
+    /// Create a minimal router for testing protocol handling.
+    /// Uses a temporary directory and in-memory S3.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let temp_dir = std::env::temp_dir().join(format!("zerofs-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create test cache dir");
+
+        Self::new(
+            s3,
+            "test".to_string(),
+            temp_dir,
+            128 * 1024, // 128KB blocks
+            10,         // 10 blocks per batch
+            100,        // 100ms sync delay
+            "test-node".to_string(),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn create_test_router(temp_dir: &TempDir) -> ExportRouter {
+        let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        ExportRouter::new(
+            s3,
+            "test".to_string(),
+            temp_dir.path().to_path_buf(),
+            128 * 1024, // 128KB blocks
+            10,         // 10 blocks per batch
+            100,        // 100ms sync delay
+            "test-node".to_string(),
+        )
+    }
+
+    fn test_export_config(name: &str) -> ExportConfig {
+        ExportConfig {
+            name: name.to_string(),
+            size_gb: 0.01, // 10MB
+            s3_prefix: None,
+            block_size: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_export_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let result = router.create_export(test_export_config("vol1"), false).await;
+        assert!(result.is_ok(), "Should create export successfully");
+
+        let exports = router.list_exports().await;
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].name, "vol1");
+    }
+
+    #[tokio::test]
+    async fn test_create_export_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Create export twice
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+        let result = router.create_export(test_export_config("vol1"), false).await;
+
+        // Second create should succeed (idempotent)
+        assert!(result.is_ok(), "Second create should succeed (idempotent)");
+
+        // Should still have only one export
+        let exports = router.list_exports().await;
+        assert_eq!(exports.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_export_readonly() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), true).await.unwrap();
+
+        let exports = router.list_exports().await;
+        assert_eq!(exports.len(), 1);
+        assert!(exports[0].readonly, "Export should be readonly");
+    }
+
+    #[tokio::test]
+    async fn test_get_handler_existing() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+
+        let handler = router.get_handler("vol1").await;
+        assert!(handler.is_some(), "Should return handler for existing export");
+    }
+
+    #[tokio::test]
+    async fn test_get_handler_nonexistent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let handler = router.get_handler("nonexistent").await;
+        assert!(handler.is_none(), "Should return None for nonexistent export");
+    }
+
+    #[tokio::test]
+    async fn test_list_exports_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let exports = router.list_exports().await;
+        assert!(exports.is_empty(), "Should return empty list");
+    }
+
+    #[tokio::test]
+    async fn test_list_exports_multiple() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+        router.create_export(test_export_config("vol2"), true).await.unwrap();
+        router.create_export(test_export_config("vol3"), false).await.unwrap();
+
+        let exports = router.list_exports().await;
+        assert_eq!(exports.len(), 3);
+
+        let names: Vec<_> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"vol1"));
+        assert!(names.contains(&"vol2"));
+        assert!(names.contains(&"vol3"));
+    }
+
+    #[tokio::test]
+    async fn test_drain_export_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+
+        // Write some data through the handler
+        let handler = router.get_handler("vol1").await.unwrap();
+        let data = vec![0xAB; 4096];
+        handler.write(0, &data, false).unwrap();
+
+        // Drain should succeed
+        let result = router.drain_export("vol1").await;
+        assert!(result.is_ok(), "Drain should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_drain_export_nonexistent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let result = router.drain_export("nonexistent").await;
+        assert!(result.is_err(), "Drain should fail for nonexistent export");
+
+        match result.unwrap_err() {
+            RouterError::ExportNotFound(name) => assert_eq!(name, "nonexistent"),
+            e => panic!("Expected ExportNotFound, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_export_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+        assert_eq!(router.list_exports().await.len(), 1);
+
+        let result = router.remove_export("vol1", false).await;
+        assert!(result.is_ok(), "Remove should succeed");
+
+        assert_eq!(router.list_exports().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_export_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Remove nonexistent export should succeed (idempotent)
+        let result = router.remove_export("nonexistent", false).await;
+        assert!(result.is_ok(), "Remove nonexistent should succeed (idempotent)");
+    }
+
+    #[tokio::test]
+    async fn test_remove_export_with_purge() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+
+        // Write some data to create cache files
+        let handler = router.get_handler("vol1").await.unwrap();
+        handler.write(0, &[0xAB; 4096], false).unwrap();
+
+        // Remove with purge
+        router.remove_export("vol1", true).await.unwrap();
+
+        // Cache files should be deleted (we can verify by trying to re-create)
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+        // Should succeed without "file exists" errors
+    }
+
+    #[tokio::test]
+    async fn test_promote_export_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Create readonly export
+        router.create_export(test_export_config("vol1"), true).await.unwrap();
+
+        let exports = router.list_exports().await;
+        assert!(exports[0].readonly, "Should be readonly initially");
+
+        // Promote to read-write
+        let result = router.promote_export("vol1").await;
+        assert!(result.is_ok(), "Promote should succeed");
+
+        let exports = router.list_exports().await;
+        assert!(!exports[0].readonly, "Should be read-write after promote");
+    }
+
+    #[tokio::test]
+    async fn test_promote_export_nonexistent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let result = router.promote_export("nonexistent").await;
+        assert!(result.is_err(), "Promote should fail for nonexistent export");
+    }
+
+    #[tokio::test]
+    async fn test_get_export_metrics() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+
+        // Write some data
+        let handler = router.get_handler("vol1").await.unwrap();
+        handler.write(0, &[0xAB; 4096], false).unwrap();
+
+        let metrics = router.get_export_metrics("vol1").await;
+        assert!(metrics.is_some(), "Should return metrics");
+
+        let m = metrics.unwrap();
+        assert!(m.guest_write_ops >= 1, "Should have recorded write");
+    }
+
+    #[tokio::test]
+    async fn test_get_export_metrics_nonexistent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let metrics = router.get_export_metrics("nonexistent").await;
+        assert!(metrics.is_none(), "Should return None for nonexistent");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_all_exports() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+        router.create_export(test_export_config("vol2"), false).await.unwrap();
+
+        let result = router.shutdown().await;
+        assert!(result.is_ok(), "Shutdown should succeed");
+
+        // After shutdown, list should be empty
+        let exports = router.list_exports().await;
+        assert!(exports.is_empty(), "Should have no exports after shutdown");
+    }
+
+    #[tokio::test]
+    async fn test_export_isolation() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false).await.unwrap();
+        router.create_export(test_export_config("vol2"), false).await.unwrap();
+
+        let handler1 = router.get_handler("vol1").await.unwrap();
+        let handler2 = router.get_handler("vol2").await.unwrap();
+
+        // Write different data to each export
+        handler1.write(0, &[0x11; 4096], false).unwrap();
+        handler2.write(0, &[0x22; 4096], false).unwrap();
+
+        // Read back and verify isolation
+        let data1 = handler1.read(0, 4096).await.unwrap();
+        let data2 = handler2.read(0, 4096).await.unwrap();
+
+        assert!(data1.iter().all(|&b| b == 0x11), "vol1 should have 0x11");
+        assert!(data2.iter().all(|&b| b == 0x22), "vol2 should have 0x22");
+    }
 }

@@ -8,4 +8,5 @@
 
 mod failure_injection;
 mod live_migration;
+mod property_tests;
 mod wake_any_node;

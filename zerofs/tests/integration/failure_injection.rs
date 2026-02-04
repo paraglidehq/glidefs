@@ -16,7 +16,7 @@ use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use tempfile::TempDir;
 
@@ -87,7 +87,6 @@ impl std::fmt::Display for FailingObjectStore {
 }
 
 #[async_trait]
-#[allow(deprecated)]
 impl ObjectStore for FailingObjectStore {
     async fn put_opts(
         &self,
@@ -110,7 +109,7 @@ impl ObjectStore for FailingObjectStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -183,12 +182,12 @@ fn create_test_cache(
 // FAILURE INJECTION TESTS
 // =============================================================================
 
-/// Test: S3 failure during drain returns error and preserves dirty blocks.
+/// Test: S3 failure during batched sync marks blocks for retry.
 ///
 /// This verifies that transient S3 failures don't cause data loss.
-/// Blocks that fail to sync should remain dirty and be retried.
+/// Blocks that fail to sync should be marked as dirty again.
 #[tokio::test]
-async fn test_s3_failure_during_drain_preserves_blocks() {
+async fn test_s3_failure_during_sync_marks_blocks_dirty() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
     let (cache, s3_store, _metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
@@ -201,18 +200,22 @@ async fn test_s3_failure_during_drain_preserves_blocks() {
 
     assert_eq!(cache.dirty_block_count(), 5, "Should have 5 dirty blocks");
 
+    // Claim blocks for sync
+    let claimed = cache.claim_dirty_blocks(5);
+    assert_eq!(claimed.len(), 5);
+    assert_eq!(cache.dirty_block_count(), 0, "Dirty count should be 0 after claim");
+    assert_eq!(cache.syncing_block_count(), 5, "Syncing count should be 5");
+
     // Enable S3 failures
     s3.set_fail_puts(true);
 
-    // Attempt to drain - should fail
-    let result = cache.drain_for_snapshot(&s3_store).await;
-    assert!(result.is_err(), "Drain should fail when S3 is unavailable");
+    // Attempt to sync - will fail, but blocks should be re-queued
+    let synced = cache.sync_blocks_batched(&s3_store, claimed).await.unwrap();
+    assert_eq!(synced, 0, "No blocks should have synced");
 
-    // Blocks should still be dirty (not lost)
-    assert!(
-        cache.dirty_block_count() > 0,
-        "Blocks should still be dirty after failure"
-    );
+    // Blocks should be back in dirty state (re-queued)
+    assert_eq!(cache.dirty_block_count(), 5, "Blocks should be dirty again after failure");
+    assert_eq!(cache.syncing_block_count(), 0, "No blocks should be syncing");
 
     // Disable failures and retry
     s3.set_fail_puts(false);
@@ -534,11 +537,16 @@ async fn test_data_integrity_after_failure_recovery() {
         cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
     }
 
-    // Fail first drain attempt
+    // Claim and fail first sync attempt
+    let claimed = cache.claim_dirty_blocks(20);
     s3.set_fail_puts(true);
-    let _ = cache.drain_for_snapshot(&s3_store).await;
+    let synced = cache.sync_blocks_batched(&s3_store, claimed).await.unwrap();
+    assert_eq!(synced, 0, "First sync should fail");
 
-    // Succeed on retry
+    // Blocks should be re-queued
+    assert!(cache.dirty_block_count() > 0, "Blocks should be dirty after failure");
+
+    // Now succeed on drain
     s3.set_fail_puts(false);
     cache.drain_for_snapshot(&s3_store).await.unwrap();
 

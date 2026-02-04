@@ -65,13 +65,11 @@ jobs:
 
           [servers.nbd]
           addresses = ["127.0.0.1:10809"]
+          api_address = "127.0.0.1:8080"
 
           [[servers.nbd.exports]]
           name = "bench-device"
           size_gb = 10.0
-
-          [servers.api]
-          address = "127.0.0.1:8080"
 
           [aws]
           access_key_id = "minioadmin"

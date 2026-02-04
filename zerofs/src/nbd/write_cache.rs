@@ -58,22 +58,26 @@ const DIRECT_IO_ALIGNMENT: usize = 4096;
 ///
 /// Uses separate file descriptors for different workloads to reduce kernel-level
 /// contention during mixed workloads (each FD has its own kernel state):
-/// - `read_file`: NBD reads (hot path for guest I/O)
-/// - `write_file`: NBD writes (hot path for guest I/O)
-/// - `sync_read_file`: Background sync worker reads (for S3 uploads)
+/// - `read_file`: NBD reads (hot path for guest I/O) - buffered for page cache benefits
+/// - `write_file`: NBD writes (hot path for guest I/O) - buffered for page cache benefits
+/// - `sync_read_file`: Background sync worker reads (for S3 uploads) - O_DIRECT to bypass page cache
+///
+/// The sync worker uses O_DIRECT to avoid polluting/contending with the page cache
+/// that NBD reads rely on. This eliminates the mixed workload performance degradation
+/// caused by the sync worker re-reading recently written blocks.
 #[derive(Debug)]
 pub struct SyncFile {
-    /// File descriptor used exclusively for NBD reads (pread)
+    /// File descriptor used exclusively for NBD reads (pread) - buffered I/O
     read_file: File,
-    /// File descriptor used exclusively for NBD writes (pwrite)
+    /// File descriptor used exclusively for NBD writes (pwrite) - buffered I/O
     write_file: File,
     /// File descriptor used exclusively for sync worker reads (pread)
-    /// Isolated from NBD reads to prevent contention during S3 uploads
+    /// Uses O_DIRECT to bypass page cache and avoid contention with NBD reads
     sync_read_file: File,
-    /// Whether direct I/O is enabled (O_DIRECT on Linux, F_NOCACHE on macOS).
-    /// When true on Linux, I/O must use aligned buffers.
+    /// Whether direct I/O is enabled for sync reads (O_DIRECT on Linux, F_NOCACHE on macOS).
+    /// When true on Linux, sync reads must use aligned buffers.
     #[allow(dead_code)] // Used on Linux for alignment decisions
-    direct_io: bool,
+    sync_direct_io: bool,
 }
 
 impl SyncFile {
@@ -88,7 +92,7 @@ impl SyncFile {
             read_file,
             write_file: file,
             sync_read_file,
-            direct_io: false,
+            sync_direct_io: false,
         }
     }
 
@@ -118,32 +122,37 @@ impl SyncFile {
 
     #[cfg(target_os = "linux")]
     fn open_direct_linux(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
-        // Try O_DIRECT first
-        let result = OpenOptions::new()
+        // Open read and write FDs as buffered (for NBD hot path, benefits from page cache)
+        let write_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(create)
             .truncate(false)
+            .open(path)?;
+
+        Self::setup_file_size(&write_file, device_size)?;
+        let read_file = write_file.try_clone()?;
+
+        // Try O_DIRECT for sync worker FD only (bypasses page cache to avoid contention)
+        let sync_result = OpenOptions::new()
+            .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(path);
 
-        match result {
-            Ok(write_file) => {
-                Self::setup_file_size(&write_file, device_size)?;
-                // Duplicate for separate handles
-                let read_file = write_file.try_clone()?;
-                let sync_read_file = write_file.try_clone()?;
-                info!(path = %path.display(), "opened cache file with O_DIRECT (3 separate FDs)");
-                Ok(SyncFile { read_file, write_file, sync_read_file, direct_io: true })
+        match sync_result {
+            Ok(sync_read_file) => {
+                info!(path = %path.display(), "opened cache file: buffered r/w, O_DIRECT sync");
+                Ok(SyncFile { read_file, write_file, sync_read_file, sync_direct_io: true })
             }
             Err(e) => {
-                // O_DIRECT not supported (e.g., tmpfs), fall back to buffered
+                // O_DIRECT not supported (e.g., tmpfs), fall back to buffered for sync too
                 warn!(
                     path = %path.display(),
                     error = %e,
-                    "O_DIRECT not supported, falling back to buffered I/O"
+                    "O_DIRECT not supported for sync, using buffered I/O for all"
                 );
-                Self::open_buffered(path, create, device_size)
+                let sync_read_file = write_file.try_clone()?;
+                Ok(SyncFile { read_file, write_file, sync_read_file, sync_direct_io: false })
             }
         }
     }
@@ -152,6 +161,7 @@ impl SyncFile {
     fn open_direct_macos(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
         use std::os::unix::io::AsRawFd;
 
+        // Open read and write FDs as buffered (for NBD hot path, benefits from page cache)
         let write_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -159,8 +169,15 @@ impl SyncFile {
             .truncate(false)
             .open(path)?;
 
-        // Enable F_NOCACHE to bypass the unified buffer cache
-        let fd = write_file.as_raw_fd();
+        Self::setup_file_size(&write_file, device_size)?;
+        let read_file = write_file.try_clone()?;
+
+        // Open a separate FD for sync worker and apply F_NOCACHE to bypass cache
+        let sync_read_file = OpenOptions::new()
+            .read(true)
+            .open(path)?;
+
+        let fd = sync_read_file.as_raw_fd();
         let result = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
 
         if result == -1 {
@@ -168,20 +185,13 @@ impl SyncFile {
             warn!(
                 path = %path.display(),
                 error = %err,
-                "F_NOCACHE not supported, using buffered I/O"
+                "F_NOCACHE not supported for sync, using buffered I/O for all"
             );
-            Self::setup_file_size(&write_file, device_size)?;
-            let read_file = write_file.try_clone()?;
-            let sync_read_file = write_file.try_clone()?;
-            return Ok(SyncFile { read_file, write_file, sync_read_file, direct_io: false });
+            Ok(SyncFile { read_file, write_file, sync_read_file, sync_direct_io: false })
+        } else {
+            info!(path = %path.display(), "opened cache file: buffered r/w, F_NOCACHE sync");
+            Ok(SyncFile { read_file, write_file, sync_read_file, sync_direct_io: true })
         }
-
-        Self::setup_file_size(&write_file, device_size)?;
-        // Duplicate for separate handles (F_NOCACHE is per-fd, so duplicated fds also have it)
-        let read_file = write_file.try_clone()?;
-        let sync_read_file = write_file.try_clone()?;
-        info!(path = %path.display(), "opened cache file with F_NOCACHE (3 separate FDs)");
-        Ok(SyncFile { read_file, write_file, sync_read_file, direct_io: true })
     }
 
     #[allow(dead_code)] // Used on platforms without direct I/O or as fallback
@@ -198,7 +208,7 @@ impl SyncFile {
         let read_file = write_file.try_clone()?;
         let sync_read_file = write_file.try_clone()?;
         info!(path = %path.display(), "opened cache file with buffered I/O (3 separate FDs)");
-        Ok(SyncFile { read_file, write_file, sync_read_file, direct_io: false })
+        Ok(SyncFile { read_file, write_file, sync_read_file, sync_direct_io: false })
     }
 
     fn setup_file_size(file: &File, device_size: u64) -> std::io::Result<()> {
@@ -210,27 +220,20 @@ impl SyncFile {
     }
 
     /// Read exact bytes at a specific offset (pread).
-    /// Uses the dedicated read file descriptor to avoid contention with writes.
-    ///
-    /// On Linux with O_DIRECT, uses an aligned intermediate buffer if needed.
+    /// Uses the dedicated read file descriptor (buffered I/O for page cache benefits).
     #[inline]
     pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if self.direct_io && !Self::is_aligned(buf.as_ptr() as usize, buf.len(), offset) {
-            return self.read_exact_at_aligned(buf, offset);
-        }
-
         self.read_file.read_exact_at(buf, offset)
     }
 
     /// Read exact bytes using the sync worker's dedicated file descriptor.
-    /// Isolated from NBD reads to prevent contention during S3 uploads.
+    /// Uses O_DIRECT to bypass page cache and avoid contention with NBD reads.
     ///
     /// On Linux with O_DIRECT, uses an aligned intermediate buffer if needed.
     #[inline]
     pub fn sync_read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
-        if self.direct_io && !Self::is_aligned(buf.as_ptr() as usize, buf.len(), offset) {
+        if self.sync_direct_io && !Self::is_aligned(buf.as_ptr() as usize, buf.len(), offset) {
             return self.sync_read_exact_at_aligned(buf, offset);
         }
 
@@ -238,16 +241,9 @@ impl SyncFile {
     }
 
     /// Write all bytes at a specific offset (pwrite).
-    /// Uses the dedicated write file descriptor to avoid contention with reads.
-    ///
-    /// On Linux with O_DIRECT, uses an aligned intermediate buffer if needed.
+    /// Uses the dedicated write file descriptor (buffered I/O for page cache benefits).
     #[inline]
     pub fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if self.direct_io && !Self::is_aligned(buf.as_ptr() as usize, buf.len(), offset) {
-            return self.write_all_at_aligned(buf, offset);
-        }
-
         self.write_file.write_all_at(buf, offset)
     }
 

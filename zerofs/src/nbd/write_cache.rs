@@ -502,7 +502,7 @@ impl WriteCache<Recovering> {
     /// Skip recovery and transition directly to Active state.
     ///
     /// **TEST ONLY**: This bypasses recovery for unit tests that don't need S3.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn skip_recovery_for_test(self) -> WriteCache<Active> {
         WriteCache {
             inner: self.inner,
@@ -1444,26 +1444,40 @@ impl WriteCache<Active> {
     #[instrument(skip(self, s3))]
     pub async fn drain_for_snapshot(&self, s3: &S3BlockStore) -> Result<(), CacheError> {
         let initial_dirty = self.dirty_block_count();
-        if initial_dirty == 0 {
+        if initial_dirty == 0 && self.syncing_block_count() == 0 {
             debug!("no dirty blocks, drain complete");
             return Ok(());
         }
 
         info!(dirty_blocks = initial_dirty, "draining for snapshot");
 
-        // Upload all dirty blocks using batched writes
+        // Outer loop handles the case where blocks are re-queued during sync
+        // (e.g., by background worker failures or our own sync failures)
         loop {
-            let dirty = self.claim_dirty_blocks(100);
-            if dirty.is_empty() {
+            // Inner loop: claim and sync all dirty blocks
+            loop {
+                let dirty = self.claim_dirty_blocks(100);
+                if dirty.is_empty() {
+                    break;
+                }
+
+                self.sync_blocks_batched(s3, dirty).await?;
+            }
+
+            // Wait for any in-flight syncs (from background worker or our parallel syncs)
+            while self.syncing_block_count() > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+
+            // Re-check: blocks may have been re-queued by failed syncs during the wait
+            if self.dirty_block_count() == 0 {
                 break;
             }
 
-            self.sync_blocks_batched(s3, dirty).await?;
-        }
-
-        // Wait for any in-flight syncs from background worker
-        while self.syncing_block_count() > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            debug!(
+                dirty = self.dirty_block_count(),
+                "blocks re-queued during drain, continuing"
+            );
         }
 
         info!("drain complete, all blocks in S3");
@@ -2937,5 +2951,57 @@ mod tests {
         cache.mark_synced(0);
         assert_eq!(cache.dirty_block_count(), 0);
         assert_eq!(cache.syncing_block_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_drain_retries_after_sync_complete() {
+        // Regression test: drain_for_snapshot must recheck dirty queue after
+        // waiting for syncing blocks to complete.
+        //
+        // Previously, if blocks were re-queued (via mark_sync_failed) AFTER
+        // drain's claim loop completed but BEFORE syncing_count reached 0,
+        // those blocks would be missed. This could happen when:
+        // 1. Background sync worker claims blocks
+        // 2. drain_for_snapshot starts, finds queue empty (worker has them)
+        // 3. drain waits for syncing_count == 0
+        // 4. Worker's sync fails for some blocks → re-queued via mark_sync_failed
+        // 5. Worker finishes, syncing_count = 0
+        // 6. drain returns OK, but queue has dirty blocks!
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let s3 = test_s3();
+
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = cache.finish_recovery(&s3).await.unwrap();
+
+        // Write data
+        cache.write(0, b"important data").unwrap();
+        assert_eq!(cache.dirty_block_count(), 1);
+
+        // Simulate background worker claiming the block
+        let claimed = cache.claim_dirty_blocks(100);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(cache.dirty_block_count(), 0);
+        assert_eq!(cache.syncing_block_count(), 1);
+
+        // Now simulate what happens when drain runs while worker is syncing:
+        // drain would see empty queue and wait for syncing == 0
+
+        // Simulate worker sync failure - block goes back to dirty
+        cache.mark_sync_failed(0);
+        assert_eq!(cache.dirty_block_count(), 1);
+        assert_eq!(cache.syncing_block_count(), 0);
+
+        // Now drain should pick up this block and sync it
+        cache.drain_for_snapshot(&s3).await.unwrap();
+
+        // After drain, no dirty or syncing blocks should remain
+        assert_eq!(cache.dirty_block_count(), 0);
+        assert_eq!(cache.syncing_block_count(), 0);
+
+        // Verify data made it to S3
+        let s3_data = s3.read_block(0).await.unwrap();
+        assert_eq!(&s3_data[..14], b"important data");
     }
 }

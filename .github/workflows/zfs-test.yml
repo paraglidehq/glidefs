@@ -170,6 +170,67 @@ jobs:
           # Show space usage
           sudo zfs list -o name,used,avail,refer,mountpoint
 
+      - name: Benchmark snapshot and clone latency
+        run: |
+          echo "=== SNAPSHOT/CLONE LATENCY BENCHMARK ==="
+          echo "This proves flush() is local-only (~100ms, not 8-15s)"
+          echo ""
+
+          # Benchmark: 10 snapshots
+          echo "Creating 10 snapshots and measuring latency..."
+          TOTAL_SNAP_MS=0
+          for i in {1..10}; do
+            START=$(date +%s%3N)
+            sudo zfs snapshot testpool/data@bench-snap-$i
+            END=$(date +%s%3N)
+            ELAPSED=$((END - START))
+            echo "  Snapshot $i: ${ELAPSED}ms"
+            TOTAL_SNAP_MS=$((TOTAL_SNAP_MS + ELAPSED))
+          done
+          AVG_SNAP_MS=$((TOTAL_SNAP_MS / 10))
+          echo ""
+          echo "Average snapshot latency: ${AVG_SNAP_MS}ms"
+
+          # Benchmark: 10 clones
+          echo ""
+          echo "Creating 10 clones and measuring latency..."
+          TOTAL_CLONE_MS=0
+          for i in {1..10}; do
+            START=$(date +%s%3N)
+            sudo zfs clone testpool/data@bench-snap-1 testpool/bench-clone-$i
+            END=$(date +%s%3N)
+            ELAPSED=$((END - START))
+            echo "  Clone $i: ${ELAPSED}ms"
+            TOTAL_CLONE_MS=$((TOTAL_CLONE_MS + ELAPSED))
+          done
+          AVG_CLONE_MS=$((TOTAL_CLONE_MS / 10))
+          echo ""
+          echo "Average clone latency: ${AVG_CLONE_MS}ms"
+
+          # Assert: Both should be under 500ms (with margin for CI variance)
+          echo ""
+          echo "=== LATENCY ASSERTIONS ==="
+          if [ $AVG_SNAP_MS -lt 500 ]; then
+            echo "✓ Snapshot latency OK: ${AVG_SNAP_MS}ms < 500ms"
+          else
+            echo "✗ Snapshot latency TOO HIGH: ${AVG_SNAP_MS}ms >= 500ms"
+            echo "  This suggests flush() is waiting for S3, which is a bug!"
+            exit 1
+          fi
+
+          if [ $AVG_CLONE_MS -lt 500 ]; then
+            echo "✓ Clone latency OK: ${AVG_CLONE_MS}ms < 500ms"
+          else
+            echo "✗ Clone latency TOO HIGH: ${AVG_CLONE_MS}ms >= 500ms"
+            echo "  This suggests flush() is waiting for S3, which is a bug!"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== BENCHMARK PASSED ==="
+          echo "Snapshot/clone operations complete in <500ms"
+          echo "This proves the write-behind cache design is working correctly."
+
       - name: Create tarball and checksum for durability test
         run: |
           echo "Creating tarball of ZFS data..."

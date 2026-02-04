@@ -35,5 +35,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --verbose
-      - name: Run tests
+      - name: Run unit tests
         run: cargo test --verbose
+      - name: Run integration tests
+        run: cargo test --features test-utils --test integration --verbose
+
+  benchmarks:
+    name: Benchmarks (Dry Run)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zerofs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build benchmarks
+        run: cargo build --features test-utils --benches
+      - name: Run flush latency benchmark (short)
+        run: cargo bench --features test-utils -- --warm-up-time 1 --measurement-time 3

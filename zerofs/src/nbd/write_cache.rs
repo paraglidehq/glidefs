@@ -1229,6 +1229,8 @@ impl WriteCache<Active> {
         {
             self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
             self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+            // Re-queue for retry - without this, drain would miss failed blocks
+            self.inner.dirty_queue.push(block_num);
         }
     }
 
@@ -1372,15 +1374,15 @@ impl WriteCache<Active> {
                     }
 
                     // Only PUT if we actually modified the batch
-                    if batch_modified {
-                        if let Err(e) = s3.put_batch_conditional(batch_num, batch_data, etag).await {
-                            // Mark all blocks in this batch as failed
-                            for block_num in &blocks_in_batch {
-                                self.mark_sync_failed(*block_num);
-                            }
-                            warn!(batch = batch_num, error = %e, "failed to upload batch");
-                            return;
+                    if batch_modified
+                        && let Err(e) = s3.put_batch_conditional(batch_num, batch_data, etag).await
+                    {
+                        // Mark all blocks in this batch as failed
+                        for block_num in &blocks_in_batch {
+                            self.mark_sync_failed(*block_num);
                         }
+                        warn!(batch = batch_num, error = %e, "failed to upload batch");
+                        return;
                     }
 
                     // Mark all blocks in this batch as synced
@@ -2885,5 +2887,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_mark_sync_failed_requeues_block() {
+        // Regression test: mark_sync_failed must re-queue blocks for retry.
+        //
+        // Previously, mark_sync_failed would transition blocks from Syncing→Dirty
+        // but NOT push them back onto the dirty_queue. This caused drain_for_snapshot
+        // to complete prematurely, leaving data only in the local cache (not S3).
+        //
+        // This would manifest as "cannot import pool: one or more devices unavailable"
+        // after NBD disconnect/reconnect because ZFS metadata never made it to S3.
+
+        let dir = TempDir::new().unwrap();
+        let config = test_config(dir.path());
+        let s3 = test_s3();
+
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = cache.finish_recovery(&s3).await.unwrap();
+
+        // Write data to a block
+        cache.write(0, b"important data").unwrap();
+        assert_eq!(cache.dirty_block_count(), 1);
+
+        // Claim the block (simulating sync worker starting)
+        let claimed = cache.claim_dirty_blocks(100);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(cache.dirty_block_count(), 0);
+        assert_eq!(cache.syncing_block_count(), 1);
+
+        // Simulate sync failure
+        cache.mark_sync_failed(0);
+
+        // Block should be back to dirty
+        assert_eq!(cache.dirty_block_count(), 1);
+        assert_eq!(cache.syncing_block_count(), 0);
+
+        // CRITICAL: Block must be re-claimable (this was the bug)
+        let reclaimed = cache.claim_dirty_blocks(100);
+        assert_eq!(
+            reclaimed.len(),
+            1,
+            "failed blocks must be re-queued for retry"
+        );
+        assert_eq!(reclaimed[0], 0);
+
+        // Now mark as synced to complete the test
+        cache.mark_synced(0);
+        assert_eq!(cache.dirty_block_count(), 0);
+        assert_eq!(cache.syncing_block_count(), 0);
     }
 }

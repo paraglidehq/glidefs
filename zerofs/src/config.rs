@@ -143,7 +143,7 @@ impl NbdConfig {
     pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 100;
     pub const DEFAULT_DEVICE_SIZE_GB: f64 = 100.0;
     pub const DEFAULT_DEVICE_NAME: &'static str = "zerofs";
-    pub const DEFAULT_SYNC_DELAY_MS: u64 = 3000;  // 3 seconds - balances durability vs write amp
+    pub const DEFAULT_SYNC_DELAY_MS: u64 = 5000;  // 5 seconds - balances durability vs write amp
 
     pub fn block_size(&self) -> usize {
         self.block_size.unwrap_or(Self::DEFAULT_BLOCK_SIZE)

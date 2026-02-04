@@ -1670,12 +1670,12 @@ impl Default for SyncWorkerConfig {
             batch_size: 100,
             // 1 concurrent S3 upload - minimizes I/O contention with reads
             max_concurrent_uploads: 1,
-            // 3 second sync interval: balances durability vs write amplification.
+            // 5 second sync interval: balances durability vs write amplification.
             // Longer interval = more writes coalesce = less S3 traffic.
             // Recently written blocks are likely still in page cache when sync reads them.
-            hot_batch_cooldown: std::time::Duration::from_secs(3),
+            hot_batch_cooldown: std::time::Duration::from_secs(5),
             // After 10 deferrals, force sync even if batch is hot
-            // At 3s cooldown, this means ~30 second max delay
+            // At 5s cooldown, this means ~50 second max delay
             max_deferrals: 10,
             metadata_save_interval: 10,
             // 1000 blocks @ 128KB = 128MB uncommitted - time to investigate

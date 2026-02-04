@@ -39,6 +39,7 @@ Compute Node (ONE zerofs process):
 ```
 Guest write → NBD handler → WriteCache (local SSD)
                                ├── Write to local file
+                               ├── Capture block data in memory (DashMap)
                                ├── Mark block present (atomic OR)
                                ├── Mark block dirty (CAS)
                                ├── Push to dirty_queue (lock-free)
@@ -49,6 +50,8 @@ Guest write → NBD handler → WriteCache (local SSD)
 ```
 
 The key insight: FLUSH returns after local SSD fsync, not after S3 sync. This makes ZFS snapshot/clone operations fast (~100ms instead of ~10s).
+
+**DashMap optimization**: Dirty block data is captured in memory at write time. This allows the sync worker to read from memory instead of re-reading from disk, eliminating I/O contention during mixed read/write workloads.
 
 ### Read Path (Read-Through Caching)
 
@@ -195,6 +198,7 @@ impl WriteCache<Active> {
 - `block_states`: `AtomicU8` array with CAS for state transitions
 - `present_chunks`: `AtomicU64` bitmap with atomic OR
 - `dirty_queue`: Lock-free `SegQueue<u64>` for O(1) dirty block tracking
+- `dirty_data`: `DashMap<u64, Bytes>` holds dirty block data in memory for sync worker
 - `dirty_notify`: `Notify` to wake sync worker on writes
 
 ### S3BlockStore (`nbd/block_store.rs`)
@@ -257,9 +261,12 @@ loop {
             // Sync: GET-modify-PUT
             batch_data = s3.get_batch_or_empty(batch_num);
             for block in blocks {
-                batch_data[offset] = local_cache.read(block);
+                // Read from in-memory DashMap (no disk I/O!)
+                batch_data[offset] = dirty_data.get(block);
             }
             s3.put_batch(batch_num, batch_data);
+            // Remove from memory after successful sync
+            for block in blocks { dirty_data.remove(block); }
             mark_hot(batch_num);  // Track for cooldown
         }
     }
@@ -269,6 +276,7 @@ loop {
 **Design**:
 - **Event-driven**: Sleeps when idle, wakes instantly on writes
 - **O(1) dirty tracking**: Lock-free queue (`SegQueue`) - no scanning
+- **In-memory dirty data**: DashMap holds block data until synced (no disk re-reads)
 - **Lease fencing**: Stops immediately if lease lost
 - **Hot batch deferral**: Recently-synced batches are deferred to reduce write amplification
 - **Back-pressure**: Warnings/errors when dirty queue exceeds thresholds
@@ -433,7 +441,7 @@ unix_socket = "/run/zerofs/nbd.sock"
 api_address = "127.0.0.1:8080"
 block_size = 131072      # 128KB (default)
 blocks_per_batch = 100   # S3 batching: 100 blocks × 128KB = 12.8MB per PUT
-sync_delay_ms = 100      # Write coalescing delay (maps to hot batch cooldown)
+sync_delay_ms = 3000     # Write coalescing delay (maps to hot batch cooldown, default 3s)
 
 [[servers.nbd.exports]]
 name = "vm-001"
@@ -452,7 +460,7 @@ block_size = 16384           # Optional, 16KB for database workloads
 |----------|---------|-----------|
 | `block_size` | 128KB | Match ZFS recordsize |
 | `blocks_per_batch` | 100 | Balance PUT cost vs latency |
-| `sync_delay_ms` | 100ms | Write coalescing / hot batch cooldown |
+| `sync_delay_ms` | 3000ms | Write coalescing / hot batch cooldown (3s balances durability vs write amp) |
 | `cache.dir` | ~/.cache/zerofs | Local SSD cache location |
 | `cache.disk_size_gb` | required | Cache size on disk |
 | `cache.memory_size_gb` | none | Optional in-memory cache |
@@ -511,7 +519,7 @@ Batches that were recently synced are marked "hot" and deferred:
 ```
 Write to block 42 (batch 0) → sync batch 0 to S3 → mark batch 0 hot
 Write to block 43 (batch 0) → batch 0 is hot → defer block 43
-...100ms later...
+...3 seconds later...
 batch 0 cools down → sync block 43 (and any others accumulated)
 ```
 

@@ -807,15 +807,25 @@ impl WriteCache<Active> {
         // Now write to local file (after claiming blocks via set_present)
         self.inner.data_file.write_all_at(data, offset)?;
 
-        // Store block data in memory for sync worker (avoids re-reading from disk).
-        // Read full blocks from file (will be in page cache since we just wrote).
-        for block in start_block..=end_block {
-            let block_offset = block * block_size;
-            let mut buf = vec![0u8; self.inner.config.block_size];
-            // Read from file - will hit page cache since we just wrote
-            self.inner.data_file.read_exact_at(&mut buf, block_offset)?;
-            self.inner.dirty_data.insert(block, Bytes::from(buf));
+        // Buffer full-block writes in memory for sync worker (avoids disk re-read).
+        // For partial-block writes, sync worker falls back to disk read.
+        // This avoids the 32x read amplification of reading 128KB for every 4KB write.
+        let block_size_usize = self.inner.config.block_size;
+        if data.len() >= block_size_usize && offset % block_size == 0 {
+            // Write is block-aligned and covers at least one full block
+            let mut data_offset = 0usize;
+            for block in start_block..=end_block {
+                let remaining = data.len() - data_offset;
+                if remaining >= block_size_usize {
+                    // Full block - buffer it directly from write data (no disk read!)
+                    let block_data = &data[data_offset..data_offset + block_size_usize];
+                    self.inner.dirty_data.insert(block, Bytes::copy_from_slice(block_data));
+                    data_offset += block_size_usize;
+                }
+                // Partial block at end - don't buffer, sync will read from disk
+            }
         }
+        // Partial/unaligned writes: don't buffer, sync worker reads from disk
 
         // Mark affected blocks as dirty (lock-free)
         let mut newly_dirty = false;

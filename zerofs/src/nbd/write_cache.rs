@@ -56,14 +56,20 @@ const DIRECT_IO_ALIGNMENT: usize = 4096;
 /// 3. We never use seek-based read/write which would race on file position
 /// 4. `sync_all()` is safe to call concurrently (just triggers fsync)
 ///
-/// Uses separate file descriptors for reads and writes to reduce kernel-level
-/// contention during mixed workloads (each FD has its own kernel state).
+/// Uses separate file descriptors for different workloads to reduce kernel-level
+/// contention during mixed workloads (each FD has its own kernel state):
+/// - `read_file`: NBD reads (hot path for guest I/O)
+/// - `write_file`: NBD writes (hot path for guest I/O)
+/// - `sync_read_file`: Background sync worker reads (for S3 uploads)
 #[derive(Debug)]
 pub struct SyncFile {
-    /// File descriptor used exclusively for reads (pread)
+    /// File descriptor used exclusively for NBD reads (pread)
     read_file: File,
-    /// File descriptor used exclusively for writes (pwrite)
+    /// File descriptor used exclusively for NBD writes (pwrite)
     write_file: File,
+    /// File descriptor used exclusively for sync worker reads (pread)
+    /// Isolated from NBD reads to prevent contention during S3 uploads
+    sync_read_file: File,
     /// Whether direct I/O is enabled (O_DIRECT on Linux, F_NOCACHE on macOS).
     /// When true on Linux, I/O must use aligned buffers.
     #[allow(dead_code)] // Used on Linux for alignment decisions
@@ -72,14 +78,16 @@ pub struct SyncFile {
 
 impl SyncFile {
     /// Create a new SyncFile from a File (without direct I/O).
-    /// Duplicates the file descriptor to create separate read/write handles.
+    /// Duplicates the file descriptor to create separate handles for each workload.
     #[allow(dead_code)] // Used by tests and fallback paths
     pub fn new(file: File) -> Self {
-        // Duplicate the file descriptor for separate read/write handles
-        let read_file = file.try_clone().expect("failed to duplicate file descriptor");
+        // Duplicate the file descriptor for separate handles
+        let read_file = file.try_clone().expect("failed to duplicate file descriptor for reads");
+        let sync_read_file = file.try_clone().expect("failed to duplicate file descriptor for sync");
         SyncFile {
             read_file,
             write_file: file,
+            sync_read_file,
             direct_io: false,
         }
     }
@@ -122,10 +130,11 @@ impl SyncFile {
         match result {
             Ok(write_file) => {
                 Self::setup_file_size(&write_file, device_size)?;
-                // Duplicate for separate read handle
+                // Duplicate for separate handles
                 let read_file = write_file.try_clone()?;
-                info!(path = %path.display(), "opened cache file with O_DIRECT (separate read/write FDs)");
-                Ok(SyncFile { read_file, write_file, direct_io: true })
+                let sync_read_file = write_file.try_clone()?;
+                info!(path = %path.display(), "opened cache file with O_DIRECT (3 separate FDs)");
+                Ok(SyncFile { read_file, write_file, sync_read_file, direct_io: true })
             }
             Err(e) => {
                 // O_DIRECT not supported (e.g., tmpfs), fall back to buffered
@@ -163,14 +172,16 @@ impl SyncFile {
             );
             Self::setup_file_size(&write_file, device_size)?;
             let read_file = write_file.try_clone()?;
-            return Ok(SyncFile { read_file, write_file, direct_io: false });
+            let sync_read_file = write_file.try_clone()?;
+            return Ok(SyncFile { read_file, write_file, sync_read_file, direct_io: false });
         }
 
         Self::setup_file_size(&write_file, device_size)?;
-        // Duplicate for separate read handle (F_NOCACHE is per-fd, so duplicated fd also has it)
+        // Duplicate for separate handles (F_NOCACHE is per-fd, so duplicated fds also have it)
         let read_file = write_file.try_clone()?;
-        info!(path = %path.display(), "opened cache file with F_NOCACHE (separate read/write FDs)");
-        Ok(SyncFile { read_file, write_file, direct_io: true })
+        let sync_read_file = write_file.try_clone()?;
+        info!(path = %path.display(), "opened cache file with F_NOCACHE (3 separate FDs)");
+        Ok(SyncFile { read_file, write_file, sync_read_file, direct_io: true })
     }
 
     #[allow(dead_code)] // Used on platforms without direct I/O or as fallback
@@ -183,10 +194,11 @@ impl SyncFile {
             .open(path)?;
 
         Self::setup_file_size(&write_file, device_size)?;
-        // Duplicate for separate read handle
+        // Duplicate for separate handles
         let read_file = write_file.try_clone()?;
-        info!(path = %path.display(), "opened cache file with buffered I/O (separate read/write FDs)");
-        Ok(SyncFile { read_file, write_file, direct_io: false })
+        let sync_read_file = write_file.try_clone()?;
+        info!(path = %path.display(), "opened cache file with buffered I/O (3 separate FDs)");
+        Ok(SyncFile { read_file, write_file, sync_read_file, direct_io: false })
     }
 
     fn setup_file_size(file: &File, device_size: u64) -> std::io::Result<()> {
@@ -209,6 +221,20 @@ impl SyncFile {
         }
 
         self.read_file.read_exact_at(buf, offset)
+    }
+
+    /// Read exact bytes using the sync worker's dedicated file descriptor.
+    /// Isolated from NBD reads to prevent contention during S3 uploads.
+    ///
+    /// On Linux with O_DIRECT, uses an aligned intermediate buffer if needed.
+    #[inline]
+    pub fn sync_read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.direct_io && !Self::is_aligned(buf.as_ptr() as usize, buf.len(), offset) {
+            return self.sync_read_exact_at_aligned(buf, offset);
+        }
+
+        self.sync_read_file.read_exact_at(buf, offset)
     }
 
     /// Write all bytes at a specific offset (pwrite).
@@ -242,6 +268,18 @@ impl SyncFile {
         let mut aligned_buf = AlignedBuffer::new(aligned_len);
 
         self.read_file.read_exact_at(aligned_buf.as_mut_slice(), offset)?;
+        buf.copy_from_slice(&aligned_buf.as_slice()[..buf.len()]);
+        Ok(())
+    }
+
+    /// Sync worker read using an aligned intermediate buffer (for O_DIRECT with unaligned input).
+    #[cfg(target_os = "linux")]
+    fn sync_read_exact_at_aligned(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        // Round up to alignment boundary
+        let aligned_len = (buf.len() + DIRECT_IO_ALIGNMENT - 1) & !(DIRECT_IO_ALIGNMENT - 1);
+        let mut aligned_buf = AlignedBuffer::new(aligned_len);
+
+        self.sync_read_file.read_exact_at(aligned_buf.as_mut_slice(), offset)?;
         buf.copy_from_slice(&aligned_buf.as_slice()[..buf.len()]);
         Ok(())
     }
@@ -960,7 +998,8 @@ impl WriteCache<Recovering> {
         let offset = block_num * self.inner.config.block_size as u64;
         let mut buf = vec![0u8; self.inner.config.block_size];
 
-        self.inner.data_file.read_exact_at(&mut buf, offset)?;
+        // Use sync FD to avoid contention with NBD reads during recovery
+        self.inner.data_file.sync_read_exact_at(&mut buf, offset)?;
 
         Ok(Bytes::from(buf))
     }
@@ -1585,6 +1624,14 @@ impl WriteCache<Active> {
         self.read(offset, self.inner.config.block_size)
     }
 
+    /// Read a single block for sync worker (uses isolated FD to avoid NBD read contention).
+    pub fn sync_read_local_block(&self, block_num: u64) -> Result<Bytes, CacheError> {
+        let offset = block_num * self.inner.config.block_size as u64;
+        let mut buf = vec![0u8; self.inner.config.block_size];
+        self.inner.data_file.sync_read_exact_at(&mut buf, offset)?;
+        Ok(Bytes::from(buf))
+    }
+
     /// Get the number of dirty blocks pending sync.
     pub fn dirty_block_count(&self) -> u64 {
         self.inner.dirty_block_count.load(Ordering::Relaxed)
@@ -1694,8 +1741,9 @@ impl WriteCache<Active> {
                     let mut batch_modified = false;
 
                     // Update dirty block slots with local data
+                    // Use sync FD to avoid contention with NBD reads
                     for &block_num in &blocks_in_batch {
-                        let local_data = match self.read_local_block(block_num) {
+                        let local_data = match self.sync_read_local_block(block_num) {
                             Ok(data) => data,
                             Err(e) => {
                                 warn!(block = block_num, error = %e, "failed to read local block");

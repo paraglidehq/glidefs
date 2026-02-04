@@ -13,12 +13,12 @@ jobs:
       - uses: actions/checkout@v4
       
       # Setup persistent cache volume
-      - name: Setup ZeroFS Cache
-        uses: Barre/ZeroFS@main
+      - name: Setup GlideFS Cache
+        uses: Barre/GlideFS@main
         with:
           object-store-url: 's3://my-bucket/ci-cache'
           mount-path: '/mnt/cache'
-          encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+          encryption-password: ${{ secrets.GLIDEFS_PASSWORD }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       

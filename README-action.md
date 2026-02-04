@@ -1,14 +1,14 @@
-# ZeroFS GitHub Action
+# GlideFS GitHub Action
 
 This GitHub Action provides persistent volumes backed by S3-compatible storage for your workflows.
 
 ## Usage
 
 ```yaml
-- uses: Barre/ZeroFS@main
+- uses: Barre/GlideFS@main
   with:
     object-store-url: 's3://bucket/path'
-    encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+    encryption-password: ${{ secrets.GLIDEFS_PASSWORD }}
     aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 ```
@@ -19,10 +19,10 @@ This GitHub Action provides persistent volumes backed by S3-compatible storage f
 |------|-------------|----------|---------|
 | `object-store-url` | Object store URL (e.g. s3://bucket/path) | Yes | - |
 | `encryption-password` | Password for filesystem encryption | Yes | - |
-| `mount-path` | Path where the volume should be mounted | No | `/mnt/zerofs` |
-| `cache-dir` | Directory for SlateDB disk cache | No | `/tmp/zerofs-cache` |
+| `mount-path` | Path where the volume should be mounted | No | `/mnt/glidefs` |
+| `cache-dir` | Directory for SlateDB disk cache | No | `/tmp/glidefs-cache` |
 | `cache-size-gb` | SlateDB disk cache size in GB | No | `1` |
-| `memory-cache-size-gb` | ZeroFS in-memory cache size in GB | No | `0.25` |
+| `memory-cache-size-gb` | GlideFS in-memory cache size in GB | No | `0.25` |
 | `aws-access-key-id` | AWS access key ID (for S3) | No | - |
 | `aws-secret-access-key` | AWS secret access key (for S3) | No | - |
 | `aws-region` | AWS region | No | `us-east-1` |
@@ -32,7 +32,7 @@ This GitHub Action provides persistent volumes backed by S3-compatible storage f
 | `azure-storage-account-key` | Azure storage account key | No | - |
 | `nfs-host` | NFS server host address | No | `127.0.0.1` |
 | `nfs-port` | NFS server port | No | `2049` |
-| `zerofs-version` | ZeroFS version to use | No | `latest` |
+| `glidefs-version` | GlideFS version to use | No | `latest` |
 
 ## Outputs
 

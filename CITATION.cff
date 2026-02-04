@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: ZeroFS
+title: GlideFS
 message: >-
   If you use this software, please cite it using the
   metadata from this file.
@@ -8,6 +8,6 @@ authors:
   - given-names: Pierre
     family-names: Barre
     email: pierre@barre.sh
-repository-code: 'https://github.com/Barre/ZeroFS'
-url: 'https://www.zerofs.net/'
+repository-code: 'https://github.com/Barre/GlideFS'
+url: 'https://www.glidefs.net/'
 license: AGPL-3.0

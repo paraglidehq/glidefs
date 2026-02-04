@@ -11,11 +11,11 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Setup Shared Volume
-        uses: Barre/ZeroFS@main
+        uses: Barre/GlideFS@main
         with:
           object-store-url: 's3://my-bucket/shared-artifacts'
           mount-path: '/mnt/shared'
-          encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+          encryption-password: ${{ secrets.GLIDEFS_PASSWORD }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       
@@ -40,11 +40,11 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Setup Shared Volume
-        uses: Barre/ZeroFS@main
+        uses: Barre/GlideFS@main
         with:
           object-store-url: 's3://my-bucket/shared-artifacts'
           mount-path: '/mnt/shared'
-          encryption-password: ${{ secrets.ZEROFS_PASSWORD }}
+          encryption-password: ${{ secrets.GLIDEFS_PASSWORD }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       

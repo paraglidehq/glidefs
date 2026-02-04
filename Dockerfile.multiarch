@@ -11,42 +11,42 @@ RUN apt-get update && apt-get install -y \
 
 # Copy the appropriate binary based on the target platform
 # Docker buildx provides TARGETPLATFORM in format like "linux/amd64", "linux/arm64", etc.
-COPY zerofs-linux-* /tmp/
+COPY glidefs-linux-* /tmp/
 
 RUN case "${TARGETPLATFORM}" in \
         "linux/amd64") \
-            mv /tmp/zerofs-linux-amd64-pgo /usr/local/bin/zerofs \
+            mv /tmp/glidefs-linux-amd64-pgo /usr/local/bin/glidefs \
             ;; \
         "linux/arm64") \
-            mv /tmp/zerofs-linux-arm64-pgo /usr/local/bin/zerofs \
+            mv /tmp/glidefs-linux-arm64-pgo /usr/local/bin/glidefs \
             ;; \
         "linux/arm/v7") \
-            mv /tmp/zerofs-linux-armv7-pgo /usr/local/bin/zerofs \
+            mv /tmp/glidefs-linux-armv7-pgo /usr/local/bin/glidefs \
             ;; \
         "linux/386") \
-            mv /tmp/zerofs-linux-i686-pgo /usr/local/bin/zerofs \
+            mv /tmp/glidefs-linux-i686-pgo /usr/local/bin/glidefs \
             ;; \
         "linux/ppc64le") \
-            mv /tmp/zerofs-linux-ppc64le-pgo /usr/local/bin/zerofs \
+            mv /tmp/glidefs-linux-ppc64le-pgo /usr/local/bin/glidefs \
             ;; \
         "linux/s390x") \
-            mv /tmp/zerofs-linux-s390x-pgo /usr/local/bin/zerofs \
+            mv /tmp/glidefs-linux-s390x-pgo /usr/local/bin/glidefs \
             ;; \
         "linux/riscv64") \
-            mv /tmp/zerofs-linux-riscv64-pgo /usr/local/bin/zerofs \
+            mv /tmp/glidefs-linux-riscv64-pgo /usr/local/bin/glidefs \
             ;; \
         *) \
             echo "Unsupported platform: ${TARGETPLATFORM}" && exit 1 \
             ;; \
     esac && \
-    rm -f /tmp/zerofs-linux-*-pgo && \
-    chmod +x /usr/local/bin/zerofs
+    rm -f /tmp/glidefs-linux-*-pgo && \
+    chmod +x /usr/local/bin/glidefs
 
-RUN useradd -m -u 1001 zerofs
+RUN useradd -m -u 1001 glidefs
 
-USER zerofs
+USER glidefs
 
 # Default ports that might be used - actual configuration comes from TOML file
 EXPOSE 2049 5564 10809
 
-ENTRYPOINT ["zerofs"]
+ENTRYPOINT ["glidefs"]

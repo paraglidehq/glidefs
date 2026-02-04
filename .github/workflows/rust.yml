@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: zerofs
+        working-directory: glidefs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: zerofs
+        working-directory: glidefs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -38,12 +38,24 @@ jobs:
       - name: Run all tests
         run: cargo test --features test-utils --verbose
 
+  loom:
+    name: Loom Concurrency Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: glidefs/loom-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run loom tests
+        run: cargo test --release
+
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: zerofs
+        working-directory: glidefs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

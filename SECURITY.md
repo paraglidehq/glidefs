@@ -11,4 +11,4 @@ currently being supported with security updates.
 
 ## Reporting a Vulnerability
 
-Please report vulnerabilities from the following page: https://github.com/Barre/ZeroFS/security
+Please report vulnerabilities from the following page: https://github.com/Barre/GlideFS/security

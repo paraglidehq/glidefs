@@ -68,27 +68,27 @@ jobs:
 
       - name: Build with cross (Linux)
         if: matrix.platform == 'linux'
-        working-directory: zerofs
+        working-directory: glidefs
         run: |
           cross build --profile ci --target ${{ matrix.target }}
 
       - name: Build with cargo (macOS)
         if: matrix.platform == 'darwin'
-        working-directory: zerofs
+        working-directory: glidefs
         run: |
           cargo build --profile ci --target ${{ matrix.target }}
 
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp zerofs/target/${{ matrix.target }}/ci/zerofs artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
-          chmod +x artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          cp glidefs/target/${{ matrix.target }}/ci/glidefs artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}
+          chmod +x artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zerofs-${{ matrix.platform }}-${{ matrix.arch }}
-          path: artifacts/zerofs-${{ matrix.platform }}-${{ matrix.arch }}
+          name: glidefs-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}
           retention-days: 7
 
   create-release-artifacts:
@@ -117,21 +117,21 @@ jobs:
             fi
           done
           cd release
-          tar czf ../zerofs-multiplatform.tar.gz zerofs-*
+          tar czf ../glidefs-multiplatform.tar.gz glidefs-*
           cd ..
-          sha256sum zerofs-multiplatform.tar.gz > zerofs-multiplatform.tar.gz.sha256
+          sha256sum glidefs-multiplatform.tar.gz > glidefs-multiplatform.tar.gz.sha256
 
       - name: Upload combined artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zerofs-multiplatform
+          name: glidefs-multiplatform
           path: |
-            zerofs-multiplatform.tar.gz
-            zerofs-multiplatform.tar.gz.sha256
+            glidefs-multiplatform.tar.gz
+            glidefs-multiplatform.tar.gz.sha256
           retention-days: 30
 
       - name: Display SHA256 checksums
         run: |
           echo "SHA256 checksums for individual binaries:"
           cd release
-          sha256sum zerofs-*
+          sha256sum glidefs-*

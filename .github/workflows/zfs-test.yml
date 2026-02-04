@@ -1,4 +1,4 @@
-name: ZFS on ZeroFS Test
+name: ZFS on GlideFS Test
 
 on:
   push:
@@ -41,26 +41,26 @@ jobs:
           wget -q https://dl.min.io/client/mc/release/linux-amd64/mc
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
-          ./mc rm --recursive --force myminio/zerofs-iops-test/ || true
-          ./mc mb myminio/zerofs-iops-test || true
+          ./mc rm --recursive --force myminio/glidefs-iops-test/ || true
+          ./mc mb myminio/glidefs-iops-test || true
 
-      - name: Build ZeroFS
-        working-directory: zerofs
+      - name: Build GlideFS
+        working-directory: glidefs
         run: cargo build --profile ci
 
-      - name: Start ZeroFS
-        working-directory: zerofs
+      - name: Start GlideFS
+        working-directory: glidefs
         run: |
-          mkdir -p /tmp/zerofs-cache
+          mkdir -p /tmp/glidefs-cache
 
-          cat > zerofs-iops.toml << EOF
+          cat > glidefs-iops.toml << EOF
           [cache]
-          dir = "/tmp/zerofs-cache"
+          dir = "/tmp/glidefs-cache"
           disk_size_gb = 4.0
           memory_size_gb = 2.0
 
           [storage]
-          url = "s3://zerofs-iops-test/bench"
+          url = "s3://glidefs-iops-test/bench"
           encryption_password = "bench-password-123"
 
           [servers.nbd]
@@ -78,11 +78,11 @@ jobs:
           allow_http = "true"
           EOF
 
-          ./target/ci/zerofs run -c zerofs-iops.toml &
+          ./target/ci/glidefs run -c glidefs-iops.toml &
 
           for i in {1..30}; do
             if nc -z 127.0.0.1 10809; then
-              echo "ZeroFS ready"
+              echo "GlideFS ready"
               break
             fi
             sleep 1
@@ -116,7 +116,7 @@ jobs:
             if curl -sf http://127.0.0.1:8080/metrics > /tmp/metrics_$$.txt 2>/dev/null; then
               echo "Latency (microseconds):"
               grep -E 'latency_avg_us|latency_max_us|cache_hit' /tmp/metrics_$$.txt | \
-                sed 's/zerofs_/  /' | sed 's/{[^}]*}//' || echo "  (no latency data)"
+                sed 's/glidefs_/  /' | sed 's/{[^}]*}//' || echo "  (no latency data)"
               rm -f /tmp/metrics_$$.txt
             else
               echo "  (metrics endpoint not available)"
@@ -190,11 +190,299 @@ jobs:
         if: always()
         run: |
           sudo nbd-client -d /dev/nbd0 || true
-          pkill -f "zerofs run" || true
+          pkill -f "glidefs run" || true
+          docker stop minio || true
+
+  real-world-benchmark:
+    name: Real-World Benchmark (batch=${{ matrix.blocks_per_batch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        blocks_per_batch: [10, 25, 50, 100]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nbd-client fio jq git build-essential
+
+      - name: Setup MinIO bucket
+        run: |
+          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc rm --recursive --force myminio/glidefs-realworld-batch${{ matrix.blocks_per_batch }}/ || true
+          ./mc mb myminio/glidefs-realworld-batch${{ matrix.blocks_per_batch }} || true
+
+      - name: Build GlideFS
+        working-directory: glidefs
+        run: cargo build --profile ci
+
+      - name: Start GlideFS
+        working-directory: glidefs
+        run: |
+          mkdir -p /tmp/glidefs-cache
+
+          cat > glidefs-realworld.toml << EOF
+          [cache]
+          dir = "/tmp/glidefs-cache"
+          disk_size_gb = 4.0
+          memory_size_gb = 2.0
+
+          [storage]
+          url = "s3://glidefs-realworld-batch${{ matrix.blocks_per_batch }}/bench"
+          encryption_password = "bench-password-123"
+
+          [servers.nbd]
+          addresses = ["127.0.0.1:10809"]
+          api_address = "127.0.0.1:8080"
+          blocks_per_batch = ${{ matrix.blocks_per_batch }}
+
+          [[servers.nbd.exports]]
+          name = "bench-device"
+          size_gb = 10.0
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
+          ./target/ci/glidefs run -c glidefs-realworld.toml &
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809; then
+              echo "GlideFS ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Connect NBD and create filesystem
+        run: |
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N bench-device
+          sudo mkfs.ext4 -F /dev/nbd0
+          sudo mkdir -p /mnt/nbd
+          sudo mount /dev/nbd0 /mnt/nbd
+          sudo chmod 777 /mnt/nbd
+
+      - name: Run Real-World Workload Benchmark
+        run: |
+          echo ""
+          echo "╔═══════════════════════════════════════════════════════════════╗"
+          echo "║           REAL-WORLD WORKLOAD BENCHMARK                       ║"
+          echo "║  blocks_per_batch = ${{ matrix.blocks_per_batch }} (batch size = $(( ${{ matrix.blocks_per_batch }} * 128 ))KB)"
+          echo "╚═══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          dump_metrics() {
+            local label="$1"
+            echo ""
+            echo "=== $label ==="
+            if curl -sf http://127.0.0.1:8080/metrics > /tmp/metrics_$$.txt 2>/dev/null; then
+              grep -E 'dirty_blocks|s3_batches_written|coalesce_ratio|write_amplification' /tmp/metrics_$$.txt | \
+                sed 's/glidefs_/  /' | sed 's/{[^}]*}//' || true
+              rm -f /tmp/metrics_$$.txt
+            fi
+          }
+
+          dump_metrics "Baseline"
+
+          # === WORKLOAD 1: File extraction (many small files, metadata heavy) ===
+          echo ""
+          echo ">>> WORKLOAD 1: File extraction (simulates unpacking tarball)"
+          START=$(date +%s%3N)
+
+          # Create directory structure with many small files
+          mkdir -p /mnt/nbd/project
+          for i in {1..500}; do
+            mkdir -p /mnt/nbd/project/dir_$((i % 50))
+            echo "file content $i with some padding to make it realistic" > /mnt/nbd/project/dir_$((i % 50))/file_$i.txt
+          done
+          sync
+
+          END=$(date +%s%3N)
+          echo "Created 500 files in $((END - START))ms"
+          dump_metrics "After file extraction"
+
+          # === IDLE PERIOD ===
+          echo ""
+          echo ">>> IDLE PERIOD (5s) - letting sync catch up"
+          sleep 5
+          dump_metrics "After idle period 1"
+
+          # === WORKLOAD 2: Sequential log writes (append-heavy) ===
+          echo ""
+          echo ">>> WORKLOAD 2: Sequential log writes (simulates application logging)"
+          START=$(date +%s%3N)
+
+          for i in {1..100}; do
+            echo "[$(date -Iseconds)] INFO: Log entry $i with request_id=$(uuidgen) status=200 latency_ms=$((RANDOM % 100))" >> /mnt/nbd/app.log
+          done
+          sync
+
+          END=$(date +%s%3N)
+          echo "Wrote 100 log entries in $((END - START))ms"
+          dump_metrics "After log writes"
+
+          # === WORKLOAD 3: Random reads (simulates serving cached content) ===
+          echo ""
+          echo ">>> WORKLOAD 3: Random file reads (simulates web server)"
+          START=$(date +%s%3N)
+
+          for i in {1..200}; do
+            FILE_NUM=$((RANDOM % 500 + 1))
+            DIR_NUM=$((FILE_NUM % 50))
+            cat /mnt/nbd/project/dir_$DIR_NUM/file_$FILE_NUM.txt > /dev/null 2>/dev/null || true
+          done
+
+          END=$(date +%s%3N)
+          echo "Read 200 random files in $((END - START))ms"
+          dump_metrics "After random reads"
+
+          # === WORKLOAD 4: Database-like mixed I/O (random read/write to data files) ===
+          echo ""
+          echo ">>> WORKLOAD 4: Database-like I/O (random read/write)"
+          START=$(date +%s%3N)
+
+          # Create "database" files
+          dd if=/dev/urandom of=/mnt/nbd/db_data.bin bs=1M count=50 2>/dev/null
+          dd if=/dev/urandom of=/mnt/nbd/db_index.bin bs=1M count=10 2>/dev/null
+
+          # Random reads and writes using fio with realistic DB pattern
+          sudo fio --name=db_workload --filename=/mnt/nbd/db_data.bin \
+            --ioengine=libaio --direct=1 --bs=8k --iodepth=16 \
+            --rw=randrw --rwmixread=80 --runtime=10 --time_based \
+            --output-format=json > /tmp/db_fio.json
+
+          DB_IOPS=$(jq -r '.jobs[0].read.iops + .jobs[0].write.iops' /tmp/db_fio.json)
+
+          END=$(date +%s%3N)
+          echo "Database workload: $DB_IOPS IOPS over $((END - START))ms"
+          dump_metrics "After DB workload"
+
+          # === IDLE PERIOD ===
+          echo ""
+          echo ">>> IDLE PERIOD (5s) - letting sync catch up"
+          sleep 5
+          dump_metrics "After idle period 2"
+
+          # === WORKLOAD 5: Burst write (simulates backup or bulk import) ===
+          echo ""
+          echo ">>> WORKLOAD 5: Burst write (simulates backup dump)"
+          START=$(date +%s%3N)
+
+          dd if=/dev/urandom of=/mnt/nbd/backup_dump.bin bs=1M count=100 2>/dev/null
+          sync
+
+          END=$(date +%s%3N)
+          echo "Wrote 100MB burst in $((END - START))ms"
+          dump_metrics "After burst write"
+
+          # === WORKLOAD 6: Bursty mixed with idle (realistic VM pattern) ===
+          echo ""
+          echo ">>> WORKLOAD 6: Bursty pattern with idle gaps"
+          for burst in {1..5}; do
+            echo "  Burst $burst/5..."
+            # Short burst of activity
+            sudo fio --name=burst_$burst --filename=/mnt/nbd/burst_test.bin \
+              --ioengine=libaio --direct=1 --bs=4k --size=20M --iodepth=32 \
+              --rw=randrw --rwmixread=70 --runtime=3 --time_based \
+              --output-format=json > /dev/null 2>&1
+            # Idle gap
+            sleep 2
+          done
+          dump_metrics "After bursty pattern"
+
+          # === FINAL IDLE - let everything sync ===
+          echo ""
+          echo ">>> FINAL IDLE (10s) - letting all syncs complete"
+          sleep 10
+          dump_metrics "Final state"
+
+          # === SUMMARY ===
+          echo ""
+          echo "╔═══════════════════════════════════════════════════════════════╗"
+          echo "║    BENCHMARK SUMMARY (blocks_per_batch=${{ matrix.blocks_per_batch }})"
+          echo "╚═══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          # Get final metrics
+          curl -sf http://127.0.0.1:8080/metrics > /tmp/final_metrics.txt
+
+          BATCHES=$(grep 's3_batches_written' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "N/A")
+          COALESCE=$(grep 'coalesce_ratio' /tmp/final_metrics.txt | grep -oE '[0-9.]+$' || echo "N/A")
+          WRITE_AMP=$(grep 'write_amplification' /tmp/final_metrics.txt | grep -oE '[0-9.]+$' || echo "N/A")
+          DIRTY=$(grep 'dirty_blocks{' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "N/A")
+          GUEST_WRITES=$(grep 'guest_write_ops' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "N/A")
+          S3_BYTES=$(grep 's3_bytes_written' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "0")
+          GUEST_BYTES=$(grep 'guest_bytes_written' /tmp/final_metrics.txt | grep -oE '[0-9]+$' || echo "0")
+
+          # Calculate batch size in MB
+          BATCH_SIZE_KB=$(( ${{ matrix.blocks_per_batch }} * 128 ))
+
+          echo "┌───────────────────────────────────────────────────┐"
+          echo "│ Metric                │ Value                     │"
+          echo "├───────────────────────────────────────────────────┤"
+          printf "│ Batch Size            │ %-25s │\n" "${BATCH_SIZE_KB}KB (${{ matrix.blocks_per_batch }} blocks)"
+          printf "│ S3 Batches Written    │ %-25s │\n" "$BATCHES"
+          printf "│ Coalesce Ratio        │ %-25s │\n" "$COALESCE"
+          printf "│ Write Amplification   │ %-25s │\n" "$WRITE_AMP"
+          printf "│ S3 Bytes Written      │ %-25s │\n" "$(numfmt --to=iec $S3_BYTES 2>/dev/null || echo $S3_BYTES)"
+          printf "│ Guest Bytes Written   │ %-25s │\n" "$(numfmt --to=iec $GUEST_BYTES 2>/dev/null || echo $GUEST_BYTES)"
+          printf "│ Remaining Dirty       │ %-25s │\n" "$DIRTY"
+          echo "└───────────────────────────────────────────────────┘"
+          echo ""
+
+          # Compare with synthetic benchmark expectations
+          echo "Real-world workload characteristics:"
+          echo "- Mixed file sizes (small files + large sequential)"
+          echo "- Bursty patterns with idle gaps"
+          echo "- Spatial locality (files in same directories)"
+          echo "- Read-heavy periods interspersed with writes"
+          echo ""
+
+          if [ "$DIRTY" != "N/A" ] && [ "$DIRTY" -lt 1000 ]; then
+            echo "✓ Dirty blocks drained well during idle periods"
+          else
+            echo "⚠ Elevated dirty blocks - sync may still be catching up"
+          fi
+
+      - name: Full Metrics Dump
+        run: |
+          echo "=== FULL SERVER METRICS ==="
+          curl -sf http://127.0.0.1:8080/metrics || echo "(not available)"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo umount /mnt/nbd || true
+          sudo nbd-client -d /dev/nbd0 || true
+          pkill -f "glidefs run" || true
           docker stop minio || true
 
   zfs-test:
-    name: Run ZFS on top of ZeroFS
+    name: Run ZFS on top of GlideFS
     runs-on: ubuntu-latest
 
     steps:
@@ -230,28 +518,28 @@ jobs:
           chmod +x mc
           ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
           # Clear any stale data from previous runs (leases, cache metadata, etc.)
-          ./mc rm --recursive --force myminio/zerofs-zfs-test/ || true
-          ./mc mb myminio/zerofs-zfs-test || true
+          ./mc rm --recursive --force myminio/glidefs-zfs-test/ || true
+          ./mc mb myminio/glidefs-zfs-test || true
 
-      - name: Build ZeroFS
-        working-directory: zerofs
+      - name: Build GlideFS
+        working-directory: glidefs
         run: cargo build --profile ci
 
-      - name: Start ZeroFS
-        working-directory: zerofs
+      - name: Start GlideFS
+        working-directory: glidefs
         run: |
           # Create cache directory
-          mkdir -p /tmp/zerofs-cache
+          mkdir -p /tmp/glidefs-cache
 
-          # Create ZeroFS configuration
-          cat > zerofs-ci.toml << EOF
+          # Create GlideFS configuration
+          cat > glidefs-ci.toml << EOF
           [cache]
-          dir = "/tmp/zerofs-cache"
+          dir = "/tmp/glidefs-cache"
           disk_size_gb = 2.0
           memory_size_gb = 2.0
 
           [storage]
-          url = "s3://zerofs-zfs-test/zfs-test"
+          url = "s3://glidefs-zfs-test/zfs-test"
           encryption_password = "test-password-123"
 
           [servers.nbd]
@@ -268,22 +556,22 @@ jobs:
           allow_http = "true"
           EOF
 
-          # Start ZeroFS with NBD support in the background, capture logs
-          ./target/ci/zerofs run -c zerofs-ci.toml 2>&1 | tee /tmp/zerofs-first.log &
+          # Start GlideFS with NBD support in the background, capture logs
+          ./target/ci/glidefs run -c glidefs-ci.toml 2>&1 | tee /tmp/glidefs-first.log &
 
-          # Wait for ZeroFS NBD server to start
-          echo "Waiting for ZeroFS NBD server to start..."
+          # Wait for GlideFS NBD server to start
+          echo "Waiting for GlideFS NBD server to start..."
           for i in {1..30}; do
             if nc -z 127.0.0.1 10809; then
-              echo "ZeroFS NBD server is ready"
+              echo "GlideFS NBD server is ready"
               break
             fi
             sleep 1
           done
 
-          # Verify ZeroFS NBD server is running
+          # Verify GlideFS NBD server is running
           if ! nc -z 127.0.0.1 10809; then
-            echo "ZeroFS NBD server failed to start"
+            echo "GlideFS NBD server failed to start"
             exit 1
           fi
 
@@ -407,11 +695,11 @@ jobs:
           sync
 
           # Trigger drain via SIGUSR1 and measure time
-          ZEROFS_PID=$(pgrep -f "zerofs.*run" | head -1)
-          if [ -n "$ZEROFS_PID" ]; then
+          GLIDEFS_PID=$(pgrep -f "glidefs.*run" | head -1)
+          if [ -n "$GLIDEFS_PID" ]; then
             echo "Triggering S3 drain (this is what write-through would add to each snapshot)..."
             START=$(date +%s%3N)
-            kill -USR1 $ZEROFS_PID 2>/dev/null || true
+            kill -USR1 $GLIDEFS_PID 2>/dev/null || true
             # Wait for drain to complete (poll dirty block count via metrics or just wait)
             sleep 5  # Give it time to drain 50MB to MinIO
             END=$(date +%s%3N)
@@ -420,7 +708,7 @@ jobs:
             echo ""
             echo "With write-through, EVERY snapshot would pay this penalty!"
           else
-            echo "Could not find ZeroFS PID for drain test"
+            echo "Could not find GlideFS PID for drain test"
             DRAIN_MS=0
           fi
 
@@ -523,13 +811,13 @@ jobs:
           fi
           echo "Pool successfully exported"
 
-      - name: Disconnect NBD and stop ZeroFS
+      - name: Disconnect NBD and stop GlideFS
         run: |
           echo "=== S3 STATE BEFORE SHUTDOWN ==="
           echo "Object count in S3:"
-          ./mc ls --recursive myminio/zerofs-zfs-test | wc -l
+          ./mc ls --recursive myminio/glidefs-zfs-test | wc -l
           echo "S3 bucket size:"
-          ./mc du myminio/zerofs-zfs-test
+          ./mc du myminio/glidefs-zfs-test
 
           echo "Disconnecting NBD device..."
           sudo nbd-client -d /dev/nbd0
@@ -554,35 +842,35 @@ jobs:
             echo "NBD device confirmed disconnected"
           fi
 
-          echo "Stopping ZeroFS gracefully..."
-          ZEROFS_PID=$(pgrep -f "zerofs.*run.*zerofs-ci.toml" || true)
-          if [ -n "$ZEROFS_PID" ]; then
-            echo "Found ZeroFS process: $ZEROFS_PID"
+          echo "Stopping GlideFS gracefully..."
+          GLIDEFS_PID=$(pgrep -f "glidefs.*run.*glidefs-ci.toml" || true)
+          if [ -n "$GLIDEFS_PID" ]; then
+            echo "Found GlideFS process: $GLIDEFS_PID"
 
             # SIGTERM triggers graceful shutdown which includes full drain to S3
             # (see router.shutdown() in the code)
             echo "Sending SIGTERM for graceful shutdown (includes S3 drain)..."
-            kill -TERM $ZEROFS_PID || true
+            kill -TERM $GLIDEFS_PID || true
           else
-            echo "No ZeroFS process found (may have already stopped)"
+            echo "No GlideFS process found (may have already stopped)"
           fi
 
-          # Wait for ZeroFS to stop (up to 60 seconds - drain can take time)
-          echo "Waiting for ZeroFS to stop..."
+          # Wait for GlideFS to stop (up to 60 seconds - drain can take time)
+          echo "Waiting for GlideFS to stop..."
           for i in {1..60}; do
-            if ! pgrep -f "zerofs.*run.*zerofs-ci.toml" > /dev/null; then
-              echo "ZeroFS stopped after $i seconds"
+            if ! pgrep -f "glidefs.*run.*glidefs-ci.toml" > /dev/null; then
+              echo "GlideFS stopped after $i seconds"
               break
             fi
             if [ $((i % 10)) -eq 0 ]; then
-              echo "Still waiting for ZeroFS to stop... $i/60 seconds"
+              echo "Still waiting for GlideFS to stop... $i/60 seconds"
             fi
             sleep 1
           done
 
           # Final check - DO NOT use SIGKILL as it causes data loss
-          if pgrep -f "zerofs.*run.*zerofs-ci.toml" > /dev/null; then
-            echo "ERROR: ZeroFS did not stop gracefully after 60 seconds!"
+          if pgrep -f "glidefs.*run.*glidefs-ci.toml" > /dev/null; then
+            echo "ERROR: GlideFS did not stop gracefully after 60 seconds!"
             echo "This likely indicates a bug - investigate rather than force kill"
             exit 1
           fi
@@ -606,38 +894,38 @@ jobs:
 
           echo "=== S3 STATE AFTER SHUTDOWN ==="
           echo "Object count in S3:"
-          ./mc ls --recursive myminio/zerofs-zfs-test | wc -l
+          ./mc ls --recursive myminio/glidefs-zfs-test | wc -l
           echo "S3 bucket size:"
-          ./mc du myminio/zerofs-zfs-test
+          ./mc du myminio/glidefs-zfs-test
 
           echo "=== LOCAL CACHE STATE ==="
           echo "Cache directory contents:"
-          ls -la /tmp/zerofs-cache/ || echo "Cache dir not found"
-          du -sh /tmp/zerofs-cache/ || echo "Could not measure cache size"
+          ls -la /tmp/glidefs-cache/ || echo "Cache dir not found"
+          du -sh /tmp/glidefs-cache/ || echo "Could not measure cache size"
 
-          echo "=== ZEROFS LOGS (first instance) ==="
-          tail -100 /tmp/zerofs-first.log || echo "No log file"
+          echo "=== GLIDEFS LOGS (first instance) ==="
+          tail -100 /tmp/glidefs-first.log || echo "No log file"
 
-      - name: Restart ZeroFS
-        working-directory: zerofs
+      - name: Restart GlideFS
+        working-directory: glidefs
         run: |
-          echo "Starting ZeroFS again..."
+          echo "Starting GlideFS again..."
           # Config file should still exist from earlier
-          ./target/ci/zerofs run -c zerofs-ci.toml 2>&1 | tee /tmp/zerofs-second.log &
+          ./target/ci/glidefs run -c glidefs-ci.toml 2>&1 | tee /tmp/glidefs-second.log &
 
-          # Wait for ZeroFS NBD server to start
-          echo "Waiting for ZeroFS NBD server to restart..."
+          # Wait for GlideFS NBD server to start
+          echo "Waiting for GlideFS NBD server to restart..."
           for i in {1..30}; do
             if nc -z 127.0.0.1 10809; then
-              echo "ZeroFS NBD server is ready"
+              echo "GlideFS NBD server is ready"
               break
             fi
             sleep 1
           done
 
-          # Verify ZeroFS NBD server is running
+          # Verify GlideFS NBD server is running
           if ! nc -z 127.0.0.1 10809; then
-            echo "ZeroFS NBD server failed to restart"
+            echo "GlideFS NBD server failed to restart"
             exit 1
           fi
 
@@ -668,18 +956,18 @@ jobs:
 
           echo "=== DIAGNOSTIC: Checking local cache data file ==="
           echo "Cache files:"
-          ls -la /tmp/zerofs-cache/bucket_*/ 2>/dev/null || echo "No cache files"
+          ls -la /tmp/glidefs-cache/bucket_*/ 2>/dev/null || echo "No cache files"
           echo ""
           echo "First 512 bytes of cache data file (block 0):"
-          sudo hexdump -C /tmp/zerofs-cache/bucket_*/test-device.cache 2>/dev/null | head -20 || echo "Could not read cache data file"
+          sudo hexdump -C /tmp/glidefs-cache/bucket_*/test-device.cache 2>/dev/null | head -20 || echo "Could not read cache data file"
           echo ""
 
           echo "Importing ZFS pool..."
           # Use -d /dev to tell ZFS where to search (it caches device paths from export)
           if ! sudo zpool import -d /dev testpool; then
             echo "=== ZPOOL IMPORT FAILED ==="
-            echo "ZeroFS logs (second instance):"
-            tail -50 /tmp/zerofs-second.log || echo "No log file"
+            echo "GlideFS logs (second instance):"
+            tail -50 /tmp/glidefs-second.log || echo "No log file"
             echo ""
             echo "Checking dmesg:"
             dmesg | tail -20
@@ -725,29 +1013,29 @@ jobs:
             exit 1
           fi
 
-      - name: Show ZeroFS S3 usage and metrics
+      - name: Show GlideFS S3 usage and metrics
         run: |
           echo "=== S3 STORAGE USAGE ==="
-          ./mc du myminio/zerofs-zfs-test
+          ./mc du myminio/glidefs-zfs-test
           echo ""
 
           echo "=== S3 OBJECT COUNT ==="
-          ./mc ls --recursive myminio/zerofs-zfs-test | wc -l
+          ./mc ls --recursive myminio/glidefs-zfs-test | wc -l
           echo "objects in bucket"
           echo ""
 
           echo "=== BATCH OBJECT BREAKDOWN ==="
           echo "Data batches (blocks):"
-          ./mc ls --recursive myminio/zerofs-zfs-test | grep -c "/batch_" || echo "0"
+          ./mc ls --recursive myminio/glidefs-zfs-test | grep -c "/batch_" || echo "0"
           echo ""
           echo "Lease objects:"
-          ./mc ls --recursive myminio/zerofs-zfs-test | grep -c "/lease_" || echo "0"
+          ./mc ls --recursive myminio/glidefs-zfs-test | grep -c "/lease_" || echo "0"
           echo ""
 
           echo "=== WRITE AMPLIFICATION ANALYSIS ==="
           # Calculate what guest wrote vs what's in S3
           GUEST_WRITTEN_MB=$(du -sm /mnt/zfsdata 2>/dev/null | cut -f1 || echo "unknown")
-          S3_USAGE=$(./mc du --json myminio/zerofs-zfs-test 2>/dev/null | jq -r '.size // 0' || echo "0")
+          S3_USAGE=$(./mc du --json myminio/glidefs-zfs-test 2>/dev/null | jq -r '.size // 0' || echo "0")
           S3_USAGE_MB=$((S3_USAGE / 1024 / 1024))
 
           echo "Guest data on ZFS: ${GUEST_WRITTEN_MB}MB"
@@ -770,7 +1058,7 @@ jobs:
           echo ""
 
           echo "=== BATCH EFFICIENCY ==="
-          BATCH_COUNT=$(./mc ls --recursive myminio/zerofs-zfs-test | grep -c "/batch_" || echo "0")
+          BATCH_COUNT=$(./mc ls --recursive myminio/glidefs-zfs-test | grep -c "/batch_" || echo "0")
           if [ "$BATCH_COUNT" -gt 0 ] && [ "$S3_USAGE_MB" -gt 0 ]; then
             AVG_BATCH_SIZE=$((S3_USAGE_MB / BATCH_COUNT))
             echo "Total batches: $BATCH_COUNT"
@@ -795,8 +1083,8 @@ jobs:
           # Disconnect NBD device
           sudo nbd-client -d /dev/nbd0 || true
 
-          # Kill ZeroFS
-          pkill -f "zerofs run -c zerofs-ci.toml" || true
+          # Kill GlideFS
+          pkill -f "glidefs run -c glidefs-ci.toml" || true
 
           # Stop MinIO
           docker stop minio || true

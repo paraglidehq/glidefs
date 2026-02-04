@@ -34,10 +34,10 @@ jobs:
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             # Use the specific tag
             TAG="${{ github.ref_name }}"
-            DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/download/${TAG}/zerofs-pgo-multiplatform.tar.gz"
+            DOWNLOAD_URL="https://github.com/Barre/glidefs/releases/download/${TAG}/glidefs-pgo-multiplatform.tar.gz"
           else
             # For PRs and workflow_dispatch, use latest
-            DOWNLOAD_URL="https://github.com/Barre/zerofs/releases/latest/download/zerofs-pgo-multiplatform.tar.gz"
+            DOWNLOAD_URL="https://github.com/Barre/glidefs/releases/latest/download/glidefs-pgo-multiplatform.tar.gz"
           fi
 
           echo "Downloading PGO builds from: $DOWNLOAD_URL"
@@ -45,7 +45,7 @@ jobs:
           curl -fsSL "$DOWNLOAD_URL" | tar xz
 
           echo "Extracted binaries:"
-          ls -la zerofs-linux-*-pgo
+          ls -la glidefs-linux-*-pgo
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'

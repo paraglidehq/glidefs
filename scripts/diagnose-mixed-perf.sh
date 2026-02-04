@@ -16,7 +16,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo "=============================================="
-echo "  ZeroFS Mixed I/O Performance Diagnostic"
+echo "  GlideFS Mixed I/O Performance Diagnostic"
 echo "=============================================="
 echo "Device: $DEVICE"
 echo "Test size: $TEST_SIZE"
@@ -31,21 +31,21 @@ fetch_metrics() {
 
     if curl -sf "$METRICS_URL" > /tmp/metrics_$$.txt 2>/dev/null; then
         # Extract key metrics
-        local read_ops=$(grep 'zerofs_guest_read_ops' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local write_ops=$(grep 'zerofs_guest_write_ops' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local cache_hits=$(grep 'zerofs_cache_hits' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local cache_misses=$(grep 'zerofs_cache_misses' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local hit_rate=$(grep 'zerofs_cache_hit_rate' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local read_ops=$(grep 'glidefs_guest_read_ops' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local write_ops=$(grep 'glidefs_guest_write_ops' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local cache_hits=$(grep 'glidefs_cache_hits' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local cache_misses=$(grep 'glidefs_cache_misses' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local hit_rate=$(grep 'glidefs_cache_hit_rate' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
 
         # Latency metrics
-        local read_lat_avg=$(grep 'zerofs_read_latency_avg_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local read_lat_max=$(grep 'zerofs_read_latency_max_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local write_lat_avg=$(grep 'zerofs_write_latency_avg_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local write_lat_max=$(grep 'zerofs_write_latency_max_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local s3_lat_avg=$(grep 'zerofs_s3_fetch_latency_avg_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local s3_lat_max=$(grep 'zerofs_s3_fetch_latency_max_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local file_read_lat_avg=$(grep 'zerofs_file_read_latency_avg_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
-        local file_read_lat_max=$(grep 'zerofs_file_read_latency_max_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local read_lat_avg=$(grep 'glidefs_read_latency_avg_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local read_lat_max=$(grep 'glidefs_read_latency_max_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local write_lat_avg=$(grep 'glidefs_write_latency_avg_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local write_lat_max=$(grep 'glidefs_write_latency_max_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local s3_lat_avg=$(grep 'glidefs_s3_fetch_latency_avg_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local s3_lat_max=$(grep 'glidefs_s3_fetch_latency_max_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local file_read_lat_avg=$(grep 'glidefs_file_read_latency_avg_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
+        local file_read_lat_max=$(grep 'glidefs_file_read_latency_max_us' /tmp/metrics_$$.txt | awk '{print $2}' | head -1)
 
         echo "Operations:"
         echo "  Read ops:    ${read_ops:-0}"
@@ -180,8 +180,8 @@ echo "=============================================="
 
 # Calculate ratios if we have the data
 if [ -f "/tmp/metrics_After_Pure_Read.txt" ] && [ -f "/tmp/metrics_After_Mixed.txt" ]; then
-    read_lat_pure=$(grep 'zerofs_read_latency_avg_us' /tmp/metrics_After_Pure_Read.txt | awk '{print $2}' | head -1)
-    read_lat_mixed=$(grep 'zerofs_read_latency_avg_us' /tmp/metrics_After_Mixed.txt | awk '{print $2}' | head -1)
+    read_lat_pure=$(grep 'glidefs_read_latency_avg_us' /tmp/metrics_After_Pure_Read.txt | awk '{print $2}' | head -1)
+    read_lat_mixed=$(grep 'glidefs_read_latency_avg_us' /tmp/metrics_After_Mixed.txt | awk '{print $2}' | head -1)
 
     if [ -n "$read_lat_pure" ] && [ -n "$read_lat_mixed" ] && [ "$read_lat_pure" != "0" ]; then
         slowdown=$(echo "scale=2; $read_lat_mixed / $read_lat_pure" | bc 2>/dev/null || echo "N/A")

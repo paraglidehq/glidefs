@@ -1,6 +1,9 @@
 name: Cross Compile
 
 on:
+  push:
+    tags:
+      - 'v*'
   pull_request:
     branches: ["main"]
   workflow_dispatch:
@@ -91,24 +94,21 @@ jobs:
           path: artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}
           retention-days: 7
 
-  create-release-artifacts:
-    name: Create combined release artifacts
+  release:
+    name: Create GitHub Release
     needs: cross-compile
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: List artifacts
-        run: |
-          ls -la artifacts/
-          ls -la artifacts/*/
-
-      - name: Create tarball
+      - name: Prepare release files
         run: |
           mkdir -p release
           for arch_dir in artifacts/*/; do
@@ -117,21 +117,10 @@ jobs:
             fi
           done
           cd release
-          tar czf ../glidefs-multiplatform.tar.gz glidefs-*
-          cd ..
-          sha256sum glidefs-multiplatform.tar.gz > glidefs-multiplatform.tar.gz.sha256
+          sha256sum glidefs-* > checksums.txt
 
-      - name: Upload combined artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
         with:
-          name: glidefs-multiplatform
-          path: |
-            glidefs-multiplatform.tar.gz
-            glidefs-multiplatform.tar.gz.sha256
-          retention-days: 30
-
-      - name: Display SHA256 checksums
-        run: |
-          echo "SHA256 checksums for individual binaries:"
-          cd release
-          sha256sum glidefs-*
+          files: release/*
+          generate_release_notes: true

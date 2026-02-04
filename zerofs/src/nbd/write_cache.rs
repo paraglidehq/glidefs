@@ -15,7 +15,6 @@
 
 use bytes::Bytes;
 use crossbeam::queue::SegQueue;
-use dashmap::DashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::marker::PhantomData;
@@ -295,11 +294,6 @@ pub(crate) struct CacheInner {
     /// Notification for waking the sync worker when dirty blocks are available.
     /// The sync worker waits on this instead of polling.
     dirty_notify: Notify,
-
-    /// In-memory buffer of dirty block data.
-    /// Captures write data at write time so sync worker doesn't need to re-read from disk.
-    /// Entries are removed after successful sync to S3.
-    dirty_data: DashMap<u64, Bytes>,
 }
 
 impl CacheInner {
@@ -595,7 +589,6 @@ impl WriteCache<Initializing> {
             syncing_block_count: AtomicU64::new(0),
             dirty_queue,
             dirty_notify: Notify::new(),
-            dirty_data: DashMap::new(),
         });
 
         info!(
@@ -749,8 +742,6 @@ impl WriteCache<Recovering> {
                 .is_ok()
             {
                 self.inner.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
-                // Remove from in-memory buffer now that it's synced to S3
-                self.inner.dirty_data.remove(&block_num);
                 break;
             }
             // CAS failed, retry
@@ -806,26 +797,6 @@ impl WriteCache<Active> {
 
         // Now write to local file (after claiming blocks via set_present)
         self.inner.data_file.write_all_at(data, offset)?;
-
-        // Buffer full-block writes in memory for sync worker (avoids disk re-read).
-        // For partial-block writes, sync worker falls back to disk read.
-        // This avoids the 32x read amplification of reading 128KB for every 4KB write.
-        let block_size_usize = self.inner.config.block_size;
-        if data.len() >= block_size_usize && offset % block_size == 0 {
-            // Write is block-aligned and covers at least one full block
-            let mut data_offset = 0usize;
-            for block in start_block..=end_block {
-                let remaining = data.len() - data_offset;
-                if remaining >= block_size_usize {
-                    // Full block - buffer it directly from write data (no disk read!)
-                    let block_data = &data[data_offset..data_offset + block_size_usize];
-                    self.inner.dirty_data.insert(block, Bytes::copy_from_slice(block_data));
-                    data_offset += block_size_usize;
-                }
-                // Partial block at end - don't buffer, sync will read from disk
-            }
-        }
-        // Partial/unaligned writes: don't buffer, sync worker reads from disk
 
         // Mark affected blocks as dirty (lock-free)
         let mut newly_dirty = false;
@@ -1335,8 +1306,6 @@ impl WriteCache<Active> {
             .is_ok()
         {
             self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-            // Remove from in-memory buffer now that it's synced to S3
-            self.inner.dirty_data.remove(&block_num);
         }
     }
 
@@ -1371,15 +1340,8 @@ impl WriteCache<Active> {
     }
 
     /// Read a single block for sync worker.
-    /// First tries in-memory dirty_data buffer, falls back to disk if not found.
+    /// Reads from local disk cache (likely from page cache for recently written blocks).
     pub fn sync_read_local_block(&self, block_num: u64) -> Result<Bytes, CacheError> {
-        // Try to get from in-memory buffer first (avoids disk read)
-        if let Some(data) = self.inner.dirty_data.get(&block_num) {
-            return Ok(data.clone());
-        }
-
-        // Fallback to disk read (edge case: block written before DashMap was added,
-        // or block was evicted from memory for some reason)
         let offset = block_num * self.inner.config.block_size as u64;
         let mut buf = vec![0u8; self.inner.config.block_size];
         self.inner.data_file.read_exact_at(&mut buf, offset)?;
@@ -1710,7 +1672,7 @@ impl Default for SyncWorkerConfig {
             max_concurrent_uploads: 4,
             // 3 second sync interval: balances durability vs write amplification.
             // Longer interval = more writes coalesce = less S3 traffic.
-            // Dirty data is held in memory (DashMap) so no disk contention.
+            // Recently written blocks are likely still in page cache when sync reads them.
             hot_batch_cooldown: std::time::Duration::from_secs(3),
             // After 10 deferrals, force sync even if batch is hot
             // At 3s cooldown, this means ~30 second max delay

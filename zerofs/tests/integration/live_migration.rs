@@ -180,7 +180,7 @@ async fn test_full_migration_protocol() {
 
     // Source writes data (simulating VM activity)
     for i in 0..10 {
-        let data: Vec<u8> = vec![(i as u8); 128 * 1024];
+        let data: Vec<u8> = vec![i as u8; 128 * 1024];
         source_handler
             .write(i as u64 * 128 * 1024, &data, false)
             .unwrap();
@@ -222,7 +222,7 @@ async fn test_full_migration_protocol() {
             .read(i as u64 * 128 * 1024, 128 * 1024)
             .await
             .unwrap();
-        let expected = vec![(i as u8); 128 * 1024];
+        let expected = vec![i as u8; 128 * 1024];
         assert_eq!(data.as_ref(), &expected[..], "Block {} mismatch", i);
     }
 
@@ -273,7 +273,7 @@ async fn test_drain_ensures_all_synced() {
 
     // Write many blocks
     for i in 0..50 {
-        let data: Vec<u8> = vec![(i as u8); 128 * 1024];
+        let data: Vec<u8> = vec![i as u8; 128 * 1024];
         cache.write(i as u64 * 128 * 1024, &data).unwrap();
     }
 

@@ -416,20 +416,22 @@ impl ExportRouter {
 
         info!("Removing export '{}'...", name);
 
-        // 1. Release the lease if we hold one (allows immediate reacquisition by other nodes)
+        // 1. Signal sync worker and lease renewal to stop FIRST
+        // (must stop renewal task before releasing lease to avoid race condition)
+        let _ = state.sync_shutdown.send(true);
+
+        // 2. Wait for lease renewal task to exit (if any)
+        // This prevents the renewal task from racing with lease release
+        if let Some(handle) = state.lease_renewal_handle
+            && let Err(e) = handle.await {
+                warn!("Lease renewal task for '{}' panicked: {}", name, e);
+            }
+
+        // 3. Now release the lease (renewal task is stopped, no race condition)
         if let Some(ref lease_handle) = state.lease
             && let Err(e) = self.lease_manager.release(name, lease_handle).await {
                 warn!("Failed to release lease for '{}': {}", name, e);
                 // Continue with removal - lease will expire eventually
-            }
-
-        // 2. Signal sync worker and lease renewal to stop
-        let _ = state.sync_shutdown.send(true);
-
-        // 3. Wait for lease renewal task to exit (if any)
-        if let Some(handle) = state.lease_renewal_handle
-            && let Err(e) = handle.await {
-                warn!("Lease renewal task for '{}' panicked: {}", name, e);
             }
 
         // 4. Wait for sync worker to exit (releases its Arc clone)
@@ -493,20 +495,22 @@ impl ExportRouter {
         for (name, state) in export_list {
             info!("Shutting down export '{}'...", name);
 
-            // 1. Release the lease if we hold one (allows immediate reacquisition by other nodes)
+            // 1. Signal sync worker and lease renewal to stop FIRST
+            // (must stop renewal task before releasing lease to avoid race condition)
+            let _ = state.sync_shutdown.send(true);
+
+            // 2. Wait for lease renewal task to exit (if any)
+            // This prevents the renewal task from racing with lease release
+            if let Some(handle) = state.lease_renewal_handle
+                && let Err(e) = handle.await {
+                    warn!("Lease renewal task for '{}' panicked: {}", name, e);
+                }
+
+            // 3. Now release the lease (renewal task is stopped, no race condition)
             if let Some(ref lease_handle) = state.lease
                 && let Err(e) = self.lease_manager.release(&name, lease_handle).await {
                     warn!("Failed to release lease for '{}': {}", name, e);
                     // Continue with shutdown - lease will expire eventually
-                }
-
-            // 2. Signal sync worker and lease renewal to stop
-            let _ = state.sync_shutdown.send(true);
-
-            // 3. Wait for lease renewal task to exit (if any)
-            if let Some(handle) = state.lease_renewal_handle
-                && let Err(e) = handle.await {
-                    warn!("Lease renewal task for '{}' panicked: {}", name, e);
                 }
 
             // 4. Wait for sync worker to exit (releases its Arc clone)

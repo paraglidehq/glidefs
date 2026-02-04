@@ -28,7 +28,7 @@ fn create_test_cache(
         block_size: 128 * 1024,        // 128KB
     };
 
-    let s3_store = Arc::new(
+    let _s3_store = Arc::new(
         S3BlockStore::new(Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>, "test", 128 * 1024)
             .with_blocks_per_batch(10),
     );
@@ -140,7 +140,7 @@ async fn test_unwritten_blocks_return_zeros() {
 async fn test_cache_hit_on_second_read() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, s3_store, metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, s3_store, _metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write some data
     let data: Vec<u8> = (0..128 * 1024).map(|i| (i % 256) as u8).collect();
@@ -194,7 +194,7 @@ async fn test_batch_prefetch_optimization() {
     let (writer_cache, writer_s3, _) = create_test_cache(&writer_dir, "vol1", Arc::clone(&s3));
 
     for i in 0..10 {
-        let data: Vec<u8> = vec![(i as u8); 128 * 1024];
+        let data: Vec<u8> = vec![i as u8; 128 * 1024];
         writer_cache.write(i * 128 * 1024, &data).unwrap();
     }
     writer_cache.drain_for_snapshot(&writer_s3).await.unwrap();

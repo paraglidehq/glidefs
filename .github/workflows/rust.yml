@@ -22,7 +22,7 @@ jobs:
         with:
           components: "clippy"
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --features test-utils --tests --benches -- -D warnings
 
   build:
     name: Build and Test
@@ -34,11 +34,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
-        run: cargo build --verbose
-      - name: Run unit tests
-        run: cargo test --verbose
-      - name: Run integration tests
-        run: cargo test --features test-utils --test integration --verbose
+        run: cargo build --features test-utils --verbose
+      - name: Run all tests
+        run: cargo test --features test-utils --verbose
 
   benchmarks:
     name: Benchmarks (Dry Run)
@@ -52,4 +50,6 @@ jobs:
       - name: Build benchmarks
         run: cargo build --features test-utils --benches
       - name: Run flush latency benchmark (short)
-        run: cargo bench --features test-utils -- --warm-up-time 1 --measurement-time 3
+        run: cargo bench --features test-utils --bench flush_latency -- --noplot
+      - name: Run workloads benchmark (short)
+        run: cargo bench --features test-utils --bench workloads -- --noplot "random_writes" "mixed_workload"

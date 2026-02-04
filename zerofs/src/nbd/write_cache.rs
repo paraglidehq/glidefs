@@ -502,6 +502,7 @@ impl WriteCache<Recovering> {
     /// Skip recovery and transition directly to Active state.
     ///
     /// **TEST ONLY**: This bypasses recovery for unit tests that don't need S3.
+    #[allow(dead_code)] // Used by integration tests and benchmarks
     #[cfg(any(test, feature = "test-utils"))]
     pub fn skip_recovery_for_test(self) -> WriteCache<Active> {
         WriteCache {
@@ -2794,11 +2795,10 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
 
             // Now do the read which triggers prefetch
-            let data = cache_read
+            cache_read
                 .read_with_fetch(0, 4096, &s3_read, &metrics)
                 .await
-                .unwrap();
-            data
+                .unwrap()
         });
 
         // Wait for both

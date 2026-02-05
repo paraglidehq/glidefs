@@ -270,6 +270,41 @@ For scale-to-zero (20% active, 80% idle):
 - S3-compatible storage
 - VPC endpoint recommended (no egress cost)
 
+## GlideFS Durability Test Steps
+
+1. Write known data inside VM
+dd if=/dev/urandom of=/root/test-data.bin bs=1M count=100
+sha256sum /root/test-data.bin && sync
+Hash: 86aabfa2ca5781f2779638e1e6d58b34e0d1f4b86ebedc02d137276c3f2b408b
+
+2. Stop the VM
+
+3. Full teardown (reverse order)
+zpool export -f pglide
+nbd-client -d /dev/nbd0
+nbd-client -d /dev/nbd1
+nbd-client -d /dev/nbd2
+kill $(pgrep glidefs)
+
+4. Wipe entire local cache — forces all reads to come from S3
+rm -rf /var/cache/glidefs/bucket_28d68a01/*.cache /var/cache/glidefs/bucket_28d68a01/*.meta
+
+5. Bring everything back up (forward order)
+glidefs run -c /etc/glidefs/glidefs.toml
+nbd-client -unix /var/run/glidefs.sock /dev/nbd0 -N pglide-0
+nbd-client -unix /var/run/glidefs.sock /dev/nbd1 -N pglide-1
+nbd-client -unix /var/run/glidefs.sock /dev/nbd2 -N pglide-2
+zpool import pglide
+
+6. Start VM and verify
+sha256sum /root/test-data.bin
+Output: 86aabfa2ca5781f2779638e1e6d58b34e0d1f4b86ebedc02d137276c3f2b408b — exact match.
+
+The cache wipe in step 4 is what makes this meaningful. With zero local data, every block ZFS reads during import and VM boot had to be fetched from
+S3. The hash match proves end-to-end durability through the full stack: VM filesystem → ZFS → NBD → GlideFS → S3 → and back
+
+* Durability test: passed. *
+
 ---
 
 ## License

@@ -1085,3 +1085,240 @@ jobs:
 
           # Stop MinIO
           docker stop minio || true
+
+  export-discovery-test:
+    name: Export Discovery from S3
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d \
+            --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+
+          for i in {1..30}; do
+            if curl -f http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nbd-client jq
+
+      - name: Setup MinIO bucket
+        run: |
+          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc rm --recursive --force myminio/export-discovery-test/ || true
+          ./mc mb myminio/export-discovery-test || true
+
+      - name: Build GlideFS
+        working-directory: glidefs
+        run: cargo build --profile ci
+
+      - name: Start GlideFS with auto-create (no static exports)
+        working-directory: glidefs
+        run: |
+          mkdir -p /tmp/glidefs-cache
+
+          # Config with NO static exports - only auto_create_size_gb
+          cat > glidefs-discovery.toml << EOF
+          [cache]
+          dir = "/tmp/glidefs-cache"
+          disk_size_gb = 2.0
+          memory_size_gb = 1.0
+
+          [storage]
+          url = "s3://export-discovery-test/discovery"
+
+          [servers.nbd]
+          addresses = ["127.0.0.1:10809"]
+          api_address = "127.0.0.1:8080"
+          auto_create_size_gb = 1.0
+
+          [aws]
+          access_key_id = "minioadmin"
+          secret_access_key = "minioadmin"
+          endpoint = "http://localhost:9000"
+          allow_http = "true"
+          EOF
+
+          ./target/ci/glidefs run -c glidefs-discovery.toml 2>&1 | tee /tmp/glidefs-first.log &
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809 && nc -z 127.0.0.1 8080; then
+              echo "GlideFS ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Create export via API
+        run: |
+          echo "Creating export via API..."
+          curl -X PUT http://127.0.0.1:8080/api/exports/dynamic-vol \
+            -H "Content-Type: application/json" \
+            -d '{"size_gb": 2.0}'
+
+          # Wait for export to be ready
+          sleep 2
+
+          # Verify export exists
+          curl -s http://127.0.0.1:8080/api/exports | jq .
+          EXPORT_COUNT=$(curl -s http://127.0.0.1:8080/api/exports | jq 'length')
+          if [ "$EXPORT_COUNT" -lt 1 ]; then
+            echo "ERROR: Export not created!"
+            exit 1
+          fi
+          echo "Export created successfully"
+
+      - name: Write test data and compute checksum
+        run: |
+          echo "Connecting NBD device..."
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N dynamic-vol
+
+          echo "Writing test pattern..."
+          sudo dd if=/dev/urandom of=/tmp/testdata.bin bs=1M count=50
+          ORIGINAL_CHECKSUM=$(sha256sum /tmp/testdata.bin | cut -d' ' -f1)
+          echo "Original checksum: $ORIGINAL_CHECKSUM"
+          echo "$ORIGINAL_CHECKSUM" > /tmp/original-checksum.txt
+
+          sudo dd if=/tmp/testdata.bin of=/dev/nbd0 bs=1M
+          sync
+
+          echo "Disconnecting NBD..."
+          sudo nbd-client -d /dev/nbd0
+
+      - name: Stop GlideFS gracefully
+        run: |
+          echo "=== S3 STATE BEFORE SHUTDOWN ==="
+          ./mc ls --recursive myminio/export-discovery-test | head -20
+          echo "Object count: $(./mc ls --recursive myminio/export-discovery-test | wc -l)"
+
+          echo "Stopping GlideFS gracefully..."
+          GLIDEFS_PID=$(pgrep -f "glidefs run" | head -1)
+          if [ -n "$GLIDEFS_PID" ]; then
+            kill -TERM $GLIDEFS_PID
+            for i in {1..60}; do
+              if ! pgrep -f "glidefs run" > /dev/null; then
+                echo "GlideFS stopped after $i seconds"
+                break
+              fi
+              sleep 1
+            done
+          fi
+
+          # Wait for port to be free
+          for i in {1..10}; do
+            if ! nc -z 127.0.0.1 10809 2>/dev/null; then
+              echo "Port 10809 is free"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "=== S3 STATE AFTER SHUTDOWN ==="
+          ./mc ls --recursive myminio/export-discovery-test | head -20
+          echo "Object count: $(./mc ls --recursive myminio/export-discovery-test | wc -l)"
+
+          # Verify export.json exists in S3
+          if ./mc ls myminio/export-discovery-test/discovery/nbd/dynamic-vol/export.json 2>/dev/null; then
+            echo "✓ export.json persisted to S3"
+          else
+            echo "✗ export.json NOT found in S3!"
+            exit 1
+          fi
+
+      - name: Clear local cache
+        run: |
+          echo "Clearing local cache..."
+          rm -rf /tmp/glidefs-cache/*
+          ls -la /tmp/glidefs-cache/
+
+      - name: Restart GlideFS (should discover export from S3)
+        working-directory: glidefs
+        run: |
+          echo "Restarting GlideFS..."
+          ./target/ci/glidefs run -c glidefs-discovery.toml 2>&1 | tee /tmp/glidefs-second.log &
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 10809 && nc -z 127.0.0.1 8080; then
+              echo "GlideFS ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Check logs for discovery message
+          sleep 2
+          if grep -q "Discovered export 'dynamic-vol'" /tmp/glidefs-second.log; then
+            echo "✓ Export was discovered from S3!"
+          else
+            echo "Checking logs for discovery..."
+            grep -i "discover" /tmp/glidefs-second.log || true
+            grep -i "dynamic-vol" /tmp/glidefs-second.log || true
+          fi
+
+      - name: Verify export was discovered
+        run: |
+          echo "Checking exports via API..."
+          curl -s http://127.0.0.1:8080/api/exports | jq .
+
+          EXPORT_COUNT=$(curl -s http://127.0.0.1:8080/api/exports | jq 'length')
+          if [ "$EXPORT_COUNT" -lt 1 ]; then
+            echo "✗ ERROR: Export was NOT discovered!"
+            echo "=== GlideFS logs ==="
+            cat /tmp/glidefs-second.log
+            exit 1
+          fi
+
+          echo "✓ Export discovered successfully"
+
+      - name: Verify data integrity
+        run: |
+          echo "Connecting NBD device..."
+          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N dynamic-vol
+
+          echo "Reading data back..."
+          sudo dd if=/dev/nbd0 of=/tmp/recovered.bin bs=1M count=50
+
+          RECOVERED_CHECKSUM=$(sha256sum /tmp/recovered.bin | cut -d' ' -f1)
+          ORIGINAL_CHECKSUM=$(cat /tmp/original-checksum.txt)
+
+          echo "Original checksum:  $ORIGINAL_CHECKSUM"
+          echo "Recovered checksum: $RECOVERED_CHECKSUM"
+
+          if [ "$ORIGINAL_CHECKSUM" = "$RECOVERED_CHECKSUM" ]; then
+            echo ""
+            echo "╔═══════════════════════════════════════════════════════════════╗"
+            echo "║     ✓ EXPORT DISCOVERY TEST PASSED                            ║"
+            echo "║                                                               ║"
+            echo "║  - Export created via API                                     ║"
+            echo "║  - Data written to NBD device                                 ║"
+            echo "║  - GlideFS stopped, local cache cleared                       ║"
+            echo "║  - GlideFS restarted and discovered export from S3            ║"
+            echo "║  - Data integrity verified (checksums match)                  ║"
+            echo "╚═══════════════════════════════════════════════════════════════╝"
+            echo ""
+          else
+            echo "✗ ERROR: Data corruption detected!"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo nbd-client -d /dev/nbd0 || true
+          pkill -f "glidefs run" || true
+          docker stop minio || true

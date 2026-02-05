@@ -98,11 +98,36 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         node_id,
     ));
 
-    // Load static exports from config
+    // Discover exports from S3 (recovers exports created via API)
+    info!("Discovering exports from S3...");
+    let mut discovered_count = 0;
+    match router.discover_exports().await {
+        Ok(discovered) => {
+            for config in discovered {
+                info!(
+                    "Discovered export '{}' ({}GB) from S3",
+                    config.name, config.size_gb
+                );
+                if let Err(e) = router.create_export(config.clone(), false).await {
+                    tracing::warn!("Failed to restore export '{}': {}", config.name, e);
+                } else {
+                    discovered_count += 1;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to discover exports from S3: {} (continuing with config)", e);
+        }
+    }
+    if discovered_count > 0 {
+        info!("Discovered {} export(s) from S3", discovered_count);
+    }
+
+    // Load static exports from config (can add new exports or override discovered ones)
     let exports = nbd_config.get_exports();
-    if exports.is_empty() && auto_create_size_gb.is_none() {
+    if exports.is_empty() && auto_create_size_gb.is_none() && discovered_count == 0 {
         return Err(anyhow::anyhow!(
-            "No exports configured. Add exports to your config file, enable auto_create_size_gb, or use the API to create them."
+            "No exports configured or discovered. Add exports to your config file, enable auto_create_size_gb, or use the API to create them."
         ));
     }
 

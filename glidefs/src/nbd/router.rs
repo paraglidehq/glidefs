@@ -11,6 +11,9 @@ use crate::nbd::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::nbd::state::Active;
 use crate::nbd::write_cache::{sync_worker, CacheError, WriteCache, WriteCacheConfig};
 use crate::task::spawn_named;
+use bytes::Bytes;
+use futures::StreamExt;
+use object_store::path::Path;
 use object_store::ObjectStore;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,7 +21,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Errors that can occur during export operations.
 #[derive(Error, Debug)]
@@ -45,6 +48,12 @@ pub enum RouterError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("S3 error: {0}")]
+    ObjectStore(#[from] object_store::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// Information about an export for NBD protocol.
@@ -162,6 +171,96 @@ impl ExportRouter {
     /// Get the auto-create size (if enabled).
     pub fn auto_create_size_gb(&self) -> Option<f64> {
         self.auto_create_size_gb
+    }
+
+    // =========================================================================
+    // Export persistence to S3
+    // =========================================================================
+
+    /// S3 path for export definition.
+    fn export_json_path(&self, name: &str) -> Path {
+        Path::from(format!("{}/nbd/{}/export.json", self.db_path, name))
+    }
+
+    /// Save export definition to S3 (idempotent).
+    async fn save_export(&self, config: &ExportConfig) -> Result<(), RouterError> {
+        let path = self.export_json_path(&config.name);
+        let json = serde_json::to_vec(config)?;
+        self.object_store.put(&path, Bytes::from(json).into()).await?;
+        debug!("Saved export definition to S3: {}", path);
+        Ok(())
+    }
+
+    /// Load export definition from S3.
+    async fn load_export(&self, name: &str) -> Result<Option<ExportConfig>, RouterError> {
+        let path = self.export_json_path(name);
+        match self.object_store.get(&path).await {
+            Ok(result) => {
+                let data = result.bytes().await?;
+                let config: ExportConfig = serde_json::from_slice(&data)?;
+                Ok(Some(config))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete export definition from S3 (idempotent).
+    async fn delete_export_definition(&self, name: &str) -> Result<(), RouterError> {
+        let path = self.export_json_path(name);
+        match self.object_store.delete(&path).await {
+            Ok(()) => {
+                debug!("Deleted export definition from S3: {}", path);
+                Ok(())
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                debug!("Export definition already gone: {}", path);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Discover all exports from S3.
+    ///
+    /// Lists the `{db_path}/nbd/` prefix and loads each `export.json` found.
+    pub async fn discover_exports(&self) -> Result<Vec<ExportConfig>, RouterError> {
+        let prefix = Path::from(format!("{}/nbd/", self.db_path));
+        let mut exports = Vec::new();
+
+        // List all objects under the nbd prefix
+        let mut stream = self.object_store.list(Some(&prefix));
+
+        // Collect export names from export.json files
+        let mut export_names = std::collections::HashSet::new();
+        while let Some(result) = stream.next().await {
+            let meta = result?;
+            let path_str = meta.location.to_string();
+            // Look for paths like "{db_path}/nbd/{name}/export.json"
+            if path_str.ends_with("/export.json") {
+                // Extract export name from path
+                if let Some(name) = extract_export_name(&path_str, &self.db_path) {
+                    export_names.insert(name);
+                }
+            }
+        }
+
+        // Load each export definition
+        for name in export_names {
+            match self.load_export(&name).await {
+                Ok(Some(config)) => {
+                    exports.push(config);
+                }
+                Ok(None) => {
+                    warn!("Export.json disappeared during discovery: {}", name);
+                }
+                Err(e) => {
+                    warn!("Failed to load export '{}': {}", name, e);
+                }
+            }
+        }
+
+        Ok(exports)
     }
 
     /// Create a new export.
@@ -305,6 +404,12 @@ impl ExportRouter {
         exports.insert(name.clone(), state);
 
         info!("Export '{}' created successfully (readonly={})", name, actual_readonly);
+
+        // Persist export definition to S3 for discovery on restart
+        if let Err(e) = self.save_export(&config).await {
+            warn!("Failed to persist export to S3: {} (export is functional)", e);
+        }
+
         Ok(())
     }
 
@@ -561,6 +666,11 @@ impl ExportRouter {
             let _ = std::fs::remove_file(&cache_file);
             let _ = std::fs::remove_file(&meta_file);
             info!("Purged cache files for export '{}'", name);
+
+            // Also delete export definition from S3
+            if let Err(e) = self.delete_export_definition(name).await {
+                warn!("Failed to delete export definition from S3: {}", e);
+            }
         }
 
         info!("Export '{}' removed", name);
@@ -668,6 +778,22 @@ impl ExportRouter {
             "test-node".to_string(),
         )
     }
+}
+
+/// Extract export name from a path like "{db_path}/nbd/{name}/export.json".
+fn extract_export_name(path: &str, db_path: &str) -> Option<String> {
+    // Path format: "{db_path}/nbd/{name}/export.json"
+    let prefix = format!("{}/nbd/", db_path);
+    let suffix = "/export.json";
+
+    if let Some(rest) = path.strip_prefix(&prefix)
+        && let Some(name) = rest.strip_suffix(suffix)
+        && !name.contains('/')
+        && !name.is_empty()
+    {
+        return Some(name.to_string());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -954,5 +1080,174 @@ mod tests {
 
         assert!(data1.iter().all(|&b| b == 0x11), "vol1 should have 0x11");
         assert!(data2.iter().all(|&b| b == 0x22), "vol2 should have 0x22");
+    }
+
+    // =========================================================================
+    // Export persistence tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_save_and_load_export() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let config = test_export_config("persist-vol");
+
+        // Save export definition
+        router.save_export(&config).await.unwrap();
+
+        // Load it back
+        let loaded = router.load_export("persist-vol").await.unwrap();
+        assert!(loaded.is_some(), "Should load saved export");
+
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.name, "persist-vol");
+        assert!((loaded.size_gb - 0.01).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_load_export_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let loaded = router.load_export("nonexistent").await.unwrap();
+        assert!(loaded.is_none(), "Should return None for nonexistent");
+    }
+
+    #[tokio::test]
+    async fn test_delete_export_definition_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Delete nonexistent should succeed (idempotent)
+        let result = router.delete_export_definition("nonexistent").await;
+        assert!(result.is_ok(), "Delete nonexistent should succeed");
+
+        // Save then delete
+        let config = test_export_config("delete-vol");
+        router.save_export(&config).await.unwrap();
+        router.delete_export_definition("delete-vol").await.unwrap();
+
+        // Verify deleted
+        let loaded = router.load_export("delete-vol").await.unwrap();
+        assert!(loaded.is_none(), "Should be deleted");
+
+        // Delete again (idempotent)
+        let result = router.delete_export_definition("delete-vol").await;
+        assert!(result.is_ok(), "Delete again should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_discover_exports_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let discovered = router.discover_exports().await.unwrap();
+        assert!(discovered.is_empty(), "Should discover no exports");
+    }
+
+    #[tokio::test]
+    async fn test_discover_exports_multiple() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Save multiple export definitions directly to S3
+        let configs = vec![
+            ExportConfig {
+                name: "discover-vol1".to_string(),
+                size_gb: 1.0,
+                s3_prefix: None,
+                block_size: None,
+            },
+            ExportConfig {
+                name: "discover-vol2".to_string(),
+                size_gb: 2.0,
+                s3_prefix: None,
+                block_size: None,
+            },
+            ExportConfig {
+                name: "discover-vol3".to_string(),
+                size_gb: 3.0,
+                s3_prefix: None,
+                block_size: None,
+            },
+        ];
+
+        for config in &configs {
+            router.save_export(config).await.unwrap();
+        }
+
+        // Discover exports
+        let discovered = router.discover_exports().await.unwrap();
+        assert_eq!(discovered.len(), 3, "Should discover 3 exports");
+
+        let names: Vec<_> = discovered.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"discover-vol1"));
+        assert!(names.contains(&"discover-vol2"));
+        assert!(names.contains(&"discover-vol3"));
+    }
+
+    #[tokio::test]
+    async fn test_create_export_persists_to_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Create export (should persist to S3)
+        router.create_export(test_export_config("auto-persist"), false).await.unwrap();
+
+        // Verify it was persisted
+        let loaded = router.load_export("auto-persist").await.unwrap();
+        assert!(loaded.is_some(), "Export should be persisted to S3");
+    }
+
+    #[tokio::test]
+    async fn test_remove_export_with_purge_deletes_from_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Create export
+        router.create_export(test_export_config("purge-vol"), false).await.unwrap();
+
+        // Verify persisted
+        let loaded = router.load_export("purge-vol").await.unwrap();
+        assert!(loaded.is_some(), "Should be persisted");
+
+        // Remove with purge
+        router.remove_export("purge-vol", true).await.unwrap();
+
+        // Verify deleted from S3
+        let loaded = router.load_export("purge-vol").await.unwrap();
+        assert!(loaded.is_none(), "Should be deleted from S3");
+    }
+
+    #[test]
+    fn test_extract_export_name() {
+        // Valid paths
+        assert_eq!(
+            super::extract_export_name("test/nbd/vol1/export.json", "test"),
+            Some("vol1".to_string())
+        );
+        assert_eq!(
+            super::extract_export_name("my-data/nbd/my-export/export.json", "my-data"),
+            Some("my-export".to_string())
+        );
+
+        // Invalid paths
+        assert_eq!(
+            super::extract_export_name("test/nbd/vol1/lease.json", "test"),
+            None
+        );
+        assert_eq!(
+            super::extract_export_name("test/nbd/vol1/batches/000000000000", "test"),
+            None
+        );
+        assert_eq!(
+            super::extract_export_name("other/nbd/vol1/export.json", "test"),
+            None
+        );
+        assert_eq!(
+            super::extract_export_name("test/nbd//export.json", "test"),
+            None
+        );
     }
 }

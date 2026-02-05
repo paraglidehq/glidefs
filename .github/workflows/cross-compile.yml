@@ -124,3 +124,43 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
+
+  publish-s3:
+    name: Publish binaries to S3
+    needs: cross-compile
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Prepare and upload to S3
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p release
+          for arch_dir in artifacts/*/; do
+            if [ -d "$arch_dir" ]; then
+              cp "$arch_dir"* release/
+            fi
+          done
+          cd release
+          sha256sum glidefs-* > checksums.txt
+
+          # Upload versioned binaries
+          aws s3 cp . "s3://paraglide-binaries-prod/glidefs/${VERSION}/" --recursive
+
+          # Update latest pointer
+          aws s3 cp . "s3://paraglide-binaries-prod/glidefs/latest/" --recursive

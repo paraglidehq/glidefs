@@ -55,12 +55,12 @@ Guest VM
     │ NBD
     ▼
 ┌─────────────────────────────────────────┐
-│              GlideFS                     │
-│                                          │
+│              GlideFS                    │
+│                                         │
 │   NBD Handler → Write Cache → S3 Sync   │
-│                     │             │      │
-│                Local SSD     Background  │
-│              (dirty queue)    upload     │
+│                     │             │     │
+│                Local SSD     Background │
+│              (dirty queue)    upload    │
 └─────────────────────────────────────────┘
                       │
                       ▼

@@ -201,10 +201,10 @@ jobs:
           sudo zpool create -f migrationpool /dev/nbd0
           sudo zfs create migrationpool/data
 
-          # Write test data
+          # Write test data directly to ZFS pool
           echo "Writing test data on source..."
-          sudo dd if=/dev/urandom of=/mnt/migrationpool-data.bin bs=1M count=50
-          sudo mv /mnt/migrationpool-data.bin /migrationpool/data/
+          sudo dd if=/dev/urandom of=/migrationpool/data/migrationpool-data.bin bs=1M count=50
+          sync
           ORIGINAL_CHECKSUM=$(sudo sha256sum /migrationpool/data/migrationpool-data.bin | cut -d' ' -f1)
           echo "Original checksum: $ORIGINAL_CHECKSUM"
 
@@ -235,6 +235,17 @@ jobs:
             if ! nc -z 127.0.0.1 10809 2>/dev/null; then break; fi
             sleep 1
           done
+
+          # Verify S3 data is present before starting destination
+          # This catches eventual consistency issues with MinIO
+          echo "Verifying S3 batches are visible..."
+          BATCH_COUNT=$(../mc ls myminio/multi-node-test/migration-test/nbd/migrate-vol/batches/ 2>/dev/null | wc -l)
+          echo "Found $BATCH_COUNT batches in S3"
+          if [ "$BATCH_COUNT" -lt 1 ]; then
+            echo "ERROR: No batches found in S3 after drain!"
+            ../mc ls -r myminio/multi-node-test/migration-test/
+            exit 1
+          fi
 
           # Create destination config (same S3 path, different cache)
           cat > /tmp/dest.toml << 'EOF'
@@ -272,12 +283,34 @@ jobs:
 
           # Connect NBD and import pool on destination
           echo "Importing pool on destination..."
-          sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N migrate-vol
-          sudo zpool import migrationpool
+          if ! sudo nbd-client 127.0.0.1 10809 /dev/nbd0 -N migrate-vol; then
+            echo "NBD connection failed!"
+            exit 1
+          fi
+
+          # Import pool with verbose output to catch any issues
+          if ! sudo zpool import migrationpool 2>&1; then
+            echo "Pool import failed! Checking dmesg..."
+            dmesg | tail -50
+            exit 1
+          fi
+
+          # Check pool status before reading
+          echo "Pool status after import:"
+          sudo zpool status migrationpool
 
           # Verify data integrity
           echo "Verifying data integrity..."
-          MIGRATED_CHECKSUM=$(sudo sha256sum /migrationpool/data/migrationpool-data.bin | cut -d' ' -f1)
+          set -o pipefail
+          if ! MIGRATED_CHECKSUM=$(sudo sha256sum /migrationpool/data/migrationpool-data.bin | cut -d' ' -f1); then
+            echo "Checksum calculation failed! Checking pool and dmesg..."
+            sudo zpool status -v migrationpool
+            dmesg | tail -100
+            # List the file to see if it exists
+            ls -la /migrationpool/data/ || true
+            exit 1
+          fi
+          set +o pipefail
           echo "Migrated checksum: $MIGRATED_CHECKSUM"
 
           if [ "$ORIGINAL_CHECKSUM" = "$MIGRATED_CHECKSUM" ]; then

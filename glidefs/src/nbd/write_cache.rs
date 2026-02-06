@@ -745,11 +745,27 @@ impl WriteCache<Recovering> {
     }
 
     fn read_local_block(&self, block_num: u64) -> Result<Bytes, CacheError> {
-        let offset = block_num * self.inner.config.block_size as u64;
-        let mut buf = vec![0u8; self.inner.config.block_size];
+        let block_size = self.inner.config.block_size;
+        let device_size = self.inner.config.device_size;
+        let offset = block_num * block_size as u64;
 
-        // Use sync FD to avoid contention with NBD reads during recovery
-        self.inner.data_file.read_exact_at(&mut buf, offset)?;
+        // Calculate valid bytes for this block (handles partial last block)
+        let valid_bytes = if offset >= device_size {
+            return Ok(Bytes::from(vec![0u8; block_size]));
+        } else {
+            std::cmp::min(block_size as u64, device_size - offset) as usize
+        };
+
+        let mut buf = vec![0u8; block_size];
+        if valid_bytes == block_size {
+            // Use sync FD to avoid contention with NBD reads during recovery
+            self.inner.data_file.read_exact_at(&mut buf, offset)?;
+        } else {
+            // Partial block (last block) - read only valid bytes, rest stays zero
+            self.inner
+                .data_file
+                .read_exact_at(&mut buf[..valid_bytes], offset)?;
+        }
 
         Ok(Bytes::from(buf))
     }
@@ -1379,18 +1395,43 @@ impl WriteCache<Active> {
     }
 
     /// Read a single block from local cache.
+    /// Handles partial last block correctly when device_size is not a multiple of block_size.
     #[allow(dead_code)] // Used by tests
     pub fn read_local_block(&self, block_num: u64) -> Result<Bytes, CacheError> {
-        let offset = block_num * self.inner.config.block_size as u64;
-        self.read(offset, self.inner.config.block_size)
+        self.sync_read_local_block(block_num)
     }
 
     /// Read a single block for sync worker.
     /// Reads from local disk cache (likely from page cache for recently written blocks).
+    ///
+    /// For the last block of a device, if device_size is not a multiple of block_size,
+    /// this reads only the valid bytes and pads the rest with zeros. This is necessary
+    /// because the cache file is sized to device_size, not num_blocks * block_size.
     pub fn sync_read_local_block(&self, block_num: u64) -> Result<Bytes, CacheError> {
-        let offset = block_num * self.inner.config.block_size as u64;
-        let mut buf = vec![0u8; self.inner.config.block_size];
-        self.inner.data_file.read_exact_at(&mut buf, offset)?;
+        let block_size = self.inner.config.block_size;
+        let device_size = self.inner.config.device_size;
+        let offset = block_num * block_size as u64;
+
+        // Calculate how many bytes are valid for this block
+        // For most blocks this is block_size, but for the last partial block
+        // it may be less (device_size - offset)
+        let valid_bytes = if offset >= device_size {
+            // Block is entirely beyond device - shouldn't happen but handle gracefully
+            return Ok(Bytes::from(vec![0u8; block_size]));
+        } else {
+            std::cmp::min(block_size as u64, device_size - offset) as usize
+        };
+
+        let mut buf = vec![0u8; block_size];
+        if valid_bytes == block_size {
+            // Full block - read normally
+            self.inner.data_file.read_exact_at(&mut buf, offset)?;
+        } else {
+            // Partial block (last block) - read only valid bytes, rest stays zero
+            self.inner
+                .data_file
+                .read_exact_at(&mut buf[..valid_bytes], offset)?;
+        }
         Ok(Bytes::from(buf))
     }
 
@@ -3161,6 +3202,69 @@ mod tests {
         // Verify data made it to S3
         let s3_data = s3.read_block(0).await.unwrap();
         assert_eq!(&s3_data[..14], b"important data");
+    }
+
+    #[tokio::test]
+    async fn test_partial_last_block_sync() {
+        // Regression test: When device_size is not a multiple of block_size,
+        // the last block is partial. sync_read_local_block must handle this
+        // by reading only valid bytes and padding with zeros.
+        //
+        // This bug caused migration failures because the last partial block
+        // (containing ZFS label L3) would fail to sync to S3, and the drain
+        // would report success despite leaving data behind.
+        //
+        // Example: 2GB device (2,000,000,000 bytes) with 128KB blocks:
+        // - num_blocks = 15,259
+        // - last block starts at 1,999,998,208
+        // - only 1,792 bytes are valid in last block
+
+        let dir = TempDir::new().unwrap();
+
+        // Use a device size that's NOT a multiple of block_size
+        // 100 blocks + 1000 extra bytes = partial last block
+        let block_size = 4096;
+        let device_size = 100 * block_size as u64 + 1000; // 101 blocks, last is partial
+
+        let config = WriteCacheConfig {
+            cache_dir: dir.path().to_path_buf(),
+            device_name: "partial_test".to_string(),
+            device_size,
+            block_size,
+        };
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let s3 = S3BlockStore::new(Arc::clone(&object_store), "test", block_size)
+            .with_blocks_per_batch(10);
+
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = cache.finish_recovery(&s3).await.unwrap();
+
+        // Write data to the LAST (partial) block
+        let last_block = 100u64; // block indices 0-100, so 101 blocks total
+        let last_block_offset = last_block * block_size as u64;
+
+        // Write 1000 bytes (all valid bytes in the partial block)
+        let data = vec![0xABu8; 1000];
+        cache.write(last_block_offset, &data).unwrap();
+
+        assert_eq!(cache.dirty_block_count(), 1);
+
+        // This is the critical test: sync_read_local_block must not fail
+        // Previously it would try to read 4096 bytes starting at offset 409600
+        // but the file is only 410600 bytes (100*4096 + 1000), so read_exact_at
+        // would fail trying to read 4096 bytes when only 1000 are available.
+        let block_data = cache.sync_read_local_block(last_block).unwrap();
+
+        // Verify: first 1000 bytes should be our data, rest should be zeros
+        assert_eq!(&block_data[..1000], &data[..]);
+        assert!(block_data[1000..].iter().all(|&b| b == 0));
+
+        // Now verify full drain works
+        cache.drain_for_snapshot(&s3).await.unwrap();
+
+        assert_eq!(cache.dirty_block_count(), 0);
+        assert_eq!(cache.syncing_block_count(), 0);
     }
 }
 

@@ -93,7 +93,6 @@ disk_size_gb = 100.0
 
 [storage]
 url = "s3://my-bucket/vms"
-encryption_password = "${GLIDEFS_PASSWORD}"
 
 [servers.nbd]
 unix_socket = "/var/run/glidefs.sock"

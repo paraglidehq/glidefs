@@ -33,7 +33,8 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:matklad.github.io)",
       "Bash(RUSTFLAGS=\"--cfg loom\" cargo test:*)",
-      "Bash(cargo +nightly fuzz:*)"
+      "Bash(cargo +nightly fuzz:*)",
+      "WebFetch(domain:fly.io)"
     ]
   }
 }

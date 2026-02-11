@@ -525,9 +525,9 @@ graph TB
 ```
 
 **How the refcount works:**
-- Stored as metadata on the base manifest object in S3 (or in a small sidecar object `bases/refcounts/{image-name}`).
+- Stored in a small sidecar object `bases/refcounts/{image-name}`.
 - Incremented when a VM is created from this base. Decremented when a VM is deleted.
-- Updated via conditional PUT (If-Match ETag) to prevent lost updates.
+- **Updated by the control plane, not by individual hosts.** The control plane already serializes VM creation/deletion — it's the natural place to batch refcount updates. This avoids conditional PUT (If-Match ETag) contention on S3 during burst scaling events (e.g., autoscaler spins up 50 VMs from the same base simultaneously — 50 concurrent conditional PUTs would mostly fail and retry). Since the control plane processes these requests, it can coalesce refcount increments into a single PUT per base per batch.
 - The refcount is an **optimization hint**, not a correctness mechanism. If it drifts (crash between VM delete and refcount decrement), the worst case is that GC skips a scan it could have done — orphaned blocks accumulate until the next reconciliation.
 
 **Reconciliation:** Periodically (e.g., daily), reconcile refcounts by scanning all tenant manifests and counting actual references to each base image. This corrects any drift. The reconciliation is the same full scan that mark-and-sweep would do — but it only runs when refcounts suggest it's needed, or on a slow schedule as a safety net.

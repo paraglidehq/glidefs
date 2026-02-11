@@ -44,7 +44,7 @@ A storage layer for microVMs that provides fast boot, cheap cross-host forks, du
 
 **Write amplification.** Content-addressing means every write to a chunk produces a new block, even if only a small portion changed. With 128KB chunks, a 4KB random write still produces a 128KB new block — 32x amplification. This is substantially better than naive 4MB chunks (1000x) but still real. Workloads with heavy small random writes (databases, logging) will generate more S3 traffic and storage than the raw write volume suggests. See the Chunk Size & Write Amplification section for the full analysis and mitigations.
 
-**Block map memory at scale.** A 100GB disk with 128KB chunks = ~800K entries per VM. At 32 bytes per entry (offset + hash), that's ~25MB per VM. 100 VMs per host = ~2.5GB of block map memory. This is manageable but not negligible — it needs to be accounted for in host memory planning. See the Block Map section for the full analysis.
+**Block map memory at scale.** A 100GB disk with 128KB chunks = ~800K entries per VM. At 17 bytes per entry (BLAKE3-128 hash + source tag), that's ~13MB per VM in the dense case. With sparse representation (typical 10GB of actual written data), it's ~1.3MB per VM. At 100 VMs per host, block maps consume ~133MB (dense) or ~133MB total in practice — manageable on any host running that many VMs. See the Block Map section for the full analysis.
 
 **Garbage collection is a real system.** Deleted VMs leave orphaned blocks in S3. Cleaning these up under concurrent fork/delete/write operations is one of the harder parts of the design. It requires its own concrete design, not just a passing mention. See the Garbage Collection section.
 
@@ -83,7 +83,7 @@ graph TB
     end
 
     subgraph S3["S3 — Durable Store"]
-        BLOCKS["blocks/{sha256}<br/>Content-addressed, LZ4 compressed"]
+        BLOCKS["blocks/{blake3}<br/>Content-addressed, LZ4 compressed"]
         MANIFESTS["manifests/{vm-id}<br/>Block maps"]
         BASES["bases/{image-name}<br/>Shared base block maps"]
     end
@@ -111,21 +111,21 @@ sequenceDiagram
     VM->>NBD: read(offset, length)
     NBD->>D: NBD_CMD_READ
     D->>M: resolve offset → chunk hash
-    M-->>D: sha256:abc123
+    M-->>D: blake3:abc123
 
-    D->>MC: lookup sha256:abc123
+    D->>MC: lookup blake3:abc123
     alt Memory Hit (~100ns)
         MC-->>D: chunk data
     else Memory Miss
-        D->>SC: lookup sha256:abc123
+        D->>SC: lookup blake3:abc123
         alt SSD Hit (~100μs)
             SC-->>D: chunk data
             D->>MC: promote to memory tier
         else SSD Miss
-            D->>S3: GET blocks/sha256:abc123
+            D->>S3: GET blocks/blake3:abc123
             S3-->>D: compressed chunk
             D->>D: decompress LZ4
-            D->>D: verify hash(data) == sha256:abc123
+            D->>D: verify blake3_128(data) == blake3:abc123
             D->>SC: store in SSD cache
             D->>MC: store in memory cache
         end
@@ -154,23 +154,23 @@ sequenceDiagram
 
     VM->>NBD: write(offset, data)
     NBD->>D: NBD_CMD_WRITE
-    D->>D: hash(raw data) → sha256:def456
-    D->>WAL: append(offset, sha256:def456, raw data)
-    D->>MC: store sha256:def456 (raw)
-    D->>SC: store sha256:def456 (raw)
-    D->>M: update offset → sha256:def456
+    D->>D: blake3_128(raw data) → blake3:def456
+    D->>WAL: append(offset, blake3:def456, raw data)
+    D->>MC: store blake3:def456 (raw)
+    D->>SC: store blake3:def456 (raw)
+    D->>M: update offset → blake3:def456
     D-->>NBD: ack
     NBD-->>VM: success
 
     Note over D,S3: Background flush (async)
     D->>D: compress(raw data) → LZ4
-    D->>S3: PUT blocks/sha256:def456 (compressed)
+    D->>S3: PUT blocks/blake3:def456 (compressed)
     S3-->>D: confirmed
     D->>WAL: mark entry flushed
     D->>S3: PUT manifests/{vm-id} (periodic)
 ```
 
-**Key detail:** Hashing is always done on raw (uncompressed) data. This ensures dedup works correctly — the same raw content always produces the same hash regardless of compression. Compression happens only at the S3 boundary.
+**Key detail:** BLAKE3-128 hashing is always done on raw (uncompressed) data. This ensures dedup works correctly — the same raw content always produces the same hash regardless of compression. Compression happens only at the S3 boundary.
 
 ---
 
@@ -182,15 +182,15 @@ This is one of the most important design decisions. The chunk size determines th
 
 | Chunk Size | Write Amp (4KB write) | Block Map Size (100GB disk) | Block Map Memory | S3 Objects (100GB) |
 |------------|----------------------|----------------------------|-----------------|-------------------|
-| 4MB | 1000x | ~25K entries | ~800KB | ~25K |
-| 1MB | 256x | ~100K entries | ~3.2MB | ~100K |
-| 128KB | 32x | ~800K entries | ~25MB | ~800K |
-| 64KB | 16x | ~1.6M entries | ~50MB | ~1.6M |
+| 4MB | 1000x | ~25K entries | ~415KB | ~25K |
+| 1MB | 256x | ~100K entries | ~1.7MB | ~100K |
+| 128KB | 32x | ~800K entries | ~13MB | ~800K |
+| 64KB | 16x | ~1.6M entries | ~26MB | ~1.6M |
 
 128KB is the sweet spot. Rationale:
 
 - **32x write amplification is acceptable.** Typical VM workloads (app servers, build systems) do mostly large sequential writes (package installs, log writes, artifact creation) where write amp is close to 1x. The 32x case only hits on small random writes, which are a minority of I/O for these workloads. For database-heavy VMs, this is a known cost.
-- **25MB block map per VM is manageable.** At 100 VMs per host, that's 2.5GB — significant but well within typical host memory budgets. Block maps are read-heavy (every I/O resolves through them) so they should be fully in memory.
+- **13MB block map per VM is manageable.** At 100 VMs per host, that's 1.3GB in the dense case — well within typical host memory budgets. With sparse representation (typical workloads), it's ~130MB total. Block maps are read-heavy (every I/O resolves through them) so they should be fully in memory.
 - **800K S3 objects per full 100GB disk is fine.** Most VMs don't touch all 100GB. A VM with 10GB of actual written data has ~80K objects. S3 handles this without issue. LIST operations for GC are the concern at scale — addressed in the GC section.
 - **Matches v1's proven chunk size.** v1 uses 128KB blocks with positional batching and it works. Don't fix what isn't broken.
 
@@ -202,30 +202,33 @@ This is one of the most important design decisions. The chunk size determines th
 
 The block map is the critical metadata structure. Every read and write resolves through it. It must be fast and its memory footprint must be predictable.
 
-**Structure:** An ordered array mapping chunk index → content hash.
+**Structure:** An ordered array mapping chunk index → (content hash, source).
 
 ```
 Block Map for VM-A (100GB disk, 128KB chunks):
-  Index 0      → sha256:aabbcc...  (bytes 0 - 128KB)
-  Index 1      → sha256:ddeeff...  (bytes 128KB - 256KB)
+  Index 0      → (blake3:aabbccdd..., base)    (bytes 0 - 128KB)
+  Index 1      → (blake3:ddeeff00..., base)    (bytes 128KB - 256KB)
+  Index 2      → (blake3:ff112233..., tenant)  (bytes 256KB - 384KB)
   ...
-  Index 819199 → sha256:112233...  (bytes 99.99GB - 100GB)
+  Index 819199 → (blake3:11223344..., base)    (bytes 99.99GB - 100GB)
 ```
 
-**Per-entry size:** 32 bytes (sha256 hash). No offset needed — the array index *is* the offset (index × chunk_size = byte offset).
+**Per-entry size:** 17 bytes (16-byte BLAKE3-128 hash + 1-byte source tag). No offset needed — the array index *is* the offset (index × chunk_size = byte offset). The source tag (`base` or `tenant`) tells the daemon exactly where to resolve the block in S3 — `blocks/bases/{hash}` or `blocks/tenants/{tenant}/{hash}` — avoiding a 404 fallback chain. When a VM writes to a chunk that was previously `base`, the new entry becomes `(new_hash, tenant)`.
+
+**Why BLAKE3-128 over SHA256:** Content-addressing needs collision resistance, not cryptographic security against adversaries. 128 bits gives a birthday bound of ~2^64 blocks — at 128KB per block, that's 2 exabytes of unique data per tenant. No tenant will ever approach this. BLAKE3 is also ~3-4x faster than SHA256, reducing the hashing cost on the write path (~5μs for 128KB vs ~20μs). Shorter hashes mean smaller block maps, smaller manifests, shorter S3 keys, and fewer bytes on the wire.
 
 **Memory analysis:**
 
 | VMs per host | Block map memory (100GB disks) | Block map memory (10GB actual) |
 |-------------|-------------------------------|-------------------------------|
-| 10 | 250MB | 25MB |
-| 50 | 1.25GB | 125MB |
-| 100 | 2.5GB | 250MB |
-| 500 | 12.5GB | 1.25GB |
+| 10 | 133MB | 13MB |
+| 50 | 664MB | 66MB |
+| 100 | 1.33GB | 133MB |
+| 500 | 6.64GB | 664MB |
 
-**Sparse representation:** Most VMs don't touch all 100GB. Unwritten regions point to a well-known "zero block" hash. A sparse map only stores non-zero entries, dramatically reducing actual memory usage. A VM with 10GB of written data on a 100GB disk stores ~80K entries (~2.5MB), not 800K (~25MB).
+**Sparse representation:** Most VMs don't touch all 100GB. Unwritten regions point to a well-known "zero block" hash. A sparse map only stores non-zero entries, dramatically reducing actual memory usage. A VM with 10GB of written data on a 100GB disk stores ~80K entries (~1.3MB), not 800K (~13MB).
 
-**Manifest sync to S3:** The full block map is serialized and uploaded to S3 periodically (every N seconds or M writes). This is the checkpoint. On crash recovery, the last manifest + WAL replay reconstructs the current state. Manifest size for a 100GB fully-written disk: ~25MB uncompressed, ~5-10MB compressed. Acceptable for periodic S3 PUTs.
+**Manifest sync to S3:** The full block map is serialized and uploaded to S3 periodically (every N seconds or M writes). This is the checkpoint. On crash recovery, the last manifest + WAL replay reconstructs the current state. Manifest size for a 100GB fully-written disk: ~13MB uncompressed, ~3-5MB compressed. Acceptable for periodic S3 PUTs.
 
 ---
 
@@ -234,24 +237,11 @@ Block Map for VM-A (100GB disk, 128KB chunks):
 The key feature this architecture enables. Forking a 100G VM is a metadata copy, not a data copy. Works across hosts.
 
 ```mermaid
-sequenceDiagram
-    participant API as Control Plane
-    participant M as Block Map Store
-    participant S3 as S3
-
-    API->>S3: GET manifests/vm-a
-    S3-->>API: block map (list of chunk hashes)
-    API->>S3: PUT manifests/vm-c (copy of vm-a's block map)
-    API->>API: Create new NBD device for vm-c (any host)
-    Note over API: Total fork cost: ~milliseconds<br/>Storage cost: 0 bytes until vm-c writes
-```
-
-```mermaid
 graph LR
     subgraph "After Fork — Shared Blocks"
-        MA["VM A Block Map"] --> B1["chunk: sha256:aaa"]
-        MA --> B2["chunk: sha256:bbb"]
-        MA --> B3["chunk: sha256:ccc"]
+        MA["VM A Block Map"] --> B1["chunk: blake3:aaa"]
+        MA --> B2["chunk: blake3:bbb"]
+        MA --> B3["chunk: blake3:ccc"]
 
         MC["VM C Block Map<br/>(fork of A)"] --> B1
         MC --> B2
@@ -260,10 +250,107 @@ graph LR
 
     subgraph "After VM C Writes"
         MC2["VM C Block Map"] --> B1
-        MC2 --> B4["chunk: sha256:ddd<br/>(new, unique to C)"]
+        MC2 --> B4["chunk: blake3:ddd<br/>(new, unique to C)"]
         MC2 --> B3
     end
 ```
+
+### The Consistency Problem
+
+The source VM is alive and writing. Its state exists in three places:
+
+```
+S3 manifest          ← last periodic sync, maybe 5s stale
+S3 blocks            ← all blocks flushed so far
+Host WAL             ← writes since last flush (not in S3 yet)
+Host memory/cache    ← block map updates not yet persisted
+```
+
+If you copy the S3 manifest, the fork gets the state as of the last manifest sync. It misses blocks in the WAL that haven't been uploaded and block map entries that haven't been persisted. This is fine — but the consistency guarantee should be explicit.
+
+### Two Fork Modes
+
+**Lazy fork (default)** — copy the S3 manifest as-is. No coordination with the source host.
+
+**Consistent fork** — ask the source host to flush first. The fork gets the exact current state.
+
+```mermaid
+sequenceDiagram
+    participant CP as Control Plane
+    participant SRC as Source Host (VM-A running)
+    participant S3 as S3
+    participant DST as Destination Host
+
+    alt Lazy Fork (default)
+        CP->>S3: GET manifests/{tenant}/vm-a
+        S3-->>CP: manifest (as of last sync)
+        CP->>S3: PUT manifests/{tenant}/vm-c (copy)
+        CP->>DST: create export vm-c
+        Note over CP: Fork is consistent as of last manifest sync.<br/>Misses writes in WAL (bounded by flush interval, ~5s).<br/>Zero coordination with source host.
+
+    else Consistent Fork
+        CP->>SRC: POST /api/exports/vm-a/snapshot
+        Note over SRC: 1. Bump WAL sequence to N<br/>2. Flush all entries ≤ N to S3<br/>3. Write manifest reflecting state at N<br/>4. VM continues writing (entries > N)
+        SRC->>S3: PUT blocks (all unflushed ≤ N)
+        SRC->>S3: PUT manifests/{tenant}/vm-a (at sequence N)
+        SRC-->>CP: { manifest_etag: "abc123", sequence: N }
+
+        CP->>S3: GET manifests/{tenant}/vm-a (If-Match: "abc123")
+        S3-->>CP: manifest (exact state at sequence N)
+        CP->>S3: PUT manifests/{tenant}/vm-c (copy)
+        CP->>DST: create export vm-c
+        Note over CP: Fork is consistent as of sequence N.<br/>Source VM was never paused — it kept writing.
+    end
+```
+
+### Why Lazy Fork Is the Right Default
+
+For the primary use case — preview environments and branch deploys — a fork that's a few seconds stale is perfectly fine. You're forking a development database or an app server to create a preview. Whether the fork reflects the state from 3 seconds ago or right now doesn't matter.
+
+Lazy fork has critical operational properties:
+- **Zero coordination.** Works even if the source host is unreachable, overloaded, or being migrated itself.
+- **Zero impact on source VM.** No flush stall, no I/O pause, no latency spike.
+- **Idempotent.** Retry-safe. No locks held.
+
+### Consistent Fork: The Snapshot Endpoint
+
+For cases where you need an exact point-in-time copy (e.g., forking a production database for debugging), the `/snapshot` endpoint provides it without pausing the source VM.
+
+The key mechanism is the **WAL sequence number**:
+
+```
+WAL entries:
+  seq 1: write block 42 → blake3:aaa
+  seq 2: write block 17 → blake3:bbb
+  seq 3: write block 42 → blake3:ccc    ← overwrote block 42
+  ─── snapshot requested, cut point = seq 3 ───
+  seq 4: write block 99 → blake3:ddd    ← after snapshot, not included
+  seq 5: write block 17 → blake3:eee    ← after snapshot, not included
+```
+
+The snapshot operation:
+1. Atomically read the current WAL sequence (e.g., N=3). This is a single atomic load — no lock, no pause.
+2. Flush all WAL entries with sequence ≤ N to S3 (blocks + manifest).
+3. Return the manifest ETag to the caller.
+4. The source VM keeps writing normally. Entries with sequence > N are unaffected.
+
+The source VM is **never paused**. The only cost is a flush of already-pending WAL entries, which would happen soon anyway via the background sync.
+
+### Race Conditions
+
+**Fork during write:** A write arrives at the source between the manifest read and the fork's first access. Not a problem — the fork's manifest doesn't reference the new block. The fork has a consistent snapshot.
+
+**Fork during fork:** Two forks of the same VM requested simultaneously. Both read the same manifest (or close versions). Both produce independent copies. No conflict — manifest PUTs are to different keys (`vm-c` and `vm-d`).
+
+**Source VM deleted during fork:** The fork's manifest is already written to S3. It references blocks by hash. GC won't touch those blocks — they're in the fork's manifest, which is in the live set. The fork survives independently.
+
+**Fork of a fork:** Same operation. Copy the manifest. Blocks are shared transitively. GC sees all manifests, keeps all referenced blocks.
+
+**Consistent fork + concurrent writes:** The WAL sequence cut is atomic. Writes that arrive after the cut get sequence > N and aren't included in the flush. The manifest at sequence N is internally consistent — it reflects all writes ≤ N and none > N.
+
+### Self-Containment Property
+
+The S3 manifest is always self-contained. Every hash in it corresponds to a block that exists in S3 (either in `blocks/bases/` or `blocks/tenants/{tid}/`). Unflushed blocks exist only in the WAL and local cache — they aren't in any manifest. You can copy a manifest to any host and it resolves completely. No dangling references.
 
 ---
 
@@ -311,12 +398,174 @@ graph TB
 
 ```
 blocks/
-  bases/{sha256}          ← shared, anyone can read
-  tenants/{tenant-id}/{sha256}  ← isolated, tenant-scoped
+  bases/{blake3}                ← shared, anyone can read
+  tenants/{tenant-id}/{blake3}  ← isolated, tenant-scoped
 
 manifests/
-  {tenant-id}/{vm-id}     ← always tenant-scoped
+  {tenant-id}/{vm-id}           ← always tenant-scoped
+
+bases/
+  manifests/{image-name}        ← blessed base image manifests
+  refcounts/{image-name}        ← base image reference counts (GC optimization)
 ```
+
+---
+
+## Base Image Registry
+
+Base images are the shared foundation — Ubuntu, Node runtimes, Python environments. They need to be chunked, uploaded, and made available to all tenants. This is an offline pipeline, not a hot-path daemon operation.
+
+### Bless Pipeline
+
+An admin or CI pipeline builds a raw disk image, then blesses it into the content-addressed store:
+
+```bash
+glidefs bless --image ubuntu-22.04-node20.raw --name ubuntu-22.04-node20-v3
+```
+
+```mermaid
+sequenceDiagram
+    participant CLI as glidefs bless
+    participant DISK as Raw Disk Image
+    participant S3 as S3
+
+    CLI->>DISK: open image file
+
+    loop For each 128KB chunk
+        CLI->>CLI: read 128KB
+        CLI->>CLI: blake3_128(raw) → blake3:aabb...
+        CLI->>CLI: compress(raw) → LZ4
+        CLI->>S3: HEAD blocks/bases/blake3:aabb...
+        alt Already exists (dedup across base versions)
+            CLI->>CLI: skip upload
+        else New block
+            CLI->>S3: PUT blocks/bases/blake3:aabb... (compressed)
+        end
+        CLI->>CLI: append (hash, base) to manifest
+    end
+
+    CLI->>S3: PUT bases/manifests/ubuntu-22.04-node20-v3
+    Note over S3: Manifest = ordered array of (hash, source) entries<br/>+ metadata: name, created_at, disk_size, chunk_count
+```
+
+**Key properties:**
+- **Dedup across base versions.** Ubuntu 22.04 + Node 18 and Ubuntu 22.04 + Node 20 share ~95% of their OS blocks. The HEAD-before-PUT check means only genuinely new chunks get uploaded. The second base image is nearly free to store.
+- **Idempotent.** Running bless again with the same image and name produces the same hashes, same manifest. A no-op.
+- **Offline.** No daemon involvement. The CLI talks directly to S3. Runs in CI, on a dev machine, wherever.
+- **No layers.** A base image is a flat disk image. Composition (Ubuntu + Node + your framework) happens at image build time, not the storage layer. Layers add complexity for marginal benefit when content-addressing already deduplicates across images.
+
+### Creating a VM from a Base Image
+
+```mermaid
+sequenceDiagram
+    participant CP as Control Plane
+    participant S3 as S3
+    participant HOST as Target Host
+
+    CP->>S3: GET bases/manifests/ubuntu-22.04-node20-v3
+    S3-->>CP: base manifest (list of chunk hashes + metadata)
+    CP->>CP: increment base refcount for ubuntu-22.04-node20-v3
+    CP->>S3: PUT manifests/{tenant-id}/vm-new (copy of base manifest)
+    CP->>HOST: POST /api/exports { name: "vm-new" }
+    HOST->>S3: GET manifests/{tenant-id}/vm-new
+    HOST->>HOST: Load block map into memory
+    Note over HOST: VM starts. All reads resolve to blocks/bases/...<br/>First write creates a block in blocks/tenants/{tenant}/...<br/>and updates that entry's source tag from base → tenant.
+```
+
+The VM's manifest starts as an exact copy of the base manifest. Every entry has source tag `base`. As the VM writes, individual entries flip to `(new_hash, tenant)`. Unmodified chunks continue resolving from the shared base namespace — no data copied, no storage consumed.
+
+### Block Resolution with Source Tags
+
+The source tag in each manifest entry tells the daemon exactly where to look:
+
+```
+1. Memory cache    → hit? serve it  (~100ns)
+2. SSD cache       → hit? serve it  (~100μs)
+3. S3              → source tag == base?
+                       blocks/bases/{hash}          (10-50ms)
+                     source tag == tenant?
+                       blocks/tenants/{tenant}/{hash} (10-50ms)
+```
+
+No 404 fallback chain. No bloom filters. The manifest is the source of truth for both *what* block and *where* it lives.
+
+### Versioning and Retirement
+
+Base images are immutable once blessed. New version = new name. Old versions persist until explicitly retired.
+
+```
+bases/manifests/
+  ubuntu-22.04-node20-v1    ← old, maybe retired
+  ubuntu-22.04-node20-v2    ← previous
+  ubuntu-22.04-node20-v3    ← current
+```
+
+The control plane decides which version new VMs use. Old VMs keep their manifests — they reference blocks by hash, not by base image name. Retiring a base image never breaks existing VMs.
+
+### Base Block Garbage Collection
+
+Base blocks require their own GC, separate from per-tenant GC. The challenge: determining whether a base block is still referenced requires scanning manifests across *all* tenants. At scale (thousands of VMs across hundreds of tenants), that's expensive.
+
+**Solution: reference counting as a fast path, mark-and-sweep as the source of truth.**
+
+```mermaid
+graph TB
+    subgraph "Fast Path — Reference Counting"
+        CREATE["VM created from base"] -->|"refcount++"| RC["Base Image Refcount<br/>(stored in base manifest metadata)"]
+        DELETE["VM deleted"] -->|"refcount--"| RC
+        RC -->|"refcount > 0"| SKIP["Skip GC scan for this base<br/>(blocks definitely still needed)"]
+        RC -->|"refcount == 0"| MAYBE["Maybe orphaned — trigger full sweep"]
+    end
+
+    subgraph "Slow Path — Mark-and-Sweep (source of truth)"
+        MAYBE --> SCAN["Scan ALL manifests (all tenants)<br/>for base-sourced entries"]
+        SCAN --> LIVE["Build live set of referenced base hashes"]
+        LIVE --> SWEEP["Delete unreferenced base blocks<br/>older than grace period"]
+    end
+```
+
+**How the refcount works:**
+- Stored as metadata on the base manifest object in S3 (or in a small sidecar object `bases/refcounts/{image-name}`).
+- Incremented when a VM is created from this base. Decremented when a VM is deleted.
+- Updated via conditional PUT (If-Match ETag) to prevent lost updates.
+- The refcount is an **optimization hint**, not a correctness mechanism. If it drifts (crash between VM delete and refcount decrement), the worst case is that GC skips a scan it could have done — orphaned blocks accumulate until the next reconciliation.
+
+**Reconciliation:** Periodically (e.g., daily), reconcile refcounts by scanning all tenant manifests and counting actual references to each base image. This corrects any drift. The reconciliation is the same full scan that mark-and-sweep would do — but it only runs when refcounts suggest it's needed, or on a slow schedule as a safety net.
+
+**Why this hybrid approach:**
+- **Common case (refcount > 0):** O(1) check, no scan needed. Most base images are actively used. This covers 99% of GC cycles.
+- **Retirement case (refcount == 0):** Full scan to confirm no references remain. This is expensive but rare — it only happens when an admin retires a base image and all VMs using it have been deleted.
+- **Failure mode is always conservative.** A stale refcount > 0 means we keep blocks longer than necessary (storage cost, not data loss). Mark-and-sweep catches it eventually.
+
+**Retirement flow:**
+
+```mermaid
+sequenceDiagram
+    participant ADMIN as Admin / CI
+    participant S3 as S3
+    participant GC as GC Worker
+
+    ADMIN->>S3: DELETE bases/manifests/ubuntu-22.04-node20-v1
+    Note over ADMIN: Old base manifest removed.<br/>Existing VMs unaffected — their manifests<br/>reference blocks by hash, not by image name.
+
+    Note over GC: Next base GC cycle:
+    GC->>S3: GET bases/refcounts/ubuntu-22.04-node20-v1
+    alt refcount > 0
+        GC->>GC: skip (blocks still referenced)
+    else refcount == 0
+        GC->>GC: full scan to confirm
+        GC->>S3: LIST manifests across all tenants
+        GC->>GC: check for base-sourced entries referencing v1 blocks
+        alt No references found
+            GC->>S3: LIST blocks/bases/* referenced only by v1
+            GC->>S3: DELETE orphaned base blocks (older than grace period)
+        else References still exist (refcount was wrong)
+            GC->>S3: correct refcount
+        end
+    end
+```
+
+**Critical safety property:** Deleting a base manifest never breaks existing VMs. VM manifests reference blocks by hash. The blocks persist in `blocks/bases/` until no manifest anywhere references them and the grace period expires.
 
 ---
 
@@ -367,7 +616,7 @@ All blocks are compressed with LZ4 before upload to S3. LZ4 is chosen for its sp
 ```mermaid
 graph LR
     subgraph "Write Path"
-        W_RAW["Raw block from VM"] --> W_HASH["hash(raw) → sha256"]
+        W_RAW["Raw block from VM"] --> W_HASH["blake3_128(raw) → hash"]
         W_HASH --> W_WAL["WAL: store raw"]
         W_HASH --> W_CACHE["Cache: store raw"]
         W_HASH --> W_COMPRESS["compress(raw) → LZ4"]
@@ -376,13 +625,13 @@ graph LR
 
     subgraph "Read Path (cache miss)"
         R_S3["S3: read compressed"] --> R_DECOMPRESS["decompress(LZ4) → raw"]
-        R_DECOMPRESS --> R_VERIFY["hash(raw) == expected?"]
+        R_DECOMPRESS --> R_VERIFY["blake3_128(raw) == expected?"]
         R_VERIFY --> R_CACHE["Cache: store raw"]
     end
 ```
 
 **Design decisions:**
-- **Hash before compress.** Dedup is based on raw content hashes. Same raw data always produces the same hash, regardless of LZ4 version or compression level. This is critical — if we hashed compressed data, different compression runs of identical content could produce different hashes, breaking dedup.
+- **Hash before compress.** Dedup is based on raw content hashes (BLAKE3-128). Same raw data always produces the same hash, regardless of LZ4 version or compression level. This is critical — if we hashed compressed data, different compression runs of identical content could produce different hashes, breaking dedup.
 - **Cache stores raw (uncompressed) blocks.** Cache reads are on the hot path. Decompression on every cache hit adds CPU cost for no benefit — the cache exists to be fast.
 - **WAL stores raw blocks.** WAL replay needs to re-upload to S3, which means compressing during replay. Storing raw in the WAL keeps the write path simple (no compression before ack) and pays the compression cost during background flush, off the critical path.
 - **S3 stores compressed blocks.** This is where compression pays for itself — reduced storage cost (~1.5-2x for typical OS/app data) and reduced transfer time on cache misses.
@@ -412,11 +661,11 @@ sequenceDiagram
     WAL-->>D: entries since last flush
 
     loop For each unflushed WAL entry
-        D->>D: hash(data) → verify sha256
+        D->>D: blake3_128(data) → verify hash
         D->>D: compress(data) → LZ4
-        D->>S3: PUT blocks/{sha256} (compressed)
+        D->>S3: PUT blocks/{blake3} (compressed)
         S3-->>D: confirmed
-        D->>M: update offset → sha256
+        D->>M: update offset → hash
     end
 
     D->>S3: PUT manifests/{vm-id} (updated)
@@ -426,7 +675,7 @@ sequenceDiagram
 
 **WAL properties:**
 - Append-only file on local SSD. Sequential writes only — fast and predictable.
-- Each entry: `(vm-id, offset, chunk_hash, raw_chunk_data)`. Self-contained for replay.
+- Each entry: `(vm-id, offset, blake3_128_hash, raw_chunk_data)`. Self-contained for replay.
 - Entries are marked flushed after S3 confirms the block upload.
 - Manifest is persisted to S3 periodically (e.g., every N seconds or M entries), not on every write.
 - On recovery: load last-known-good manifest from S3, replay unflushed WAL entries, done.
@@ -525,7 +774,7 @@ sequenceDiagram
 
 **Operational design:**
 - **Frequency:** Daily or every few hours. GC is not latency-sensitive — running it less frequently means slightly more orphaned storage, not correctness issues.
-- **Scope:** Per-tenant. Each tenant's blocks are GC'd independently. Shared base image blocks are never GC'd (they're managed separately as part of the base image registry).
+- **Scope:** Per-tenant. Each tenant's blocks are GC'd independently. Shared base image blocks have their own GC with refcount-accelerated mark-and-sweep — see the Base Image Registry section.
 - **Cost:** The main cost is S3 LIST operations. For a tenant with 1M blocks, a full LIST is ~1000 requests (1000 keys per page). At current S3 pricing, this is negligible. The live set construction requires reading all manifests — for a tenant with 100 VMs, that's 100 GET requests.
 - **Consistency:** GC is eventually consistent. A sweep might miss a block that was just orphaned. It'll be caught on the next sweep. This is fine — the cost is a few hours of extra storage, not correctness.
 
@@ -544,15 +793,15 @@ Tenant data in S3 is encrypted per-tenant using S3 server-side encryption with K
 graph TB
     subgraph "S3 Encryption Model"
         subgraph "Shared Base Blocks"
-            SB["blocks/bases/{sha256}<br/>SSE-S3 (default key)<br/>Public, non-secret"]
+            SB["blocks/bases/{blake3}<br/>SSE-S3 (default key)<br/>Public, non-secret"]
         end
 
         subgraph "Tenant A Blocks"
-            TA["blocks/tenants/a/{sha256}<br/>SSE-KMS (tenant-a-key)"]
+            TA["blocks/tenants/a/{blake3}<br/>SSE-KMS (tenant-a-key)"]
         end
 
         subgraph "Tenant B Blocks"
-            TB["blocks/tenants/b/{sha256}<br/>SSE-KMS (tenant-b-key)"]
+            TB["blocks/tenants/b/{blake3}<br/>SSE-KMS (tenant-b-key)"]
         end
     end
 
@@ -616,7 +865,7 @@ Content-addressing gives us free integrity checks. Every block is keyed by its h
 graph TB
     subgraph "On S3 Read (cache miss)"
         PULL["GET blocks/{expected_hash}"] --> DECOMP["decompress LZ4"]
-        DECOMP --> HASH["hash(raw data)"]
+        DECOMP --> HASH["blake3_128(raw data)"]
         HASH --> CMP{"hash == expected?"}
         CMP -->|"Yes"| CACHE_STORE["Store in cache, serve to VM"]
         CMP -->|"No"| RETRY["Evict, re-pull from S3"]
@@ -647,14 +896,15 @@ graph TB
 |-----------|------|---------------------|
 | **NBD Device** | 1:1 per VM, block device interface | Linux kernel NBD, socket pair to daemon |
 | **NBD Daemon** | Single process, multiplexes all VMs | Event loop, resolves offsets via block maps, no QoS logic |
-| **WAL** | Crash recovery, durability bridge | Append-only on local SSD, stores raw blocks, replayed on recovery |
-| **Block Map** | Ordered array of chunk hashes per VM | ~25MB per 100GB disk at 128KB chunks. Sparse for unwritten regions. Fully in memory. |
+| **WAL** | Crash recovery, durability bridge | Append-only on local SSD, stores raw blocks, sequence-numbered, replayed on recovery |
+| **Block Map** | Ordered array of (hash, source) per VM | 17 bytes/entry (BLAKE3-128 + source tag). ~13MB per 100GB disk at 128KB chunks. Sparse for unwritten regions. Fully in memory. |
 | **Memory Cache** | In-memory LRU, hot blocks | Configurable size (`memory_cache_gb`), ~100ns reads, evicts to SSD tier |
 | **SSD Cache** | SSD-backed LRU, warm blocks | ~100μs reads, stores uncompressed blocks, verified on ingestion |
-| **Compression** | LZ4 at S3 boundary | Hash raw → compress → store. Decompress → verify → cache. ~1.5-2x ratio. |
-| **S3 Block Store** | Durable, content-addressed chunks | LZ4 compressed, 128KB chunk size, SSE-KMS per tenant |
-| **Base Image Registry** | Blessed shared blocks | Pre-chunked base images, SSE-S3, shared by all tenants |
-| **GC Worker** | Orphan block cleanup | Mark-and-sweep with 24h grace period, per-tenant, daily |
+| **Compression** | LZ4 at S3 boundary | BLAKE3-128 raw → compress → store. Decompress → verify → cache. ~1.5-2x ratio. |
+| **S3 Block Store** | Durable, content-addressed chunks | BLAKE3-128 keyed, LZ4 compressed, 128KB chunk size, SSE-KMS per tenant |
+| **Base Image Registry** | Blessed shared blocks | Offline CLI pipeline (`glidefs bless`). Pre-chunked, deduped across versions, SSE-S3. |
+| **Base Block GC** | Base image block cleanup | Refcount fast path + mark-and-sweep source of truth. Scans all tenants only when refcount hits 0. |
+| **Tenant GC Worker** | Tenant orphan block cleanup | Mark-and-sweep with 24h grace period, per-tenant, daily |
 | **cgroup v2 I/O** | Per-VM IOPS/throughput limits | Kernel-level, configured by control plane at VM creation |
 | **Background Scrubber** | Cache integrity verification | Periodic re-hash of cached blocks, off hot path |
 
@@ -666,7 +916,7 @@ graph TB
 |---------------|-------------|-----|
 | **Local snapshots/clones** | Block map copy in S3 | ZFS clones are local-only. Block map copy works cross-host — this is the primary motivation for the entire design. |
 | **LZ4 compression** | LZ4 at S3 boundary | Same algorithm, applied at a different layer. Compression ratio is equivalent. |
-| **Block integrity (checksums)** | Content-addressed hashing + scrubber | Every block is verified by its hash. Background scrubber catches bit rot. |
+| **Block integrity (checksums)** | BLAKE3-128 content-addressing + scrubber | Every block is verified by re-hashing. Background scrubber catches bit rot. |
 | **ARC (adaptive read cache)** | Two-tier memory + SSD cache | Memory tier replaces ARC's L1. SSD tier replaces ARC's L2. LRU instead of ARC's adaptive algorithm — simpler, may revisit if hit rates are poor. |
 | **Copy-on-write** | Content-addressed writes | Every write produces a new block by definition. Old blocks remain until GC. |
 | **Durability (ZIL/SLOG)** | WAL on local SSD | Same concept, different implementation. WAL entries flush to S3 instead of being replayed locally. |

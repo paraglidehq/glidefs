@@ -126,7 +126,7 @@ Production VMs are the fork source — someone might create a preview at any tim
 | ~5 seconds | Flush dirty blocks to S3 as packs |
 | ~60 seconds | Sync manifest (block map + pack index) to S3 |
 
-**Durability guarantee:** Host death loses at most ~5 seconds of writes (bounded by block flush interval). The manifest may be up to 60 seconds stale, but the WAL bridges the gap on recovery.
+**Durability guarantee:** Host death loses at most ~5 seconds of writes (bounded by block flush interval). The manifest may be up to 60 seconds stale, but blocks flushed to S3 between manifest syncs are recoverable — they exist as packs in S3 and the pack index can be reconstructed on recovery.
 
 **In practice, production VMs barely write after boot.** A web server processes requests in memory and writes to a database (separate VM). Filesystem writes are log rotation and temp files — a few blocks per minute. The continuous flush traffic from a steady-state production VM is negligible.
 
@@ -375,14 +375,17 @@ sequenceDiagram
 
 Whether triggered by a fork request, portable sleep, or the continuous flush timer:
 
-1. Collect dirty blocks from WAL
-2. Deduplicate: skip blocks whose hash already exists in the pack index
-3. Compress each new block with LZ4
-4. Assemble into a pack (index header + compressed blocks)
-5. Single S3 PUT per pack (~3.2MB, 25 blocks)
-6. Update pack index: hash → (pack-id, offset, length)
-7. Mark WAL entries as flushed
-8. Sync manifest to S3 (block map + pack index)
+1. Scan block map for dirty entries (blocks not yet in S3)
+2. Read block data from SSD cache
+3. Deduplicate: skip blocks whose hash already exists in the pack index
+4. Compress each new block with LZ4
+5. Assemble into a pack (index header + compressed blocks)
+6. Single S3 PUT per pack (~3.2MB, 25 blocks)
+7. Update pack index: hash → (pack-id, offset, length)
+8. Clear dirty flags on flushed entries
+9. Sync manifest to S3 (block map + pack index)
+
+**Note:** The flush reads from the SSD cache, not the WAL. The WAL is for local crash recovery only (see Crash Recovery). Dirty tracking lives in the block map — each entry carries a flag indicating whether the block has been flushed to S3.
 
 ### TRIM / Discard
 
@@ -433,7 +436,9 @@ Block Map for VM-A (100GB disk, 128KB chunks):
   Index 819199 → (blake3:11223344..., base)    (bytes 99.99GB - 100GB)
 ```
 
-**Per-entry size:** 17 bytes (16-byte BLAKE3-128 hash + 1-byte source tag). No offset needed — the array index *is* the offset (index × chunk_size = byte offset). The source tag (`base` or `tenant`) tells the daemon exactly where to resolve the block — `packs/bases/{pack-id}` or `packs/tenants/{tenant}/{pack-id}` — avoiding a 404 fallback chain.
+**Per-entry size:** 17 bytes (16-byte BLAKE3-128 hash + 1-byte flags). No offset needed — the array index *is* the offset (index × chunk_size = byte offset). The flags byte encodes:
+- **Source** (2 bits): `base` or `tenant` — tells the daemon where to resolve the block (`packs/bases/{pack-id}` or `packs/tenants/{tenant}/{pack-id}`), avoiding a 404 fallback chain.
+- **Dirty** (1 bit): whether the block has been flushed to S3. Set on write, cleared on S3 flush. This is how the flush path finds unflushed blocks — scan the block map for dirty entries, read data from SSD cache. The WAL is not involved in S3 flush.
 
 **Why BLAKE3-128 over SHA256:** Content-addressing needs collision resistance, not cryptographic security against adversaries. 128 bits gives a birthday bound of ~2^64 blocks — at 128KB per block, that's 2 exabytes of unique data per tenant. BLAKE3 is ~3-4x faster than SHA256, reducing hashing cost on the write path (~5μs for 128KB vs ~20μs). Shorter hashes mean smaller block maps, smaller manifests, shorter S3 keys.
 
@@ -494,8 +499,8 @@ The source VM is alive and writing. Its state exists in three places:
 ```
 S3 manifest          ← last flush (could be minutes or hours old in demand-driven mode)
 S3 blocks            ← all blocks flushed so far
-Host WAL + SSD       ← writes since last flush (not in S3 yet)
-Host memory          ← block map updates not yet persisted
+Host SSD cache       ← dirty blocks not yet in S3 (pinned, not evictable)
+Host memory          ← block map with dirty flags, updates not yet persisted locally
 ```
 
 ### Two Fork Modes
@@ -513,8 +518,8 @@ sequenceDiagram
 
     alt Consistent Fork (default)
         CP->>SRC: POST /api/exports/vm-a/snapshot
-        Note over SRC: 1. Atomically read WAL sequence N<br/>2. Flush all entries ≤ N to S3<br/>3. Write manifest at sequence N<br/>4. VM keeps writing (entries > N)
-        SRC->>S3: PUT packs (unflushed blocks ≤ N)
+        Note over SRC: 1. Atomically read sequence N<br/>2. Snapshot dirty block map entries at N<br/>3. Flush snapshot to S3 (reads from SSD cache)<br/>4. Write manifest at sequence N<br/>5. VM keeps writing (doesn't touch snapshot)
+        SRC->>S3: PUT packs (dirty blocks at sequence N)
         SRC->>S3: PUT manifests/{tenant}/vm-a (at sequence N)
         SRC-->>CP: { manifest_etag: "abc123", sequence: N }
 
@@ -541,10 +546,10 @@ Lazy fork is available for cases where staleness is acceptable (e.g., forking a 
 
 ### The Snapshot Mechanism
 
-The key mechanism is the **WAL sequence number**:
+The key mechanism is the **sequence number** — a monotonically increasing counter on the write path. Every block write gets a sequence number. The block map tracks the sequence of the last write to each entry.
 
 ```
-WAL entries:
+Writes arrive:
   seq 1: write block 42 → blake3:aaa
   seq 2: write block 17 → blake3:bbb
   seq 3: write block 42 → blake3:ccc    ← overwrote block 42
@@ -554,12 +559,15 @@ WAL entries:
 ```
 
 The snapshot operation:
-1. Atomically read the current WAL sequence (e.g., N=3). Single atomic load — no lock, no pause.
-2. Flush all WAL entries with sequence ≤ N to S3 (blocks + manifest).
-3. Return the manifest ETag to the caller.
-4. The source VM keeps writing normally. Entries with sequence > N are unaffected.
+1. Atomically read the current sequence number (e.g., N=3). Single atomic load — no lock, no pause.
+2. Snapshot the dirty portion of the block map at sequence N into a temporary structure: a list of `(offset, hash)` pairs where `dirty == true && sequence ≤ N`. This is a fast scan — the block map is in memory.
+3. Flush from the snapshot, reading block data from SSD cache by hash.
+4. Write the manifest at sequence N to S3. Return the ETag to the caller.
+5. Clear dirty flags for flushed entries. Unpin their SSD cache entries.
 
-The source VM is **never paused**. The only cost is a flush of pending dirty data.
+The source VM **keeps writing during the flush**. Concurrent writes get sequence > N and update the live block map, but don't touch the snapshot. Block data for the snapshot is safe in SSD cache — content-addressing means new writes create new cache entries (new hash → new key), they don't overwrite the old ones.
+
+The source VM is **never paused**. The only cost is the time to upload dirty data. For a steady-state production VM, that's a handful of blocks. For a demand-driven VM that's been active for hours, it's proportional to total unique dirty blocks.
 
 ### Race Conditions
 
@@ -571,11 +579,11 @@ The source VM is **never paused**. The only cost is a flush of pending dirty dat
 
 **Fork of a fork:** Same operation. Copy the manifest. Blocks are shared transitively. GC sees all manifests, keeps all referenced blocks.
 
-**Consistent fork + concurrent writes:** The WAL sequence cut is atomic. Writes after the cut get sequence > N and aren't included. The manifest at sequence N is internally consistent.
+**Consistent fork + concurrent writes:** The sequence cut is atomic. The snapshot captures dirty entries at sequence ≤ N. Writes after the cut get sequence > N, update the live block map but not the snapshot. The flush reads block data from SSD cache by hash — content-addressing guarantees concurrent writes don't overwrite snapshot data. The manifest at sequence N is internally consistent.
 
 ### Self-Containment Property
 
-The S3 manifest is always self-contained. Every hash in it corresponds to a block that exists in S3 (either in `packs/bases/` or `packs/tenants/{tid}/`). Unflushed blocks exist only in the WAL and local cache — they aren't in any manifest. You can copy a manifest to any host and it resolves completely. No dangling references.
+The S3 manifest is always self-contained. Every hash in it corresponds to a block that exists in S3 (either in `packs/bases/` or `packs/tenants/{tid}/`). Unflushed dirty blocks exist only in the local SSD cache — they aren't in any manifest. You can copy a manifest to any host and it resolves completely. No dangling references.
 
 ---
 
@@ -683,6 +691,7 @@ Two-tier cache: in-memory LRU for hot blocks, SSD-backed for warm blocks.
 - Bounded by available SSD space. Much larger than memory tier.
 - LRU eviction. Evicted blocks re-pulled from S3 on next access.
 - Stores uncompressed blocks. ~100μs reads.
+- **Dirty blocks are pinned.** Blocks marked dirty in the block map (not yet flushed to S3) are ineligible for LRU eviction. The SSD cache is the only copy of that data — the WAL is truncated every ~5s, and S3 doesn't have it yet. Evicting a dirty block means data loss. Blocks are unpinned when their dirty flag is cleared after S3 flush. Effective cache capacity = total SSD - pinned dirty blocks across all VMs.
 
 **Key properties:**
 - During active operation, the SSD tier contains *everything the VM has ever read or written*. Cache hit rate approaches 100%.
@@ -701,11 +710,11 @@ The WAL handles two distinct recovery scenarios:
 
 The daemon crashes but the host and SSD are fine. Load the locally persisted block map and replay the local WAL. No S3 involved.
 
-1. Load block map from local SSD file
-2. Replay unflushed WAL entries (update block map, populate cache)
+1. Load block map from local SSD file (last persisted state)
+2. Replay WAL entries since last persistence (update block map, populate memory cache)
 3. Resume serving
 
-Fast — milliseconds to seconds depending on WAL size.
+Fast — milliseconds. The WAL only contains entries since the last local block map persistence (~5 seconds of writes), not since the last S3 flush. Block data is already in the SSD cache.
 
 ### Cross-Host Recovery (Host Death)
 
@@ -733,9 +742,23 @@ For production VMs: continuous flush bounds the loss to seconds.
 
 - Append-only file on local SSD. Sequential writes only — fast and predictable.
 - Each entry: `(vm-id, offset, blake3_128_hash, raw_chunk_data)`. Self-contained for replay.
-- Entries marked flushed after S3 confirms block upload (in continuous or demand-driven flush).
-- Truncated after full flush. Keeps disk usage bounded.
-- In demand-driven mode, the WAL grows as long as the VM is active without an S3 flush. This is fine — it's just local SSD space. A VM writing at 100MB/s for an hour generates ~360GB of WAL. On modern NVMe (2-4TB), this is manageable. The WAL is truncated on the next S3 flush (sleep, fork, etc.).
+- **The WAL is for local crash recovery only.** It bridges the gap between the last locally-persisted block map and the crash point. It is NOT the source of data for S3 flushes — that's the SSD cache + dirty flags in the block map.
+- Truncated after each local block map persistence (every ~5 seconds). Once the block map is persisted and block data is in the SSD cache, the WAL entries are redundant.
+- **WAL size is bounded by local persist interval, not S3 flush interval.** This is critical for demand-driven mode, where S3 flushes may be hours apart. The WAL doesn't accumulate across that window.
+
+**Aggregate WAL sizing (typical host: 2TB NVMe, 50 VMs):**
+
+| VM type | Count | Write rate | WAL contribution |
+|---------|-------|-----------|-----------------|
+| Production (continuous) | 3 | ~1 MB/s each | ~3 MB/s |
+| Active builds (transient) | 5 | ~50 MB/s each | ~250 MB/s |
+| Dev environments (active) | 10 | ~2 MB/s each | ~20 MB/s |
+| Idle previews | 32 | ~0 | 0 |
+| **Aggregate** | **50** | | **~273 MB/s peak** |
+
+WAL size = aggregate write rate × local persist interval = **273 MB/s × 5s ≈ 1.4 GB**. On a 2TB NVMe, that's 0.07% of disk. Even at 2x the write rate with a 10s persist interval, the WAL is ~5.5 GB — comfortably under 0.3% of disk.
+
+The SSD cache is the larger consumer of local disk (it holds the actual block data for all active VMs), but that's bounded by VM count × written data per VM and is the subject of cache eviction policy, not WAL management.
 
 ### Failure Modes
 
@@ -888,7 +911,7 @@ sequenceDiagram
     end
 ```
 
-**Grace period (24 hours):** Packs younger than the grace period are never deleted, even if unreferenced. This protects against races: a flush creates blocks that aren't yet in any manifest, a fork copies a manifest while blocks are in flight, WAL replay uploads blocks during recovery.
+**Grace period (24 hours):** Packs younger than the grace period are never deleted, even if unreferenced. This protects against races: a flush creates packs that aren't yet referenced by any manifest, a fork copies a manifest while blocks are in flight, or a recovery reconstructs a manifest from recently-uploaded packs.
 
 **Operational design:**
 - **Frequency:** Daily or every few hours.
@@ -937,7 +960,7 @@ Content-addressing gives free integrity checks.
 | **NBD Device** | 1:1 per VM, block device interface | Linux kernel NBD, socket pair to daemon |
 | **NBD Daemon** | Single process, multiplexes all VMs | Event loop, resolves offsets via block maps, no QoS logic |
 | **Flush Scheduler** | Controls when blocks go to S3 | Demand-driven (default) or continuous (production). Per-VM policy. |
-| **WAL** | Local crash recovery + S3 flush source | Append-only on local SSD, sequence-numbered, raw blocks |
+| **WAL** | Local crash recovery (bridges last ~5s before local persist) | Append-only on local SSD, sequence-numbered, truncated on persist |
 | **Block Map** | Ordered array of (hash, source) per VM | 17 bytes/entry. Persisted locally (fast) + S3 (on flush). Sparse for unwritten regions. |
 | **Memory Cache** | In-memory LRU, hot blocks | Configurable size, ~100ns reads, evicts to SSD tier |
 | **SSD Cache** | SSD-backed, warm blocks | ~100μs reads, stores uncompressed, verified on ingestion |
@@ -962,7 +985,7 @@ Content-addressing gives free integrity checks.
 | **Block integrity** | BLAKE3-128 content-addressing + scrubber | Every block verified by re-hashing. |
 | **ARC (adaptive read cache)** | Two-tier memory + SSD cache | LRU instead of ARC. Simpler, may revisit if hit rates are poor. |
 | **Copy-on-write** | Content-addressed writes | Every write produces a new block. Old blocks remain until GC. |
-| **Durability (ZIL/SLOG)** | WAL on local SSD | Same concept. WAL entries flush to S3 on demand instead of locally. |
+| **Durability (ZIL/SLOG)** | WAL on local SSD | Same concept. WAL covers the window between local block map persists (~5s). S3 flush reads from SSD cache, not WAL. |
 | **Deduplication** | Content-addressing (inherent) | Same content → same hash → same block. Automatic. |
 
 ---
@@ -975,7 +998,7 @@ Content-addressing gives free integrity checks.
 4. **cgroup I/O limits by tier** — What are the actual IOPS/throughput numbers per tier?
 5. **GC grace period tuning** — 24 hours is conservative. Could be shorter if we can bound the max time between block creation and manifest update.
 6. **Sub-chunk dirty tracking** — Deferred until write amplification is a measured problem.
-7. **WAL size bound (continuous mode)** — At what size do we back-pressure writes if S3 is slow?
+7. **Pinned dirty block pressure** — In demand-driven mode, dirty blocks accumulate on SSD for hours (pinned, not evictable). A write-heavy VM active for 8 hours could pin tens of GB. At 50 VMs, aggregate pinned data could consume a meaningful fraction of SSD. Need a policy: back-pressure writes when pinned blocks exceed X% of SSD? Force a partial S3 flush? This is the real SSD capacity concern — not WAL size, not cache eviction, but the steady growth of data that *can't* be evicted.
 8. **ARC vs LRU** — Start with LRU. Consider ARC if hit rates are poor.
 9. **Pack size** — 25 blocks (3.2MB) matches v1. Profile to find the sweet spot between S3 ops and mixed-pack waste.
 10. **Demand-driven for production** — Should production default to demand-driven (flush on fork request) instead of continuous? Saves S3 traffic at the cost of 1-5 seconds of fork latency. Depends on preview creation frequency.

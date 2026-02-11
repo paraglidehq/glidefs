@@ -130,6 +130,40 @@ Production VMs are the fork source — someone might create a preview at any tim
 
 **In practice, production VMs barely write after boot.** A web server processes requests in memory and writes to a database (separate VM). Filesystem writes are log rotation and temp files — a few blocks per minute. The continuous flush traffic from a steady-state production VM is negligible.
 
+### Configuration
+
+The daemon doesn't know what a "preview" or "production" VM is. The control plane owns that policy and tells the daemon what to do.
+
+**On export creation:**
+
+```
+PUT /api/exports/{name}
+{
+  "size_gb": 100,
+  "s3_prefix": "tenants/acme/vm-preview-abc",
+  "flush_mode": "demand_driven"
+}
+```
+
+`flush_mode` is `"demand_driven"` (default) or `"continuous"`. The daemon starts the appropriate flush scheduler.
+
+**Runtime switch** (e.g., promotion turns a preview into a fork source):
+
+```
+POST /api/exports/{name}/flush-mode
+{ "flush_mode": "continuous" }
+```
+
+Takes effect immediately — starts the background flush scheduler without restarting the VM. The control plane calls this after a promotion completes and the new VM becomes the fork source.
+
+**That's it.** Two values, one API field, one mutation endpoint. The control plane maps Box lifecycle to flush mode:
+
+| Box role | Flush mode | When set |
+|----------|-----------|----------|
+| Preview / dev env | `demand_driven` | At creation |
+| Promotion build | `demand_driven` | At creation |
+| Production (fork source) | `continuous` | At creation, or switched at promotion |
+
 ### Why Not Just Flush On Fork?
 
 You could make even production demand-driven: flush when a fork is requested, accept a few seconds of latency. This works — the flush is proportional to dirty data, which is small for a steady-state production VM. The tradeoff is a 1-5 second delay on preview creation. If that's acceptable, production can use demand-driven too. Continuous is the conservative default for fork-source VMs.

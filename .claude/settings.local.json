@@ -34,7 +34,8 @@
       "WebFetch(domain:matklad.github.io)",
       "Bash(RUSTFLAGS=\"--cfg loom\" cargo test:*)",
       "Bash(cargo +nightly fuzz:*)",
-      "WebFetch(domain:fly.io)"
+      "WebFetch(domain:fly.io)",
+      "Bash(git -C /Users/jared/Code/Apps/paraglidehq/glidefs log --oneline)"
     ]
   }
 }

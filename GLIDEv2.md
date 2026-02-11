@@ -174,6 +174,44 @@ sequenceDiagram
 
 ---
 
+## TRIM / Discard Handling
+
+When a guest filesystem deletes files, it issues TRIM (discard) commands to the block device. Without handling these, the block map grows monotonically — a VM that writes 50GB then deletes 40GB still carries a 50GB block map and 50GB of orphaned blocks in S3 until GC sweeps.
+
+**Implementation:** Handle `NBD_CMD_TRIM` by resetting trimmed block map entries to the well-known zero-block hash.
+
+```mermaid
+sequenceDiagram
+    participant VM as MicroVM
+    participant NBD as NBD Device
+    participant D as NBD Daemon
+    participant WAL as WAL (local SSD)
+    participant M as Block Map
+
+    VM->>NBD: trim(offset, length)
+    NBD->>D: NBD_CMD_TRIM
+    D->>D: compute affected chunk range
+
+    loop For each chunk in range
+        D->>WAL: append(offset, ZERO_HASH, nil)
+        D->>M: update offset → ZERO_HASH
+    end
+
+    D-->>NBD: ack
+    NBD-->>VM: success
+
+    Note over M: Sparse representation drops zero entries<br/>→ memory reclaimed immediately
+    Note over D: Old blocks become orphaned<br/>→ tenant GC cleans up on next sweep
+```
+
+**Properties:**
+- **Metadata-only.** No data uploaded to S3. The WAL records the TRIM for crash recovery, but the entry carries no block data — just the offset and zero hash.
+- **Immediate memory savings.** Sparse block map drops zero entries. A VM that wrote 50GB and trimmed 40GB holds ~80K entries (~1.3MB), not ~400K (~6.5MB).
+- **Storage reclaimed by GC.** Orphaned blocks are swept on the next GC cycle (subject to grace period). No special TRIM-aware GC logic needed — the normal sweep sees unreferenced hashes and deletes them.
+- **Guest opt-in.** The guest filesystem must be mounted with `discard` option or use periodic `fstrim` to generate TRIM commands. Standard for any thin-provisioned block device.
+
+---
+
 ## Chunk Size & Write Amplification
 
 This is one of the most important design decisions. The chunk size determines the tradeoff between write amplification, metadata overhead, and S3 request volume.
@@ -643,6 +681,125 @@ graph LR
 
 ---
 
+## S3 Write Batching (Pack Files)
+
+Content-addressing stores each block as a separate S3 object keyed by its hash. For a VM with 10GB of unique data at 128KB chunks, that's ~80K S3 objects and ~80K PUT operations during flush. At scale across thousands of VMs, this adds up — both in PUT costs and GC LIST overhead.
+
+**Solution: pack files.** Batch content-addressed blocks into single S3 objects. The addressing model (content-addressed by hash) is unchanged — packs are a physical storage optimization, not a logical change. Same idea as git packfiles: the SHA is the address, the packfile is the storage.
+
+### Concept
+
+```
+Without packs:                        With packs:
+
+  blocks/tenants/t1/blake3:aaa          packs/tenants/t1/pack-0042
+  blocks/tenants/t1/blake3:bbb            ├─ blake3:aaa (compressed)
+  blocks/tenants/t1/blake3:ccc            ├─ blake3:bbb (compressed)
+  ...                                     ├─ blake3:ccc (compressed)
+  (80K objects for 10GB)                  └─ index: [{hash, offset, length}]
+                                        (3.2K objects for 10GB)
+```
+
+Each flush cycle collects dirty blocks, compresses them, assembles a pack with a small index header, and uploads with a single PUT. Default: 25 blocks per pack (~3.2MB), matching v1's proven batch size.
+
+### Write Path with Packs
+
+```mermaid
+sequenceDiagram
+    participant D as NBD Daemon
+    participant WAL as WAL
+    participant PI as Pack Index
+    participant S3 as S3
+
+    Note over D: Background flush cycle
+    D->>WAL: collect N dirty blocks
+    D->>PI: deduplicate (skip hashes already in a pack)
+    D->>D: compress each new block (LZ4)
+    D->>D: assemble pack (index header + compressed blocks)
+    D->>S3: PUT packs/tenants/{tid}/{pack-id} (single request)
+    S3-->>D: confirmed
+    D->>PI: register new hash → (pack-id, offset, length) mappings
+    D->>WAL: mark entries flushed
+    D->>S3: PUT manifests/{tid}/{vm-id} (periodic)
+```
+
+**Dedup during flush:** Before packing, check the pack index for each hash. If a block with that hash already exists in a pack (common after forks — the parent already uploaded it), skip it. Physical dedup within a tenant without a global index.
+
+### Read Path with Packs
+
+On a cache miss, the daemon resolves the block's physical location via the pack index:
+
+```
+1. Block map: offset → hash                    (~100ns, in memory)
+2. Memory cache → hit? serve                   (~100ns)
+3. SSD cache → hit? serve                      (~100μs)
+4. Pack index: hash → (pack-id, offset, length) (~100ns, in memory)
+5. S3 GET packs/{source}/{pack-id}             (10-50ms)
+6. Decompress all blocks in pack
+7. Verify hashes, cache all blocks
+```
+
+**Key optimization: prefetch the whole pack.** On a cache miss, download the entire pack (~3.2MB) instead of a single block via Range request. You're already paying the S3 first-byte latency (10-50ms) — the extra ~3MB of transfer is negligible at S3's bandwidth. Caching all 25 blocks exploits temporal locality: blocks written in the same flush cycle are often accessed together (same boot sequence, same install pass, same write burst). One cache miss warms 25 cache entries.
+
+### Pack Index
+
+The pack index maps `hash → (pack-id, offset, compressed_length)` for every block stored in S3. Maintained in memory by the daemon, persisted as part of the manifest.
+
+**Memory cost:** ~24 bytes per unique block (16-byte hash key + 4-byte pack-id + 4-byte offset/length).
+
+| Scenario | Pack index memory | Block map memory | Total |
+|----------|------------------|-----------------|-------|
+| 10GB actual data (80K blocks) | ~1.9MB | ~1.3MB | ~3.2MB |
+| 100GB fully written (800K blocks) | ~19MB | ~13MB | ~32MB |
+| 100 VMs × 10GB each | ~190MB | ~133MB | ~323MB |
+
+Within a tenant, forked VMs share pack index entries — a fork that hasn't diverged adds zero index overhead.
+
+**On startup:** Load the pack index from the manifest. No pack header scanning needed.
+
+### S3 Key Layout with Packs
+
+```
+packs/
+  bases/{pack-id}                ← base image packs (from bless pipeline)
+  tenants/{tenant-id}/{pack-id}  ← tenant packs
+
+manifests/
+  {tenant-id}/{vm-id}           ← always tenant-scoped (unchanged)
+```
+
+### Interaction with Other Components
+
+**Fork:** Unchanged. Copy the manifest (which includes the pack index). The fork references the same packs as the parent. No data copied.
+
+**GC:** Operates on packs instead of individual blocks.
+- **Mark:** Build live set of hashes from all manifests (unchanged).
+- **Sweep:** For each pack, check how many of its blocks are in the live set.
+  - All live → keep.
+  - All dead + older than grace period → delete pack.
+  - Mixed → **compact** if dead ratio exceeds threshold: write new pack with only live blocks, update manifests, delete old pack.
+- **Compaction** is the new GC operation. It's rare in practice — most packs are either fully live (recent writes) or fully dead (old packs whose blocks have all been overwritten). Packs age out naturally.
+
+**Base images:** The bless pipeline creates packs instead of individual block objects. A base image is one or more packs containing all chunks. VMs created from the base reference these packs directly.
+
+### Cost Analysis
+
+| Metric | Individual Blocks | Pack Files (25/pack) | Improvement |
+|--------|------------------|---------------------|-------------|
+| S3 PUTs (10GB VM) | 80,000 | 3,200 | **25x fewer** |
+| S3 objects (10GB VM) | 80,000 | 3,200 | **25x fewer** |
+| GC LIST requests (100 VMs) | ~8,000 | ~320 | **25x fewer** |
+| S3 GET on cache miss | 1 block cached | 25 blocks cached | **25x better prefetch** |
+| Memory overhead | 0 (block map only) | +1.9MB per 10GB | Acceptable |
+
+At S3 pricing ($5/M PUTs, $0.40/M GETs):
+- 10GB VM build-out: $0.40 → $0.016 (PUTs alone)
+- Daily GC for 100-VM tenant: $0.032 → $0.0013
+
+The real win at scale is fewer S3 requests across thousands of VMs and frequent GC cycles — plus the temporal locality bonus on reads that no individual-block scheme can match.
+
+---
+
 ## Crash Recovery (WAL)
 
 The WAL (write-ahead log) is the durability mechanism. S3 is the long-term store, but writes are acked locally before S3 confirms. The WAL bridges the gap.
@@ -901,10 +1058,13 @@ graph TB
 | **Memory Cache** | In-memory LRU, hot blocks | Configurable size (`memory_cache_gb`), ~100ns reads, evicts to SSD tier |
 | **SSD Cache** | SSD-backed LRU, warm blocks | ~100μs reads, stores uncompressed blocks, verified on ingestion |
 | **Compression** | LZ4 at S3 boundary | BLAKE3-128 raw → compress → store. Decompress → verify → cache. ~1.5-2x ratio. |
-| **S3 Block Store** | Durable, content-addressed chunks | BLAKE3-128 keyed, LZ4 compressed, 128KB chunk size, SSE-KMS per tenant |
-| **Base Image Registry** | Blessed shared blocks | Offline CLI pipeline (`glidefs bless`). Pre-chunked, deduped across versions, SSE-S3. |
+| **Pack Files** | Batched S3 storage format | 25 blocks/pack (~3.2MB). 25x fewer S3 PUTs and objects. Whole-pack fetch prefetches temporal neighbors. |
+| **Pack Index** | Hash → pack location mapping | ~24 bytes/block. Persisted in manifest. Resolves cache misses to pack + offset. |
+| **TRIM Handler** | Reclaim deleted blocks | NBD_CMD_TRIM → reset to zero-block hash. Metadata-only, no S3 upload. Orphans cleaned by GC. |
+| **S3 Block Store** | Durable, content-addressed chunks | BLAKE3-128 keyed, LZ4 compressed, 128KB chunk size, SSE-KMS per tenant. Stored in pack files. |
+| **Base Image Registry** | Blessed shared blocks | Offline CLI pipeline (`glidefs bless`). Pre-chunked into packs, deduped across versions, SSE-S3. |
 | **Base Block GC** | Base image block cleanup | Refcount fast path + mark-and-sweep source of truth. Scans all tenants only when refcount hits 0. |
-| **Tenant GC Worker** | Tenant orphan block cleanup | Mark-and-sweep with 24h grace period, per-tenant, daily |
+| **Tenant GC Worker** | Tenant orphan block cleanup | Mark-and-sweep with 24h grace period, per-tenant, daily. Operates on packs, with compaction for mixed-liveness packs. |
 | **cgroup v2 I/O** | Per-VM IOPS/throughput limits | Kernel-level, configured by control plane at VM creation |
 | **Background Scrubber** | Cache integrity verification | Periodic re-hash of cached blocks, off hot path |
 
@@ -934,3 +1094,5 @@ graph TB
 6. **Sub-chunk dirty tracking** — If write amplification becomes a measured problem for database-heavy workloads, implement delta tracking within chunks. Deferred until we have data showing it matters.
 7. **WAL size bound** — If S3 is slow or temporarily unavailable, the WAL grows. At what size do we start back-pressuring writes? This is the release valve for S3 outages.
 8. **ARC vs LRU** — The memory cache uses simple LRU. ZFS's ARC algorithm adapts between recency and frequency. If cache hit rates are poor under realistic workloads, consider implementing ARC or LIRS. Start with LRU — it's simpler and might be good enough.
+9. **Pack compaction threshold** — At what dead-block ratio should GC rewrite a pack? Too aggressive (compact at 10% dead) wastes S3 bandwidth. Too lenient (compact at 90% dead) wastes storage. Likely in the 50-70% range, but needs tuning under real churn patterns.
+10. **Pack size vs prefetch tradeoff** — 25 blocks (3.2MB) per pack matches v1. Larger packs mean fewer S3 objects but more wasted bandwidth on partial reads. Smaller packs mean more objects but finer-grained prefetch. Profile under real workloads to find the sweet spot.

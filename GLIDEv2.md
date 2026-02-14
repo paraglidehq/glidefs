@@ -26,11 +26,9 @@ A storage layer for Boxes — Paraglide's microVMs. Provides fast boot, near-ins
 
 **Cheap cross-host forks.** Forking a 100G VM is a metadata copy — duplicate the block map in S3, done. Zero data copied. The forked VM shares 100% of its blocks with the parent until it writes. Storage cost is proportional to unique writes, not total disk size. This works across hosts — the fork can materialize anywhere. This unlocks preview environments, branch deploys, and dev/prod parity at near-zero cost.
 
-**Storage efficiency.** Content-addressing deduplicates automatically within a tenant. Ten VMs running the same Node app share one copy of the base OS, runtime, and dependencies. LZ4 compression before upload further reduces S3 storage by ~1.5-2x for typical OS/application data. Combined with shared base images across tenants, actual S3 usage is a small fraction of total allocated disk space.
+**Storage efficiency.** Content-addressing deduplicates automatically across all tenants. A thousand tenants running Next.js apps share one copy of the base OS, Node runtime, and common npm packages — ~2.7GB stored once instead of ~3TB of per-tenant copies (15x reduction). LZ4 compression before upload further reduces S3 storage by ~1.5-2x for typical OS/application data. The marginal S3 cost of tenant N+1 converges to the cost of storing their unique source code (~50-200MB).
 
-**Operational simplicity.** No ZFS to tune (ARC, zpool, scrub schedules). No distributed filesystem to operate (quorum, rebalancing, split-brain). No QoS code in the daemon (cgroup v2 handles it). No application-layer encryption (SSE-KMS handles it). Each component does one thing.
-
-**Tenant isolation without sacrificing efficiency.** Shared base image blocks give most of the cross-tenant dedup savings. Tenant-written blocks are namespace-isolated, closing the deduplication oracle side channel. Per-tenant KMS keys mean a compromised S3 bucket doesn't expose all tenants' data.
+**Operational simplicity.** No ZFS to tune (ARC, zpool, scrub schedules). No distributed filesystem to operate (quorum, rebalancing, split-brain). No QoS code in the daemon (cgroup v2 handles it). No application-layer encryption (SSE-KMS handles it). One global block namespace, one GC. Each component does one thing.
 
 **Integrity for free.** Content-addressing means every block can be verified by re-hashing. No separate checksum database to maintain. Corruption is detectable at read time and by background scrubbing.
 
@@ -44,9 +42,9 @@ A storage layer for Boxes — Paraglide's microVMs. Provides fast boot, near-ins
 
 **Write amplification.** Content-addressing means every write to a chunk produces a new block, even if only a small portion changed. With 128KB chunks, a 4KB random write still produces a 128KB new block — 32x amplification. This only affects local SSD writes (fast) and S3 flushes (infrequent in demand-driven mode). Typical VM workloads (app servers, build systems) do mostly large sequential writes where write amp is close to 1x. The 32x case only hits on small random writes. See the Chunk Size section for the full analysis.
 
-**Block map memory at scale.** A 100GB disk with 128KB chunks = ~800K entries per VM. At 17 bytes per entry (BLAKE3-128 hash + source tag), that's ~13MB per VM in the dense case. With sparse representation (typical 10GB of actual written data), it's ~1.3MB per VM. At 100 VMs per host, block maps consume ~133MB total in practice — manageable. See the Block Map section for the full analysis.
+**Block map memory at scale.** A 100GB disk with 128KB chunks = ~800K entries per VM. At 17 bytes per entry (BLAKE3-128 hash + flags), that's ~13MB per VM in the dense case. With sparse representation (typical 10GB of actual written data), it's ~1.3MB per VM. At 100 VMs per host, block maps consume ~133MB total in practice — manageable. See the Block Map section for the full analysis.
 
-**Garbage collection is a real system.** Deleted VMs leave orphaned blocks in S3. Cleaning these up under concurrent fork/delete/write operations requires careful design. See the Garbage Collection section.
+**Garbage collection is a real system.** Deleted VMs leave orphaned blocks in S3. Event-driven refcounts make GC O(1) per lifecycle event — no manifest scanning. A monthly reconciliation sweep catches any drift. See the Garbage Collection section.
 
 **Cold cache on cross-host wake.** When a VM wakes on a different host, its SSD cache is empty. Reads hit S3 until the cache warms. Base image blocks help (likely warm from siblings), but tenant-specific hot data will be cold. This is a transient degradation, not a steady state.
 
@@ -70,7 +68,7 @@ graph TB
             BR["Block Resolver"]
             WAL["WAL<br/>(local SSD, append-only)"]
             subgraph CACHE["Local Store + Cache"]
-                MEM["Memory Tier<br/>(LRU, ~100ns)"]
+                MEM["Memory Tier<br/>(S3-FIFO, ~100ns)"]
                 SSD["SSD Tier<br/>(~100μs)"]
             end
         end
@@ -83,17 +81,19 @@ graph TB
     end
 
     subgraph S3["S3 — Portability Layer"]
-        PACKS["packs/{tenant}/{pack-id}<br/>Content-addressed, LZ4, batched"]
+        PACKS["packs/{prefix}/{pack-id}<br/>Content-addressed, LZ4, prefix-sharded"]
         MANIFESTS["manifests/{tenant}/{vm-id}<br/>Block maps + pack index"]
-        BASES["packs/bases/{pack-id}<br/>Shared base image blocks"]
     end
+
+    DB["Control Plane DB<br/>(pack refcounts, manifest_packs)"]
 
     CACHE -->|"demand-driven flush<br/>(fork, sleep, promote, migrate)"| PACKS
     BR -->|"cache miss → lazy pull"| PACKS
     CACHE -.->|"continuous flush<br/>(production VMs only)"| PACKS
+    CACHE -.->|"refcount updates<br/>(transactional with manifest)"| DB
 ```
 
-**During active operation**, all I/O stays within the host box. S3 is only touched on cross-host transitions or for cache misses on blocks that haven't been loaded locally yet.
+**During active operation**, all I/O stays within the host box. S3 is only touched on cross-host transitions or for cache misses on blocks that haven't been loaded locally yet. Refcount updates to the control plane DB are piggybacked on manifest writes — not on the read/write hot path.
 
 ---
 
@@ -129,6 +129,8 @@ Production VMs are the fork source — someone might create a preview at any tim
 **Durability guarantee:** Host death loses at most ~5 seconds of writes (bounded by block flush interval). The manifest may be up to 60 seconds stale, but blocks flushed to S3 between manifest syncs are recoverable — they exist as packs in S3 and the pack index can be reconstructed on recovery.
 
 **In practice, production VMs barely write after boot.** A web server processes requests in memory and writes to a database (separate VM). Filesystem writes are log rotation and temp files — a few blocks per minute. The continuous flush traffic from a steady-state production VM is negligible.
+
+**Adaptive intervals:** The fixed 5s/60s intervals are the default. The flush scheduler adapts based on dirty set size (O(1) check) — flush more frequently under heavy writes (reduces the data loss window), skip flushes entirely when the dirty set is empty. Simple heuristic: `flush_interval = max(1s, base_interval × (threshold / dirty_set.len()))`. Clamped between 1s and the base interval.
 
 ### Configuration
 
@@ -340,6 +342,8 @@ Cache misses that hit S3 are primarily during initial boot (base image blocks) a
 
 **Pack-level prefetch:** On a cache miss, the daemon fetches the entire pack (~3.2MB, 25 blocks) instead of a single block. The S3 first-byte latency (10-50ms) dominates — the extra ~3MB of transfer is negligible. This prefetches temporally related blocks (written in the same flush cycle, often accessed together), warming 25 cache entries per miss.
 
+**Sequential read-ahead:** The daemon tracks the last N read offsets per VM. If reads are to consecutive chunk offsets (sequential access pattern — common during boot and large file reads), proactively fetch the next pack before it's requested. This hides S3 latency for sequential workloads: by the time the VM reads the next block, the pack is already in cache. Simple sequential detector, disabled after a non-sequential read resets the pattern.
+
 ---
 
 ## Write Path
@@ -362,7 +366,8 @@ sequenceDiagram
     D->>WAL: append(offset, blake3:def456, raw data)
     D->>MC: store blake3:def456 (raw)
     D->>SC: store blake3:def456 (raw)
-    D->>M: update offset → blake3:def456
+    D->>M: update offset → blake3:def456 + dirty flag
+    D->>D: dirty_set.insert(offset)
     D-->>NBD: ack
     NBD-->>VM: success
 
@@ -375,15 +380,16 @@ sequenceDiagram
 
 Whether triggered by a fork request, portable sleep, or the continuous flush timer:
 
-1. Scan block map for dirty entries (blocks not yet in S3)
-2. Read block data from SSD cache
-3. Deduplicate: skip blocks whose hash already exists in the pack index
+1. Drain the dirty set — O(dirty count), not O(block map size)
+2. Deduplicate: skip blocks whose hash already exists in the host pack index (already uploaded by this VM or another VM on the host)
+3. Read block data from SSD cache for remaining (genuinely new) blocks
 4. Compress each new block with LZ4
 5. Assemble into a pack (index header + compressed blocks)
 6. Single S3 PUT per pack (~3.2MB, 25 blocks)
-7. Update pack index: hash → (pack-id, offset, length)
-8. Clear dirty flags on flushed entries
-9. Sync manifest to S3 (block map + pack index)
+7. Update host pack index: hash → (pack-id, offset, length)
+8. Clear dirty flags on flushed entries, move dirty blocks to clean cache
+9. Sync manifest to S3 (block map + pack index derived from host index)
+10. Update pack refcounts in control plane DB (transactional with manifest record update — see Garbage Collection)
 
 **Note:** The flush reads from the SSD cache, not the WAL. The WAL is for local crash recovery only (see Crash Recovery). Dirty tracking lives in the block map — each entry carries a flag indicating whether the block has been flushed to S3.
 
@@ -429,16 +435,17 @@ The block map is the critical metadata structure. Every read and write resolves 
 
 ```
 Block Map for VM-A (100GB disk, 128KB chunks):
-  Index 0      → (blake3:aabbccdd..., base)    (bytes 0 - 128KB)
-  Index 1      → (blake3:ddeeff00..., base)    (bytes 128KB - 256KB)
-  Index 2      → (blake3:ff112233..., tenant)  (bytes 256KB - 384KB)
+  Index 0      → blake3:aabbccdd...    (bytes 0 - 128KB)
+  Index 1      → blake3:ddeeff00...    (bytes 128KB - 256KB)
+  Index 2      → blake3:ff112233...    (bytes 256KB - 384KB)
   ...
-  Index 819199 → (blake3:11223344..., base)    (bytes 99.99GB - 100GB)
+  Index 819199 → blake3:11223344...    (bytes 99.99GB - 100GB)
 ```
 
 **Per-entry size:** 17 bytes (16-byte BLAKE3-128 hash + 1-byte flags). No offset needed — the array index *is* the offset (index × chunk_size = byte offset). The flags byte encodes:
-- **Source** (2 bits): `base` or `tenant` — tells the daemon where to resolve the block (`packs/bases/{pack-id}` or `packs/tenants/{tenant}/{pack-id}`), avoiding a 404 fallback chain.
-- **Dirty** (1 bit): whether the block has been flushed to S3. Set on write, cleared on S3 flush. This is how the flush path finds unflushed blocks — scan the block map for dirty entries, read data from SSD cache. The WAL is not involved in S3 flush.
+- **Dirty** (1 bit): whether the block has been flushed to S3. Set on write, cleared on S3 flush. A separate dirty set (`HashSet<u64>` of offsets) tracks which entries are dirty so the flush path iterates O(dirty count), not O(block map size). The WAL is not involved in S3 flush.
+
+No source tag needed — all blocks live in one global namespace (`packs/{prefix}/{pack-id}`, prefix-sharded). The block map contains only the content hash and the dirty flag.
 
 **Why BLAKE3-128 over SHA256:** Content-addressing needs collision resistance, not cryptographic security against adversaries. 128 bits gives a birthday bound of ~2^64 blocks — at 128KB per block, that's 2 exabytes of unique data per tenant. BLAKE3 is ~3-4x faster than SHA256, reducing hashing cost on the write path (~5μs for 128KB vs ~20μs). Shorter hashes mean smaller block maps, smaller manifests, shorter S3 keys.
 
@@ -452,6 +459,27 @@ Block Map for VM-A (100GB disk, 128KB chunks):
 | 500 | 6.64GB | 664MB |
 
 **Sparse representation:** Most VMs don't touch all 100GB. Unwritten regions point to a well-known "zero block" hash. A sparse map only stores non-zero entries. A VM with 10GB of written data on a 100GB disk stores ~80K entries (~1.3MB), not 800K (~13MB).
+
+### Fork Overlay
+
+Forking copies the block map — but a forked VM is 99% identical to its parent until it diverges. With 180 preview VMs forked from 10 production VMs, full copies waste memory: 200 × 1.3MB = 260MB of nearly-identical arrays.
+
+**Solution: overlay map.** A forked VM holds a shared reference to the parent's block map and a small overlay of diverged entries:
+
+```
+ForkedBlockMap:
+  parent:  Arc<BlockMap>           ← shared, immutable reference to parent
+  overlay: HashMap<u64, Entry>     ← only entries that differ from parent
+
+Lookup(offset):
+  overlay[offset] ?? parent[offset]
+```
+
+180 forks with ~1% divergence: 10 × 1.3MB (parents) + 180 × ~13KB (overlays) = ~15MB instead of 260MB.
+
+**Flattening:** When the overlay exceeds ~50% of the parent's entries, the fork has diverged enough that the overlay lookup overhead isn't worth it. Flatten into a standalone block map. This is a background operation — copy parent entries, apply overlay, replace the structure.
+
+**S3 manifest:** Always stored as a full block map (no overlay encoding). The overlay is a host-memory optimization only. When the manifest is synced to S3 (flush, fork, sleep), the overlay is resolved into a complete map.
 
 ### Local Persistence
 
@@ -583,7 +611,7 @@ The source VM is **never paused**. The only cost is the time to upload dirty dat
 
 ### Self-Containment Property
 
-The S3 manifest is always self-contained. Every hash in it corresponds to a block that exists in S3 (either in `packs/bases/` or `packs/tenants/{tid}/`). Unflushed dirty blocks exist only in the local SSD cache — they aren't in any manifest. You can copy a manifest to any host and it resolves completely. No dangling references.
+The S3 manifest is always self-contained. Every hash in it corresponds to a block that exists in S3 (in `packs/{prefix}/{pack-id}`). Unflushed dirty blocks exist only in the local SSD cache — they aren't in any manifest. You can copy a manifest to any host and it resolves completely. No dangling references.
 
 ---
 
@@ -596,7 +624,7 @@ Content-addressing at the logical level (block map, hashing, dedup). Pack files 
 Each flush cycle collects dirty blocks, compresses them, assembles a pack with a small index header, and uploads with a single PUT. Default: 25 blocks per pack (~3.2MB), matching v1's proven batch size.
 
 ```
-packs/tenants/t1/pack-0042
+packs/a7/pack-0042
   ├─ blake3:aaa (compressed)
   ├─ blake3:bbb (compressed)
   ├─ blake3:ccc (compressed)
@@ -605,19 +633,30 @@ packs/tenants/t1/pack-0042
 
 25x fewer S3 PUTs, 25x fewer S3 objects, 25x faster GC LIST operations.
 
-### Pack Index
+### Pack Index (Host-Level)
 
-Maps `hash → (pack-id, offset, compressed_length)` for every block in S3. Maintained in memory, persisted as part of the manifest.
+Maps `hash → (pack-id, offset, compressed_length)` for every block in S3. **Shared across all VMs on the host** — a single `DashMap` rather than per-VM `HashMap`s.
 
-**Memory cost:** ~24 bytes per unique block (16-byte hash key + 4-byte pack-id + 4-byte offset/length).
+When a VM flushes, it checks the host pack index before uploading. If a block's hash is already in the index (uploaded by another VM on this host), the flush skips that block and references the existing pack. Every skipped block is 128KB of network I/O saved.
+
+```
+VM-A flushes:  hash:abc → pack-42 (uploaded)     host_index[hash:abc] = pack-42
+VM-B flushes:  hash:abc → host_index hit → skip   manifest references pack-42
+```
+
+**Why this matters:** On a host with 10 tenants running similar stacks, each VM's post-fork `npm install` writes ~4000 blocks of overlapping packages. Without host-level dedup, that's 10 × 160 = 1,600 pack PUTs. With it, VM-1 uploads 160 packs, subsequent VMs skip ~80-90% of their blocks. Total: ~240 packs. 7x fewer uploads, 7x less network I/O competing for the uplink.
+
+**Staleness:** When a VM leaves the host (delete, migrate, sleep), its entries remain in the index but may become stale if GC eventually deletes the referenced packs. Rebuild the host index from active VMs' pack indices on each VM arrival/departure. Rebuild cost: 50 VMs × 80K entries ≈ 4M lookups, ~100ms. Stale entries live at most minutes — well within the 24-hour GC grace period.
+
+**Manifest serialization:** Each VM's manifest includes a complete pack index for portability (self-contained, resolves on any host). Derived from the host index at serialization time — filter to hashes in this VM's block map.
+
+**Memory cost:** ~24 bytes per unique block (16-byte hash key + 4-byte pack-id + 4-byte offset/length). Shared across VMs, so deduplicated content (base image, common packages) is stored once in the index.
 
 | Scenario | Pack index memory | Block map memory | Total |
 |----------|------------------|-----------------|-------|
 | 10GB actual data (80K blocks) | ~1.9MB | ~1.3MB | ~3.2MB |
 | 100GB fully written (800K blocks) | ~19MB | ~13MB | ~32MB |
-| 100 VMs × 10GB each | ~190MB | ~133MB | ~323MB |
-
-Within a tenant, forked VMs share pack index entries — a fork that hasn't diverged adds zero index overhead.
+| 50 VMs × 10GB each (shared host index) | ~95MB (deduplicated) | ~66MB | ~161MB |
 
 ### Read Path with Packs
 
@@ -625,10 +664,8 @@ On a cache miss, fetch the entire pack and cache all 25 blocks. One cache miss w
 
 ### GC with Packs
 
-- **Mark:** Build live set of hashes from all manifests (unchanged).
-- **Sweep:** For each pack, check if *any* block is in the live set.
-  - No live blocks + older than grace period → **delete pack**.
-  - Any live block → **keep entire pack**.
+Pack-level refcounts tracked in the control plane DB. A pack is deleted when its refcount reaches 0 and it's older than the grace period. See the Garbage Collection section for the full design.
+
 - **No compaction.** A pack with mixed liveness (some dead, some live blocks) is kept whole until every block is unreferenced.
 
 **Why not compact mixed packs?** Compaction rewrites live blocks into a new pack. But the old pack may be referenced by manifests on other hosts — a forked VM's pack index points to (hash, old-pack-id, offset). Updating a remote daemon's in-memory pack index requires cross-host coordination. This is distributed coordination — exactly what this design avoids.
@@ -639,12 +676,15 @@ On a cache miss, fetch the entire pack and cache all 25 blocks. One cache miss w
 
 ```
 packs/
-  bases/{pack-id}                ← base image packs (from bless pipeline)
-  tenants/{tenant-id}/{pack-id}  ← tenant packs
+  {hash-prefix}/{pack-id}       ← all blocks, globally deduplicated, prefix-sharded
 
 manifests/
-  {tenant-id}/{vm-id}           ← always tenant-scoped
+  {tenant-id}/{vm-id}           ← per-tenant, per-VM
 ```
+
+One global block namespace. Content-addressing handles dedup naturally — same content → same hash → stored once regardless of which tenant wrote it. Manifests remain per-tenant for access control and GC reference tracking.
+
+**Prefix sharding:** Pack keys use the first 2 hex characters of the pack's content hash as a prefix: `packs/a7/{pack-id}`. This gives 256 prefixes, each supporting 5,500 PUTs/s = 1.4M PUTs/s aggregate capacity. S3 auto-partitions by prefix, so sharding ensures throughput scales with fleet size without hitting per-prefix limits.
 
 ---
 
@@ -680,25 +720,48 @@ graph LR
 
 ## Cache Design
 
-Two-tier cache: in-memory LRU for hot blocks, SSD-backed for warm blocks.
+Dirty blocks and clean blocks are managed separately. Dirty blocks are pinned (not evictable). Clean blocks use a two-tier S3-FIFO cache.
+
+### Dirty Block Store
+
+Blocks not yet flushed to S3 are stored in a pinned hash map — not in the eviction cache. The WAL is truncated every ~5s, so after truncation the dirty store is the only local copy. Evicting a dirty block means data loss.
+
+```
+Write path:  hash block → dirty_store[hash] = data
+S3 flush:    dirty_store.remove(hash) → insert into clean cache
+```
+
+Dirty blocks are served directly from the dirty store on read (~100ns, in-memory). When flushed to S3, they move to the clean cache and become evictable.
+
+### Clean Block Cache (S3-FIFO)
+
+Clean blocks (backed by S3, safe to evict and re-fetch) use a two-tier cache with S3-FIFO eviction.
+
+**Why S3-FIFO over LRU:** VM boot is a sequential scan — reads hundreds of base image blocks once, then never touches them again. LRU promotes all of them to the head, evicting actually hot blocks. S3-FIFO's small/main/ghost queue structure handles this naturally: one-time reads stay in the small queue and wash through without polluting the main queue. Blocks accessed more than once get promoted. S3-FIFO matches ARC on hit rate with simpler implementation and better concurrency — FIFO queues don't need per-access linked list manipulation.
 
 **Memory tier:**
 - Configurable size per host (`memory_cache_gb`).
-- LRU eviction. Evicted blocks fall to SSD tier.
+- S3-FIFO eviction. Evicted blocks fall to SSD tier.
 - ~100ns reads. 1000x faster than SSD.
 
 **SSD tier:**
 - Bounded by available SSD space. Much larger than memory tier.
-- LRU eviction. Evicted blocks re-pulled from S3 on next access.
+- S3-FIFO eviction. Evicted blocks re-pulled from S3 on next access.
 - Stores uncompressed blocks. ~100μs reads.
-- **Dirty blocks are pinned.** Blocks marked dirty in the block map (not yet flushed to S3) are ineligible for LRU eviction. The SSD cache is the only copy of that data — the WAL is truncated every ~5s, and S3 doesn't have it yet. Evicting a dirty block means data loss. Blocks are unpinned when their dirty flag is cleared after S3 flush. Effective cache capacity = total SSD - pinned dirty blocks across all VMs.
+
+**Implementation:** Use [foyer](https://github.com/foyer-rs/foyer) — a Rust hybrid cache library that provides S3-FIFO eviction with memory + disk tiers. Matches the two-tier design directly. The dirty block store is separate and trivial (a `HashMap` with no eviction).
+
+### Boot Hot Set Prefetching
+
+The `glidefs bless` pipeline already processes every block in the base image. During the bless, boot the image in a reference VM and record which block offsets are accessed during the first 10 seconds (the boot hot set — kernel, init, core libs, runtime). Store this as a boot manifest alongside the base image manifest.
+
+On VM start, before Firecracker launches, prefetch boot hot set blocks into the memory cache. For base image blocks already cached from sibling VMs, this is a no-op (already in cache). For cold hosts, this pulls the boot-critical blocks from S3 in parallel, hiding the latency before the VM needs them.
 
 **Key properties:**
 - During active operation, the SSD tier contains *everything the VM has ever read or written*. Cache hit rate approaches 100%.
 - Blocks are immutable (content-addressed), so cached blocks are always valid. No coherence protocol.
-- Boot prefetching: base images have a known hot set (kernel, init, core libs). Prefetch into memory cache when a VM is scheduled, before it starts.
 - On same-host wake: cache is fully warm. No S3 reads needed.
-- On cross-host wake: cache starts cold. Base image blocks likely warm from siblings. Tenant data warms organically.
+- On cross-host wake: cache starts cold. Boot hot set prefetch warms critical blocks. Base image blocks likely warm from siblings. Tenant data warms organically.
 
 ---
 
@@ -768,66 +831,56 @@ The SSD cache is the larger consumer of local disk (it holds the actual block da
 
 ---
 
-## Tenant Isolation Model
+## Global Block Dedup
 
-Cross-tenant deduplication is a side-channel risk (deduplication oracle attack). The design uses a tiered isolation model.
+All blocks live in one global namespace. Content-addressing handles dedup naturally — same content, same hash, stored once, regardless of which tenant wrote it.
 
 ```mermaid
 graph TB
-    subgraph "Shared (Public)"
-        BASES["Base Image Blocks<br/>Ubuntu, Node, Python, etc.<br/>Non-secret, shared by all tenants"]
+    subgraph "Global Block Store"
+        BLOCKS["All Blocks<br/>OS, runtimes, packages, app code<br/>Content-addressed, globally deduplicated"]
     end
 
-    subgraph "Tenant A (Isolated)"
-        MA1["VM A1 Block Map"]
-        MA2["VM A2 Block Map"]
-        BA["Tenant A Private Blocks"]
-        MA1 --> BASES
-        MA2 --> BASES
-        MA1 --> BA
-        MA2 --> BA
+    subgraph "Tenant A"
+        MA1["VM A1 Manifest"]
+        MA2["VM A2 Manifest"]
+        MA1 --> BLOCKS
+        MA2 --> BLOCKS
     end
 
-    subgraph "Tenant B (Isolated)"
-        MB1["VM B1 Block Map"]
-        BB["Tenant B Private Blocks"]
-        MB1 --> BASES
-        MB1 --> BB
+    subgraph "Tenant B"
+        MB1["VM B1 Manifest"]
+        MB1 --> BLOCKS
     end
 
-    BA ~~~ BB
-
-    style BASES fill:#2d5a3d,stroke:#4a9,color:#fff
-    style BA fill:#5a2d2d,stroke:#a44,color:#fff
-    style BB fill:#2d2d5a,stroke:#44a,color:#fff
+    style BLOCKS fill:#2d5a3d,stroke:#4a9,color:#fff
 ```
 
 **Rules:**
-- Base image blocks are blessed, public, and shared across all tenants
-- Any block written by a tenant is keyed to that tenant's namespace
-- Dedup happens freely *within* a tenant (their own VMs share blocks)
-- Cross-tenant dedup only happens against the shared base set
+- Blocks are stored once globally. Hash is the only address.
+- Manifests are per-tenant, per-VM. This is the access control boundary.
+- Dedup happens across all tenants automatically — no bless pipeline, no source tags, no dual namespace.
 
-### Block Resolution with Source Tags
+**Why this is safe:** The deduplication oracle attack requires observing whether dedup happened. In this architecture, tenants operate through VMs — writes always hit local SSD at identical latency regardless of whether the block exists elsewhere. S3 dedup happens in background flush, not observable from the guest. Tenants don't have S3 access.
 
-The source tag in each block map entry tells the daemon exactly where to look:
+### Block Resolution
+
+One path. No source tags, no routing:
 
 ```
-1. Memory cache    → hit? serve it  (~100ns)
-2. SSD cache       → hit? serve it  (~100μs)
-3. S3              → source tag == base?
-                       packs/bases/{pack-id}          (10-50ms)
-                     source tag == tenant?
-                       packs/tenants/{tenant}/{pack-id} (10-50ms)
+1. Dirty store     → hit? serve it  (~100ns, in-memory)
+2. Memory cache    → hit? serve it  (~100ns)
+3. SSD cache       → hit? serve it  (~100μs)
+4. S3              → packs/{prefix}/{pack-id}  (10-50ms)
 ```
 
-No 404 fallback chain. The block map is the source of truth for both *what* block and *where* it lives.
+The block map is just a hash. The pack index maps hash → pack location. One lookup, one namespace.
 
 ---
 
-## Base Image Registry
+## Base Image Pipeline
 
-Base images are the shared foundation — Ubuntu, Node runtimes, Python environments. Chunked, uploaded, and made available to all tenants via an offline pipeline.
+Base images are the starting point for VMs — Ubuntu, Node runtimes, Python environments. Chunked, uploaded to the global block store, and referenced by a base manifest.
 
 ### Bless Pipeline
 
@@ -851,35 +904,26 @@ sequenceDiagram
     end
 
     loop For each pack (25 blocks)
-        CLI->>S3: HEAD packs/bases/{pack-id}
-        alt Already exists
+        CLI->>S3: HEAD packs/{prefix}/{pack-id}
+        alt Already exists (dedup)
             CLI->>CLI: skip upload
         else New pack
-            CLI->>S3: PUT packs/bases/{pack-id}
+            CLI->>S3: PUT packs/{prefix}/{pack-id}
         end
     end
 
-    CLI->>S3: PUT bases/manifests/ubuntu-22.04-node20-v3
+    CLI->>S3: PUT manifests/bases/ubuntu-22.04-node20-v3
 ```
 
 **Properties:**
-- **Dedup across base versions.** Ubuntu 22.04 + Node 18 and Ubuntu 22.04 + Node 20 share ~95% of their OS blocks. Only genuinely new chunks get uploaded.
+- **Global dedup across everything.** Ubuntu 22.04 + Node 18 and Ubuntu 22.04 + Node 20 share ~95% of their OS blocks. If a tenant has already written those blocks, they're already in S3. Only genuinely new content gets uploaded.
 - **Idempotent.** Same image → same hashes → same manifest. A no-op on re-run.
 - **Offline.** No daemon involvement. CLI talks directly to S3. Runs in CI or on a dev machine.
 - **No layers.** A base image is a flat disk image. Content-addressing handles deduplication.
 
 ### Creating a VM from a Base Image
 
-The VM's manifest starts as a copy of the base manifest. Every entry has source tag `base`. As the VM writes, individual entries flip to `(new_hash, tenant)`. Unmodified chunks continue resolving from the shared base namespace — no data copied, no storage consumed.
-
-### Base Block GC
-
-**Solution: reference counting as a fast path, mark-and-sweep as the source of truth.**
-
-- Refcount stored per base image, updated by the control plane on VM create/delete.
-- Refcount > 0: skip GC scan. Refcount == 0: full sweep to confirm.
-- The refcount is an optimization hint, not a correctness mechanism. Drift is corrected by periodic reconciliation.
-- Failure mode is always conservative: keep blocks too long, never delete too early.
+The VM's manifest starts as a copy of the base manifest. All entries point to blocks that already exist in the global store. As the VM writes, individual entries get new hashes. Unmodified chunks continue resolving from the same global namespace — no data copied, no storage consumed. New blocks written by the VM are also globally deduplicated — if another tenant has already written the same content (same npm packages, same runtime files), the block already exists.
 
 ---
 
@@ -887,47 +931,119 @@ The VM's manifest starts as a copy of the base manifest. Every entry has source 
 
 When VMs are deleted or blocks are overwritten, orphaned blocks (in packs) accumulate in S3.
 
-**Approach: mark-and-sweep with a grace period.**
+**Design principle: O(1) per lifecycle event, not O(N manifests).** The system must scale to millions of VMs without GC becoming a bottleneck. This means event-driven refcounts as the primary mechanism, not periodic scanning.
+
+### Event-Driven Refcounts (Primary)
+
+Every pack has a reference count in the control plane database. Refcount updates are transactional with manifest updates — they cannot drift.
 
 ```mermaid
 sequenceDiagram
-    participant GC as GC Worker
+    participant D as NBD Daemon
     participant S3 as S3
+    participant DB as Control Plane DB
 
-    Note over GC: Phase 1 — Mark (build live set)
-    GC->>S3: LIST + GET all manifests for tenant
-    GC->>GC: collect all referenced hashes into live set
+    Note over D: S3 flush (fork, sleep, continuous)
+    D->>S3: PUT packs (new blocks)
+    D->>S3: PUT manifest
 
-    Note over GC: Phase 2 — Sweep (find orphaned packs)
-    GC->>S3: LIST all packs in tenant namespace
+    D->>DB: BEGIN
+    Note over DB: Update manifest_packs:<br/>delete old pack refs, insert new<br/>Adjust pack_refcounts:<br/>increment new, decrement dropped
+    D->>DB: COMMIT
 
-    loop For each pack
-        GC->>GC: any block hash in live set?
-        alt Any live block
-            GC->>GC: keep entire pack
-        else All blocks dead + older than grace period
-            GC->>S3: DELETE pack
-        end
-    end
+    Note over DB: Refcount hits 0?<br/>→ enqueue pack for deletion<br/>→ delete after grace period
 ```
 
-**Grace period (24 hours):** Packs younger than the grace period are never deleted, even if unreferenced. This protects against races: a flush creates packs that aren't yet referenced by any manifest, a fork copies a manifest while blocks are in flight, or a recovery reconstructs a manifest from recently-uploaded packs.
+**Lifecycle events and their cost:**
 
-**Operational design:**
-- **Frequency:** Daily or every few hours.
-- **Scope:** Per-tenant. Base image packs have their own GC with refcount-accelerated sweep.
-- **Failure mode:** Always conservative. GC crash = orphans survive until next run. Never deletes live data.
+| Event | Refcount operations | Cost |
+|-------|-------------------|------|
+| Flush (continuous, ~5s) | Increment new packs, decrement overwritten (~2-5 packs) | O(1) |
+| Fork | Copy manifest_packs rows for new manifest, increment refcounts | O(packs in manifest) — one-time |
+| VM delete | Delete manifest_packs rows, decrement refcounts | O(packs in manifest) — one-time |
+| Refcount → 0 | Enqueue pack for deletion after grace period | O(1) |
+
+Steady-state operations (flush) touch a handful of rows per transaction. Lifecycle operations (fork, delete) are proportional to the VM's pack count (~3,200 for a 10GB VM) but happen once per VM lifetime. None scale with fleet size.
+
+### The Transaction
+
+The manifest record and pack references live in the control plane database. The full manifest (block map + pack index) lives in S3. The DB tracks *which packs* each manifest references — not the full block map.
+
+```sql
+-- Manifest write (flush)
+BEGIN;
+  -- Compute delta: new packs added, old packs dropped
+  -- (daemon sends the diff, not the full set)
+  DELETE FROM manifest_packs
+    WHERE manifest_id = $1 AND pack_id = ANY($dropped);
+
+  INSERT INTO manifest_packs (manifest_id, pack_id)
+    SELECT $1, unnest($added::text[]);
+
+  UPDATE pack_refcounts SET refcount = refcount - 1,
+    last_decremented = now()
+    WHERE pack_id = ANY($dropped);
+
+  UPDATE pack_refcounts SET refcount = refcount + 1
+    WHERE pack_id = ANY($added);
+COMMIT;
+```
+
+For a continuous flush that wrote 2 new packs and overwrote blocks in 1 old pack: 1 delete + 2 inserts + 3 refcount updates. Six rows touched regardless of whether the fleet has 100 VMs or 10 million.
+
+### Pack Deletion
+
+A background worker processes packs with refcount 0:
+
+```sql
+SELECT pack_id FROM pack_refcounts
+  WHERE refcount = 0
+  AND last_decremented < now() - interval '24 hours';
+```
+
+Index scan, O(dead packs), not O(all packs). Deletes the S3 objects. Runs continuously or on a short timer.
+
+### Reconciliation (Monthly Safety Net)
+
+The transactional refcounts should never drift. Reconciliation is a defense-in-depth measure, not a routine operation. Run monthly (or on-demand after incidents):
+
+1. Scan all manifests in S3, build live pack set
+2. Compare against pack_refcounts in DB
+3. Correct any drift (log discrepancies for investigation)
+4. Delete packs that are unreferenced in both S3 manifests and DB
+
+At 1M VMs this takes ~60 minutes. At 10M VMs, a few hours. Acceptable for a monthly job. Can be run incrementally (rotate through tenant subsets over a week) if needed.
+
+### Safety Rails
+
+- **Grace period (24 hours):** Packs with refcount 0 are not deleted until 24 hours after the last decrement. Protects against races: flush creates packs not yet referenced by a manifest, fork copies a manifest while blocks are in flight.
+- **Transactional updates:** Refcount and manifest_packs are updated in the same DB transaction. No drift window.
+- **Max deletions per cycle:** Cap the number of packs deleted per deletion worker cycle. Limits blast radius.
+- **Dry-run mode:** Log what would be deleted without deleting. Validate before enabling in production.
+- **Failure mode:** Always conservative. Transaction failure → no refcount change → orphans survive. Deletion worker crash → orphans survive until next cycle. Never deletes live data.
+
+### Scaling Properties
+
+| Fleet size | Steady-state GC cost | Lifecycle GC cost | Reconciliation |
+|-----------|---------------------|------------------|----------------|
+| 1K VMs | ~10 refcount updates/s | Negligible | Minutes |
+| 100K VMs | ~1K refcount updates/s | ~100 VM deletes/day | ~10 minutes |
+| 1M VMs | ~10K refcount updates/s | ~1K VM deletes/day | ~60 minutes monthly |
+| 10M VMs | ~100K refcount updates/s | ~10K VM deletes/day | Hours, incremental |
+
+The control plane DB (PostgreSQL) handles 100K simple updates/s on modest hardware. This is the same database the control plane already uses for VM metadata, tenant records, and scheduling.
 
 ---
 
 ## Encryption at Rest
 
-Per-tenant encryption using S3 server-side encryption with KMS (SSE-KMS).
+SSE-KMS with a shared platform key. All blocks and manifests encrypted with one KMS key.
 
-- **Shared base image packs:** SSE-S3 (AWS-managed key). Not secret — public OS/runtime images.
-- **Tenant packs:** SSE-KMS with per-tenant KMS key. Transparent encryption/decryption on PUT/GET.
-- **Manifests:** SSE-KMS with tenant's key. Block maps reveal which blocks a tenant uses.
+- **All packs:** SSE-KMS with the platform key. Transparent encryption/decryption on PUT/GET.
+- **All manifests:** SSE-KMS with the platform key.
 - **No application-layer encryption needed.** S3 + KMS handles it. The daemon doesn't touch keys.
+
+**Why a shared key:** Per-tenant KMS keys are security theater for a developer platform. "Key compromised" means your AWS account is compromised, at which point the attacker has access to all KMS keys anyway. The platform operator needs access to all keys to serve VMs. A shared key satisfies SOC2 encryption-at-rest requirements. Per-tenant keys can be added later if an enterprise customer requires customer-managed keys in their own AWS account — it's additive (change the KMS key on S3 PUTs for that tenant, accept that their blocks don't dedup cross-tenant).
 
 ---
 
@@ -961,18 +1077,158 @@ Content-addressing gives free integrity checks.
 | **NBD Daemon** | Single process, multiplexes all VMs | Event loop, resolves offsets via block maps, no QoS logic |
 | **Flush Scheduler** | Controls when blocks go to S3 | Demand-driven (default) or continuous (production). Per-VM policy. |
 | **WAL** | Local crash recovery (bridges last ~5s before local persist) | Append-only on local SSD, sequence-numbered, truncated on persist |
-| **Block Map** | Ordered array of (hash, source) per VM | 17 bytes/entry. Persisted locally (fast) + S3 (on flush). Sparse for unwritten regions. |
-| **Memory Cache** | In-memory LRU, hot blocks | Configurable size, ~100ns reads, evicts to SSD tier |
-| **SSD Cache** | SSD-backed, warm blocks | ~100μs reads, stores uncompressed, verified on ingestion |
+| **Block Map** | Ordered array of (hash, flags) per VM | 17 bytes/entry. Fork overlay for shared parents. Persisted locally (fast) + S3 (on flush). Sparse for unwritten regions. |
+| **Dirty Block Store** | Pinned storage for unflushed blocks | HashMap, no eviction. Blocks move to clean cache on S3 flush. |
+| **Dirty Set** | Track dirty block offsets | HashSet\<u64\>. O(1) insert on write, O(D) drain on flush. Avoids O(B) block map scan. |
+| **Memory Cache** | In-memory S3-FIFO, hot blocks | Configurable size, ~100ns reads, evicts to SSD tier. foyer library. |
+| **SSD Cache** | SSD-backed S3-FIFO, warm blocks | ~100μs reads, stores uncompressed, verified on ingestion. foyer library. |
 | **Pack Files** | Batched S3 storage format | 25 blocks/pack (~3.2MB). 25x fewer S3 PUTs. Whole-pack prefetch. |
-| **Pack Index** | Hash → pack location mapping | ~24 bytes/block. In manifest. No compaction — keep packs with any live block. |
+| **Pack Index** | Hash → pack location mapping | ~24 bytes/block. Shared across VMs on host (DashMap). Rebuilt on VM lifecycle events. Per-VM index derived for manifest serialization. |
 | **TRIM Handler** | Reclaim deleted blocks | Reset to zero-block hash. Metadata-only. Orphans cleaned by GC. |
 | **Compression** | LZ4 at S3 boundary | Hash raw → compress → pack → S3. ~1.5-2x ratio. |
-| **Base Image Registry** | Blessed shared blocks | Offline CLI pipeline (`glidefs bless`). Packed, deduped across versions. |
-| **Tenant GC** | Orphan pack cleanup | Mark-and-sweep, 24h grace period, per-tenant, daily. Pack-level sweep. |
-| **Base GC** | Base image pack cleanup | Refcount fast path + mark-and-sweep. Scans all tenants only when refcount hits 0. |
+| **Base Image Pipeline** | Base image ingestion | Offline CLI pipeline (`glidefs bless`). Uploads to global block store. Deduped naturally. |
+| **Pack Refcounts** | Track pack liveness | Transactional with manifest updates in control plane DB. O(1) per flush. No drift. |
+| **Pack Deletion Worker** | Delete orphaned packs | Processes refcount-0 packs after 24h grace period. Index scan, continuous. |
+| **GC Reconciliation** | Correctness safety net | Monthly mark-and-sweep across all manifests. Corrects any drift. Incremental at scale. |
 | **cgroup v2 I/O** | Per-VM IOPS/throughput limits | Kernel-level, configured by control plane |
 | **Background Scrubber** | Cache integrity verification | Periodic re-hash of cached blocks, off hot path |
+
+---
+
+## Algorithmic Complexity Analysis
+
+Systematic analysis of every operation's time and space complexity. Variables:
+
+```
+B = block_map_size (entries per VM, max ~800K for 100GB disk, typical ~80K for 10GB)
+D = dirty_count (blocks modified since last flush)
+P = packs_per_manifest (~B/25, ~3,200 for 10GB VM)
+V = VMs_on_host (typical 50-100, max ~500)
+N = total_VMs_in_fleet (target: millions)
+K = pack_size (blocks per pack, default 25)
+```
+
+### Hot Path (Per-Request)
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **Read: block map lookup** | O(1) | — | No | Array index or overlay HashMap + parent fallback |
+| **Read: dirty store check** | O(1) | — | No | HashMap lookup |
+| **Read: memory cache lookup** | O(1) | — | No | DashMap (foyer) |
+| **Read: SSD cache lookup** | O(1) | — | No | foyer |
+| **Read: S3 fetch (cache miss)** | O(K) | O(K) | No | Fetch 1 pack, decompress + cache 25 blocks |
+| **Read: BLAKE3 verify** | O(128KB) | — | No | ~5μs, constant |
+| **Write: BLAKE3 hash** | O(128KB) | — | No | ~5μs, constant |
+| **Write: WAL append** | O(128KB) | — | No | Sequential, ~20μs |
+| **Write: cache insert** | O(1) | O(128KB) | No | Dirty store + memory cache |
+| **Write: block map update** | O(1) | — | No | Array index or overlay insert |
+| **Write: dirty set insert** | O(1) | — | No | Track dirty offsets for flush |
+
+**Verdict: all O(1).** The hot path has no operations that scale with VM count, block map size, or fleet size. Throughput is bounded by SSD bandwidth and CPU (hashing), not algorithmic complexity.
+
+### Flush Path (Periodic or On-Demand)
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **Collect dirty blocks** | O(D) | O(D) | **Fixed** | Dirty set, not block map scan (see below) |
+| **Host pack index dedup** | O(D) | — | No | D lookups in DashMap, O(1) each |
+| **Read from SSD cache** | O(D') | — | No | D' = blocks after dedup, D' ≤ D |
+| **BLAKE3 hash (if re-verify)** | O(D' × 128KB) | — | No | Optional integrity check |
+| **LZ4 compress** | O(D' × 128KB) | O(D' × 128KB) | No | ~1GB/s, negligible |
+| **S3 PUT (packs)** | O(D'/K) | — | No | Network-bound, not CPU |
+| **Host pack index update** | O(D') | — | No | DashMap inserts |
+| **Manifest serialization** | O(B) | O(B) | **Watch** | Must serialize full block map + derive pack index |
+| **Manifest S3 PUT** | O(1) | — | No | Single object |
+| **Refcount DB transaction** | O(Δ packs) | — | No | Only changed packs, ~2-5 for steady-state flush |
+
+**Bottleneck found and fixed: dirty block collection.**
+
+The doc said "scan block map for dirty entries" — that's O(B) per flush, scanning 80K-800K entries to find a handful of dirty blocks. For continuous flush every 5 seconds, this is wasteful.
+
+**Fix: maintain a dirty set.** On write, insert the block offset into a `HashSet<u64>`. On flush, iterate the dirty set (O(D), not O(B)). On flush completion, clear flushed entries. Cost: O(1) per write (HashSet insert), O(D) per flush. Space: O(D) — negligible.
+
+**Watch: manifest serialization** is O(B) — must write the full block map and derive each entry's pack location from the host index. For continuous flush, this runs every ~60 seconds. At B=800K and 5 production VMs: 5 × 800K / 60 = ~67K lookups/s. ~3ms of CPU. Not a bottleneck in practice, but it's the one flush operation that scales with disk size rather than dirty count.
+
+### Lifecycle Operations
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **Fork: S3 manifest copy** | O(B) | O(B) | No | Serialize + PUT. One-time per fork. |
+| **Fork: DB manifest_packs copy** | O(P) | O(P) | No | `INSERT ... SELECT` — one SQL query, ~3,200 rows |
+| **Fork: refcount increment** | O(P) | — | No | One UPDATE with `WHERE pack_id IN (...)` |
+| **Fork: host overlay setup** | O(1) | O(1) | No | Arc clone + empty HashMap |
+| **VM delete: DB cleanup** | O(P) | — | No | Delete manifest_packs + decrement refcounts. Async. |
+| **VM delete: local cleanup** | O(1) | — | No | Drop block map, release cache entries lazily |
+| **Same-host wake** | O(B) | O(B) | No | Load block map from local file |
+| **Cross-host wake** | O(B) | O(B) | No | GET manifest from S3 + parse |
+| **Boot hot set prefetch** | O(H) | O(H) | No | H = hot set size, ~1,600 blocks. Parallel S3 GETs. |
+
+**Verdict: all O(per-VM), none O(fleet).** Fork and delete are proportional to the VM's pack count (~3,200), not to fleet size. Two SQL queries handle the DB updates regardless of whether the fleet has 1K or 10M VMs.
+
+### Background Operations
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **WAL truncation** | O(1) | — | No | Truncate file after block map persist |
+| **Block map local persist** | O(B) | O(B) | No | Every ~5s, fsync to SSD. Bounded by disk size. |
+| **Host pack index rebuild** | O(V × B) | O(unique blocks) | **Watch** | On VM lifecycle events. ~100ms at 100 VMs. |
+| **Fork overlay flattening** | O(B) | O(B) | No | Copy parent + apply overlay. Background. Rare. |
+| **Background scrubber** | O(cached blocks) | — | No | Amortized over hours/days. Off hot path. |
+| **Sequential read-ahead** | O(1) per read | O(V) | No | Ring buffer per VM for pattern detection |
+| **Pack deletion worker** | O(dead packs) | — | No | Index scan on refcount=0. Continuous. |
+| **Reconciliation** | O(N × B) | O(unique hashes) | **Known** | Monthly. Incremental at scale. |
+
+**Watch: host pack index rebuild** is O(V × B). At 500 VMs × 80K entries = 40M entries, ~500ms. Triggered on VM arrive/depart. If VMs churn rapidly (10+ events/second), rebuilds could lag. Mitigation: debounce rebuilds (batch lifecycle events within a 1-second window) or use incremental updates (add on arrive, mark-and-sweep on depart).
+
+**Known: reconciliation** is O(N × B) — the one operation that scales with fleet size. Bounded to monthly cadence. At 1M VMs: ~60 minutes. At 10M VMs: hours, run incrementally over a week. This is a consistency check, not a bottleneck — event-driven refcounts handle steady-state GC at O(1).
+
+### Space Complexity (Per Host)
+
+| Structure | Size | Bounded by | Growth pattern |
+|-----------|------|-----------|---------------|
+| **Block maps** | O(V × B) | VM count × disk size | Static per VM. Fork overlay reduces by ~95%. |
+| **Dirty block store** | O(Σ dirty blocks) | **Unbounded** | **Grows until flush.** See below. |
+| **Memory cache** | Configured | `memory_cache_gb` setting | Fixed. Eviction handles pressure. |
+| **SSD cache** | Configured | Available SSD | Fixed. Eviction handles pressure. |
+| **WAL** | O(write_rate × 5s) | Persist interval | Truncated every ~5s. ~1.4GB worst case. |
+| **Host pack index** | O(unique blocks on host) | VM count × data per VM | Rebuilt on lifecycle events. |
+| **Sequential detector** | O(V) | VM count | Ring buffer per VM. Negligible. |
+
+**Bottleneck: dirty block store growth.** In demand-driven mode, dirty blocks accumulate indefinitely — they're pinned (not evictable) because the SSD cache is the only local copy after WAL truncation. A build VM writing 50GB over 8 hours pins 50GB. At 50 VMs with heavy writes, aggregate pinned data could exhaust SSD capacity.
+
+**Fix options** (open question #6):
+1. **Back-pressure:** Slow writes when pinned blocks exceed X% of SSD. Guest sees higher latency, not errors.
+2. **Forced partial flush:** Flush oldest dirty blocks to S3 even in demand-driven mode when pinned data exceeds a threshold. Turns pure demand-driven into a hybrid.
+3. **Dirty block budget per VM:** Hard cap on pinned data. Flush triggered at threshold.
+
+### Fleet-Level Operations
+
+| Operation | Time | Scales with | Bottleneck? |
+|-----------|------|------------|-------------|
+| **Refcount update (per flush)** | O(Δ packs) | Nothing — constant per flush | No |
+| **Refcount update (fork/delete)** | O(P) | Per-VM data | No |
+| **Pack deletion** | O(dead packs) | Churn rate | No |
+| **S3 PUTs (aggregate)** | O(fleet write rate / K) | Fleet write rate | Infra cost, not algorithmic |
+| **S3 GETs (aggregate)** | O(fleet cache misses) | Cache hit rate | Infra cost, not algorithmic |
+| **Reconciliation** | O(N × B) | Fleet size | Monthly. Incremental. |
+| **manifest_packs table** | — | O(N × P) rows | **Watch** |
+
+**Watch: manifest_packs table size.** At 1M VMs × 3,200 packs = 3.2B rows. PostgreSQL handles this with partitioning (by tenant_id or manifest_id hash). Query patterns are single-manifest (insert/delete on flush, fork, VM delete) — partition-local operations. No cross-partition joins needed.
+
+### Summary
+
+```
+Hot path:          O(1) per read/write         ✓ no bottleneck
+Flush:             O(D) with dirty set         ✓ fixed (was O(B))
+Manifest sync:     O(B) per VM                 ~ bounded by disk size, infrequent
+Fork/delete:       O(P) per VM                 ✓ independent of fleet size
+GC (steady-state): O(1) per flush event        ✓ no bottleneck
+GC (lifecycle):    O(P) per fork/delete         ✓ independent of fleet size
+GC (reconcile):    O(N × B) monthly            ~ known, incremental at scale
+Host operations:   O(V × B) on lifecycle        ~ bounded by host density
+```
+
+**Nothing in the steady-state hot path or flush path scales with fleet size.** The only fleet-scale operation is monthly reconciliation, which is a safety net, not a routine operation. The system scales horizontally by adding hosts — each host is O(V × B) regardless of total fleet size.
 
 ---
 
@@ -983,22 +1239,24 @@ Content-addressing gives free integrity checks.
 | **Local snapshots/clones** | Block map copy in S3 | ZFS clones are local-only. Block map copy works cross-host. |
 | **LZ4 compression** | LZ4 at S3 boundary | Same algorithm, different layer. Equivalent ratio. |
 | **Block integrity** | BLAKE3-128 content-addressing + scrubber | Every block verified by re-hashing. |
-| **ARC (adaptive read cache)** | Two-tier memory + SSD cache | LRU instead of ARC. Simpler, may revisit if hit rates are poor. |
+| **ARC (adaptive read cache)** | Two-tier memory + SSD cache with S3-FIFO | S3-FIFO matches ARC on hit rates, better scan resistance, simpler concurrency. foyer library. |
 | **Copy-on-write** | Content-addressed writes | Every write produces a new block. Old blocks remain until GC. |
 | **Durability (ZIL/SLOG)** | WAL on local SSD | Same concept. WAL covers the window between local block map persists (~5s). S3 flush reads from SSD cache, not WAL. |
-| **Deduplication** | Content-addressing (inherent) | Same content → same hash → same block. Automatic. |
+| **Deduplication** | Content-addressing (inherent, global) | Same content → same hash → same block. Automatic across all tenants. |
 
 ---
 
 ## Open Questions
 
 1. **Memory cache sizing** — What's the right default for `memory_cache_gb`? Needs profiling under realistic load.
-2. **Continuous flush intervals** — Block flush at ~5s, manifest at ~60s is the starting point for production VMs. Both tunable.
-3. **Cache warming on cross-host wake** — Is the boot hot set predictable enough to preload? Start without it, measure, add if needed.
-4. **cgroup I/O limits by tier** — What are the actual IOPS/throughput numbers per tier?
-5. **GC grace period tuning** — 24 hours is conservative. Could be shorter if we can bound the max time between block creation and manifest update.
-6. **Sub-chunk dirty tracking** — Deferred until write amplification is a measured problem.
-7. **Pinned dirty block pressure** — In demand-driven mode, dirty blocks accumulate on SSD for hours (pinned, not evictable). A write-heavy VM active for 8 hours could pin tens of GB. At 50 VMs, aggregate pinned data could consume a meaningful fraction of SSD. Need a policy: back-pressure writes when pinned blocks exceed X% of SSD? Force a partial S3 flush? This is the real SSD capacity concern — not WAL size, not cache eviction, but the steady growth of data that *can't* be evicted.
-8. **ARC vs LRU** — Start with LRU. Consider ARC if hit rates are poor.
-9. **Pack size** — 25 blocks (3.2MB) matches v1. Profile to find the sweet spot between S3 ops and mixed-pack waste.
-10. **Demand-driven for production** — Should production default to demand-driven (flush on fork request) instead of continuous? Saves S3 traffic at the cost of 1-5 seconds of fork latency. Depends on preview creation frequency.
+2. **Continuous flush intervals** — Block flush at ~5s, manifest at ~60s is the starting point for production VMs. Adaptive flush adjusts based on dirty block count. Both base intervals tunable.
+3. **cgroup I/O limits by tier** — What are the actual IOPS/throughput numbers per tier?
+4. **GC grace period tuning** — 24 hours is conservative. Could be shorter if we can bound the max time between block creation and manifest update.
+5. **Sub-chunk dirty tracking** — Deferred until write amplification is a measured problem.
+6. **Pinned dirty block pressure** — In demand-driven mode, dirty blocks accumulate in the dirty store for hours. A write-heavy VM active for 8 hours could pin tens of GB. At 50 VMs, aggregate pinned data could consume a meaningful fraction of SSD. Need a policy: back-pressure writes when pinned blocks exceed X% of SSD? Force a partial S3 flush? This is the real SSD capacity concern — the steady growth of data that *can't* be evicted.
+7. **Pack size** — 25 blocks (3.2MB) matches v1. Profile to find the sweet spot between S3 ops and mixed-pack waste.
+8. **Demand-driven for production** — Should production default to demand-driven (flush on fork request) instead of continuous? Saves S3 traffic at the cost of 1-5 seconds of fork latency. Depends on preview creation frequency.
+9. **Fork overlay flattening threshold** — 50% divergence is the starting heuristic for flattening a fork overlay into a standalone block map. May need tuning based on read path overhead vs memory savings.
+10. **manifest_packs table size** — At 1M VMs × ~3,200 packs per VM = ~3.2B rows. PostgreSQL handles this with partitioning (by manifest_id or tenant_id). Monitor and partition proactively.
+11. **Per-tenant KMS keys (future)** — If an enterprise customer requires customer-managed keys, add per-tenant encryption as an opt-in. Blocks for that tenant don't dedup cross-tenant. Additive change — no architectural rework needed.
+12. **Reconciliation scheduling at extreme scale** — At 10M+ VMs, full reconciliation takes hours. Incremental approach (rotate through tenant subsets) keeps individual runs bounded. Determine the right rotation period.

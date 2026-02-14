@@ -65,7 +65,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 │  ┌───────────────────────────┐   ┌──────────────────────────┐│
 │  │  User workload            │   │  glidefs-agent           ││
 │  │  (app, build, AI agent)   │   │                          ││
-│  │                           │   │  • inotify on /repo      ││
+│  │                           │   │  • fanotify on /repo     ││
 │  │  reads/writes /repo       │   │  • file walk + hash      ││
 │  │  normally                 │   │  • file write (restore)  ││
 │  └───────────────────────────┘   │  • vsock connection      ││
@@ -369,7 +369,7 @@ glidefs receives a write plan from the control plane, fetches blobs from S3 by h
 ```
 glidefs-agent (guest)                   glidefs (host)
      │                                       │
-     │ (inotify fires: file changed in /repo)│
+     │ (fanotify: FAN_CLOSE_WRITE in /repo)  │
      │                                       │
      │  FILE_CHANGED { }                     │
      ├──────────────────────────────────────►│
@@ -379,7 +379,7 @@ glidefs-agent (guest)                   glidefs (host)
      │                                       │
 ```
 
-The notification is intentionally content-free — just "something changed." The host doesn't need to know what changed until it triggers a checkpoint. But internally, the agent maintains a **dirty set** of paths from inotify events. When a checkpoint triggers, the agent hashes only dirty paths instead of stat-walking everything (see Incremental Hashing). On `IN_Q_OVERFLOW` (inotify dropped events), the dirty set is discarded and the next checkpoint falls back to a full stat walk.
+The notification is intentionally content-free — just "something changed." The host doesn't need to know what changed until it triggers a checkpoint. But internally, the agent maintains a **dirty set** of paths from fanotify events. When a checkpoint triggers, the agent hashes only dirty paths instead of stat-walking everything (see Incremental Hashing). fanotify with `FAN_UNLIMITED_QUEUE` doesn't overflow — the dirty set is always complete. The full stat walk fallback is only needed after agent restart (dirty set lost in memory).
 
 ---
 
@@ -398,7 +398,7 @@ Index entry per file:
 
 **On checkpoint (fast path — dirty set available):**
 
-Between checkpoints, inotify events accumulate a dirty set of paths that changed. When a checkpoint triggers:
+Between checkpoints, fanotify `FAN_CLOSE_WRITE` events accumulate a dirty set of paths that changed. When a checkpoint triggers:
 
 1. For each path in the dirty set: read file, hash it, update index entry
 2. For paths NOT in the dirty set: reuse cached hash from the index (no stat, no read, no hash)
@@ -406,7 +406,7 @@ Between checkpoints, inotify events accumulate a dirty set of paths that changed
 
 **On checkpoint (fallback — full walk):**
 
-Used on first checkpoint, after agent restart (dirty set lost), or after `IN_Q_OVERFLOW` (inotify dropped events — dirty set is incomplete):
+Used on first checkpoint or after agent restart (dirty set lost):
 
 1. Walk /repo (respecting .checkpointignore)
 2. For each file, `stat()` to get (mtime, size, inode)
@@ -414,7 +414,7 @@ Used on first checkpoint, after agent restart (dirty set lost), or after `IN_Q_O
 4. If any differ or entry missing → read file, hash it, update index entry
 
 **First checkpoint:** O(total bytes) — hash everything.
-**Subsequent checkpoints (fast path):** O(changed files) for both stat and hash — inotify tells you exactly what's dirty.
+**Subsequent checkpoints (fast path):** O(changed files) for both stat and hash — fanotify tells you exactly what's dirty.
 **Subsequent checkpoints (fallback):** O(total files) for stat, O(changed bytes) for hash — mtime index skips unchanged files.
 
 The three-field comparison (mtime + size + inode) is the same approach git uses for its index. A file that changes content while keeping the same mtime, size, AND inode number is astronomically unlikely. If paranoia is needed, add a `--full-hash` flag that ignores the index and hashes everything.
@@ -901,9 +901,10 @@ Both options exist and serve different purposes:
 ### Agent Side (File Watching)
 
 ```
-1. Set up recursive inotify watch on /repo
-   Events: IN_CREATE | IN_MODIFY | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO
-   Respect .checkpointignore: don't watch ignored paths
+1. Set up fanotify on /repo filesystem
+   Single mark: FAN_CLOSE_WRITE | FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO
+   FAN_UNLIMITED_QUEUE — never overflows (requires CAP_SYS_ADMIN, agent has it)
+   Filter events to /repo prefix in userspace, respect .checkpointignore
 
 2. On any event:
    Buffer for 500ms (coalesce rapid edits)
@@ -949,7 +950,7 @@ At 60 checkpoints/hour, an active AI agent produces 400+ checkpoints in a workda
 
 ### When Watching is Paused
 
-- During restore (agent pauses inotify while receiving WRITE_FILES, resumes after)
+- During restore (agent pauses fanotify processing while receiving WRITE_FILES, resumes after)
 - During build (the control plane disables auto-checkpoint while setup_command / build_command runs, re-enables after)
 - In production mode (no auto-checkpoint — explicit only)
 
@@ -1118,7 +1119,7 @@ A single static binary (`glidefs-agent`) baked into the base image. No runtime d
 
 The agent does:
 
-- Watch /repo for file changes (inotify)
+- Watch /repo for file changes (fanotify)
 - Walk /repo, hash files, stream manifest to host (vsock)
 - Write files to /repo on restore/merge (vsock)
 - Maintain mtime index for incremental hashing
@@ -1140,10 +1141,10 @@ It reads files, hashes files, writes files, and reports changes. The host tells 
 |----------|-------|
 | **Language** | Rust (shared types with glidefs for manifest/protocol) |
 | **Binary size** | ~2-5MB static |
-| **Lines of code** | ~2000-3000 (gitignore-compatible glob parsing, recursive inotify with overflow handling, atomic writes with error propagation, mtime index with corruption detection) |
+| **Lines of code** | ~2000-3000 (gitignore-compatible glob parsing, fanotify filesystem watching, atomic writes with error propagation, mtime index with corruption detection) |
 | **Memory usage** | ~10-50MB (mtime index + vsock buffers) |
 | **CPU usage** | Negligible except during checkpoint (hashing) |
-| **Dependencies** | blake3, rmp-serde (MessagePack), inotify, vsock, ignore (gitignore-compatible glob matching for .checkpointignore) |
+| **Dependencies** | blake3, rmp-serde (MessagePack), vsock, ignore (gitignore-compatible glob matching for .checkpointignore) |
 
 ### File Ownership
 
@@ -1152,7 +1153,7 @@ The agent needs vsock access (typically requires root or a specific group). But 
 1. Starting as root (for vsock bind)
 2. Reading a configured `repo_uid`/`repo_gid` (default: 1000/1000 — standard first non-root user)
 3. All file writes use `chown(repo_uid, repo_gid)` after the atomic rename
-4. The agent does NOT drop privileges itself — it needs root for vsock and inotify on arbitrary paths
+4. The agent does NOT drop privileges itself — it needs root for vsock and fanotify (CAP_SYS_ADMIN for FAN_UNLIMITED_QUEUE)
 
 The manifest records `mode` (permission bits) but not `uid`/`gid`. Ownership is a VM-local concern configured once per base image, not a per-file property that travels with checkpoints.
 
@@ -1162,7 +1163,7 @@ The manifest records `mode` (permission bits) but not `uid`/`gid`. Ownership is 
 1. Parse config: checkpoint root (default: /repo), vsock port (default: 10842),
    repo_uid (default: 1000), repo_gid (default: 1000)
 2. Load mtime index from /var/lib/glidefs-agent/index.bin (or start fresh)
-3. Set up inotify watches on checkpoint root
+3. Set up fanotify mark on filesystem (single mark, filters to checkpoint root)
 4. Listen on vsock port
 5. Ready (log "glidefs-agent listening on vsock port 10842")
 ```
@@ -1182,7 +1183,7 @@ On SIGTERM:
 
 | Component | Location | Role |
 |-----------|----------|------|
-| **glidefs-agent** | Guest VM (~2000-3000 LOC) | File I/O — walk, hash, read, write. vsock client. inotify watcher. |
+| **glidefs-agent** | Guest VM (~2000-3000 LOC) | File I/O — walk, hash, read, write. vsock client. fanotify watcher. |
 | **vsock server** | glidefs host daemon | Connects to agent, sends requests, receives manifests and blobs. |
 | **Checkpoint coordinator** | glidefs host daemon | Orchestrates: Glide v2 snapshot → agent manifest → blob upload → S3 store. |
 | **Write plan executor** | glidefs host daemon | Fetches blobs from S3 by hash, streams to agent via vsock. |

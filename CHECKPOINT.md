@@ -1,12 +1,12 @@
 # Checkpoint Agent — File-Level Operations for Boxes
 
-## Design Document — vsock Guest Agent + File Manifests + Three-Way Merge
+## Design Document — vsock Guest Agent + File Manifests + Stacked Merge
 
 ---
 
 ## Overview
 
-A thin file-level layer on top of Glide v2 that gives Boxes version control semantics — automatic save points, file-level diffs, branching, and three-way merge for promotion. No git ceremony.
+A thin file-level layer on top of Glide v2 that gives Boxes version control semantics — automatic save points, file-level diffs, branching, and stacked merge for promotion. No git ceremony.
 
 **Core insight: Glide v2 sees blocks, not files.** It can snapshot, fork, and restore a block device instantly — but it can't tell you which *files* changed, or merge two developers' changes to the same codebase. A lightweight guest agent bridges this gap by giving glidefs file-level visibility through vsock.
 
@@ -16,7 +16,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 - **Auto-checkpoint**: Agent watches /repo, triggers checkpoints on change. No git add, no git commit. Invisible save points.
 - **File-level diff**: Compare two checkpoints, see exactly which files changed and what changed in each one.
-- **Three-way merge**: Promote a checkpoint to production without overwriting concurrent changes.
+- **Stacked merge**: Promote a checkpoint to production without overwriting concurrent changes.
 - **Selective restore**: Replace /repo from a checkpoint without touching the rest of the filesystem (OS, runtime, caches stay warm).
 - **Branching**: Fork a VM (Glide v2), keep working independently, diff branches against their common ancestor.
 
@@ -32,7 +32,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 **Sub-second diff.** Comparing two checkpoints with 50K files takes <1ms (hash comparison). Fetching content for ~100 changed files takes 50-200ms. Total: well under a second for any realistic codebase.
 
-**Safe concurrent development.** Two agents (or an agent and a developer) can fork from the same production, work independently, and both promote. Three-way merge reconciles their changes automatically when they don't conflict, and surfaces conflicts clearly when they do.
+**Safe concurrent development.** Two agents (or an agent and a developer) can fork from the same production, work independently, and both promote. Stacked merge decomposes each agent's work into its natural stack of small changesets (auto-checkpoints) and applies them individually — overlapping files are re-applied by the agent with full semantic understanding, not merged mechanically at the text level.
 
 **Incremental everything.** After the first checkpoint (which hashes every file), subsequent checkpoints only hash changed files. The mtime index makes this O(changed files), not O(total files). Blob uploads are deduplicated — same content is never uploaded twice.
 
@@ -48,7 +48,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 **vsock requires a cooperating guest.** If the agent isn't running (or the guest kernel doesn't support vsock), file-level operations fail silently. Block-level operations are unaffected. This is acceptable — we control the base images and the agent is a tiny static binary.
 
-**Three-way merge is line-based.** Content merge (diff3) works on text files with line-level granularity. It can produce semantically incorrect merges for structured files (JSON, YAML) where a line-level merge is syntactically valid but logically wrong. This is the same limitation as git. For code files, it works well.
+**Agent re-apply requires the agent.** When both sides modify the same file, stacked merge delegates to the AI agent to re-apply its change on the new base. If the agent is unavailable (offline, timed out), the promotion blocks until the agent is ready. Fallback for human developers: show a unified diff for manual resolution. This is the exception — most promotions have no overlapping files and complete without agent involvement.
 
 **No atomic multi-file restore.** Individual files are atomically replaced (write to temp, fsync, rename). But the restore as a whole is not atomic across files. A crash mid-restore leaves /repo in a mixed state. Mitigation: re-trigger restore (idempotent — same inputs, same result). For promotion, the VM isn't serving traffic until build succeeds, so partial state during restore is never user-visible.
 
@@ -105,7 +105,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 │  │                                                        │  │
 │  │  • Checkpoint DAG (database or S3 metadata)            │  │
 │  │  • Diff engine (fetch manifests + blobs, unified diff) │  │
-│  │  • Merge engine (three-way merge, diff3)               │  │
+│  │  • Merge engine (stacked merge, agent re-apply)        │  │
 │  │  • Promotion orchestration                             │  │
 │  │  • Auto-checkpoint scheduling                          │  │
 │  └────────────────────────────────────────────────────────┘  │
@@ -116,7 +116,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 - **glidefs-agent** (guest): file I/O only. Walks filesystem, hashes files, writes files, reports changes. No storage logic, no S3 access, no merge logic, no policy decisions.
 - **glidefs daemon** (host): block storage + vsock bridge. Handles block-level operations (Glide v2), coordinates with the agent over vsock, uploads blob content to S3 on checkpoint, and executes file write plans by fetching blobs from S3 and streaming them to the agent. Does NOT compute diffs, merges, or manage the checkpoint DAG.
-- **Control plane** (separate service): file-level intelligence. Manages the checkpoint DAG, computes diffs and three-way merges, orchestrates promotions, decides when to auto-checkpoint. Sends write plans to glidefs for execution.
+- **Control plane** (separate service): file-level intelligence. Manages the checkpoint DAG, computes diffs and stacked merges, orchestrates promotions, decides when to auto-checkpoint. Sends write plans to glidefs for execution.
 
 ---
 
@@ -187,7 +187,7 @@ checkpoints/{tenant}/{id}.manifest.lz4    ← file manifest (MessagePack + LZ4)
 
 ### Checkpoint DAG
 
-The DAG tracks parent pointers, labels, and timestamps for every checkpoint. It's how the system finds common ancestors for merge and walks history for diff.
+The DAG tracks parent pointers, labels, timestamps, and changesets for every checkpoint. It's how the system finds fork points for stacked merge, walks history for diff, and retrieves precomputed changesets at promotion time.
 
 Each checkpoint record:
 
@@ -199,6 +199,7 @@ snapshot_id:            "glide-snap-0042"
 source_checkpoint_id:   "chk_P0"          ← production checkpoint this preview forked from
 label:                  "before-migration"
 timestamp:              "2026-02-11T15:04:05Z"
+changeset:              ["src/main.rs"]    ← files changed vs parent (precomputed for stacked merge)
 ```
 
 **Where to store it depends on the control plane:**
@@ -627,9 +628,9 @@ The diff engine skips fetching blob content for generated files entirely. The ex
 
 ---
 
-## Three-Way Merge
+## Stacked Merge
 
-The critical operation for concurrent development. When promoting a checkpoint based on a stale production state, three-way merge reconciles the changes instead of blindly overwriting.
+The merge strategy for concurrent promotion. Instead of three-way content merge (diff3), decompose the agent's work into its natural stack of small changesets — one per auto-checkpoint — and apply each one individually. Overlapping files are resolved by the agent re-applying its intent, not by algorithmic text merging.
 
 ### Why It's Needed
 
@@ -642,26 +643,67 @@ Timeline:
   T4: Agent B wants to promote
 
   Without merge:
-    Fork P1 + replace /repo with B's checkpoint → A's changes are lost.
+    Fork P1 + replace /repo with B's final checkpoint → A's changes are lost.
 
-  With three-way merge:
-    Base = P0 (common ancestor)
-    Ours = P1 (current production, includes A's work)
-    Theirs = B's checkpoint
-    → A's changes preserved, B's changes applied, conflicts surfaced.
+  With stacked merge:
+    Decompose B's work into individual changesets (one per auto-checkpoint).
+    Apply each changeset to P1.
+    Overlapping files → agent re-applies that one small change.
+    → A's changes preserved, B's changes applied, no conflicts.
 ```
 
-### Finding the Common Ancestor
+### The Stack
 
-Every checkpoint records its parent. The common ancestor is the point where the two chains diverge:
+Auto-checkpoints already capture a natural stack of small changesets. Each checkpoint records a few files changed in a ~5-second window. An agent working for 2 hours produces ~400 checkpoints.
 
 ```
-P0 ── P1 (Agent A promoted)              ← "ours" chain
- └─── chk_B1 ── chk_B2 ── chk_B3        ← "theirs" chain
-       common ancestor = P0
+Agent B's checkpoint chain (forked from P0):
+
+  P0 → chk_1 → chk_2 → chk_3 → chk_4 → chk_5
+       (Δ1)    (Δ2)    (Δ3)    (Δ4)    (Δ5)
+
+Changesets (diff between consecutive checkpoints):
+  Δ1 = chk_1 − P0      added package.json dependency         (1 file)
+  Δ2 = chk_2 − chk_1   added src/feature.rs, modified lib.rs (2 files)
+  Δ3 = chk_3 − chk_2   modified src/main.rs                  (1 file)
+  Δ4 = chk_4 − chk_3   modified src/main.rs                  (1 file)
+  Δ5 = chk_5 − chk_4   added tests/feature_test.rs           (1 file)
 ```
 
-Walk both chains backward until they meet. With a database, this is a recursive CTE — milliseconds regardless of depth. With S3 metadata, it's sequential GETs — fast for shallow chains, slow for deep ones.
+A changeset is computed trivially: compare manifest N to manifest N-1. Different hash → modified. Present in N but not N-1 → added. Present in N-1 but not N → deleted. Changesets are small (typically 1-5 files), so they're recorded in the checkpoint DAG record at checkpoint time — no need to re-derive them at merge time.
+
+### Production Delta
+
+Before applying the stack, compute what production changed since the agent forked:
+
+```
+production_delta = diff(P0_manifest, P1_manifest)
+  → { modified: ["src/main.rs", "src/config.rs"], added: [...], deleted: [...] }
+```
+
+Single manifest comparison — O(F), cached by the control plane.
+
+### Merge Algorithm
+
+For each changeset Δ_i in order, for each **source file** (not matched by `.gitignore`) in Δ_i:
+
+```
+File in Δ_i?   File in production_delta?   Action
+───────────    ────────────────────────    ─────────────────────────
+YES            NO                          Apply Δ_i's version. Clean.
+NO             —                           (not in changeset, skip)
+YES            YES                         Overlap → agent re-applies Δ_i.
+```
+
+That's it. No diff3. No conflict markers. No per-path merge strategies.
+
+The question per file is: **did production also change this file since the fork?** If no → apply the changeset's version. If yes → the agent re-applies that one small change.
+
+**Why stacking matters:** A changeset that touches `src/main.rs` in a ~5-second window is a few lines of change. An agent can re-apply a few lines of intent trivially. A monolithic diff that accumulates 2 hours of changes to `src/main.rs` is much harder to reason about and re-apply correctly.
+
+**Write plan construction:** Process the stack from last to first. For each file, keep the latest version. If a file appears in multiple changesets (e.g., `src/main.rs` in Δ3 and Δ4) and doesn't overlap with production, use the final checkpoint's version directly — no need to replay intermediate states. Only overlapping files need changeset-level granularity.
+
+Generated files (matched by `.gitignore`) are skipped entirely — left on the production fork as-is, regenerated by the build.
 
 ### Merge Scope: Source Files Only
 
@@ -669,110 +711,46 @@ Like diffs, merges only operate on source files (see File Filtering). Generated 
 
 This matters because merging generated files file-by-file is wrong. Two agents both running `npm install` produce subtly different `node_modules/` trees (non-deterministic file ordering, timestamps, platform-specific binaries). Merging 40,000 node_modules files produces thousands of spurious "conflicts" that are meaningless. Merging source files and rebuilding everything else avoids this entirely.
 
-### Per-Path Merge Strategies
+### Agent Re-Apply
 
-Some source files don't merge well with diff3:
+When a changeset overlaps with production (same file modified by both sides), the agent re-applies that single changeset's intent on the current base.
 
-| File | Strategy | Why |
-|------|----------|-----|
-| `package-lock.json` | Take theirs | Machine-generated, `npm install` regenerates from merged `package.json` |
-| `yarn.lock` | Take theirs | Same reason |
-| `pnpm-lock.yaml` | Take theirs | Same reason |
-| `Cargo.lock` | Take theirs | Same reason |
-| Everything else | diff3 | Standard three-way content merge |
+**What the agent receives:**
 
-Lockfiles are source-controlled (not in `.gitignore`) but machine-generated. diff3 on them produces nonsense. "Take theirs" means the promoted checkpoint's lockfile wins, and `setup_command` reconciles it with the merged `package.json`.
+1. The current state of the overlapping files (production's version)
+2. The changeset diff (what the agent changed — typically a few lines)
+3. The surrounding codebase context
 
-### Merge Algorithm
+**Why this works:** The changeset is tiny — 1-3 files from a ~5-second window. Re-applying a small, specific change is trivial for an AI agent. The agent understands *what it was trying to do* and applies it to whatever the file looks like now. If production refactored the function the agent was editing, the agent applies its change to the refactored version correctly — something line-level merge algorithms cannot do.
 
-Three inputs:
+**Why it's better than diff3:**
 
-- **base**: manifest at common ancestor (what production looked like when the checkpoint's branch started)
-- **ours**: manifest of current production (includes all changes merged since the ancestor)
-- **theirs**: manifest of the checkpoint being promoted
+| | diff3 (git-style) | Agent re-apply |
+|---|---|---|
+| **Granularity** | Line-level text matching | Semantic understanding |
+| **Handles refactors** | Conflict (lines moved) | Clean (intent preserved) |
+| **Structured files** | False conflicts (JSON, YAML) | Correct merge (understands structure) |
+| **Result quality** | Syntactically merged, possibly semantically wrong | Semantically correct (agent verifies) |
+| **Speed** | Milliseconds | Seconds |
+| **Requires agent** | No | Yes |
 
-For each **source file** path (not matched by `.gitignore`) across all three manifests:
+**Fallback (no agent available):** If a human developer is promoting manually and there are overlapping files, show a unified diff for manual resolution. This is the traditional workflow — less common on a platform built for AI agents.
+
+### Finding the Fork Point
+
+Every preview VM records `source_checkpoint_id` — the production checkpoint it forked from. This is the base for computing `production_delta`.
 
 ```
-base      ours      theirs     Action
-────────  ────────  ────────   ─────────────────────────────────
-same      same      same       No change.
-same      same      changed    Take theirs. (They changed it, we didn't.)
-same      changed   same       Keep ours. (We changed it, they didn't.)
-same      changed   changed    Same hash? Take either.
-                               Diff hash? Content merge (diff3)
-                               — or per-path strategy if configured.
-absent    absent    present    Take theirs. (They added a new file.)
-absent    present   absent     Keep ours. (We added a new file.)
-absent    present   present    Both added:
-                                 same hash → take either.
-                                 diff hash → CONFLICT.
-present   absent    present    We deleted:
-                                 theirs == base → clean delete.
-                                 theirs != base → CONFLICT.
-                                   (We deleted, they modified.)
-present   present   absent     They deleted:
-                                 ours == base → accept delete.
-                                 ours != base → CONFLICT.
-                                   (They deleted, we modified.)
+P0 ── P1 (Agent A promoted)              ← production chain
+ └─── chk_1 ── chk_2 ── chk_3           ← Agent B's chain
+       fork point = P0
 ```
 
-Generated files (matched by `.gitignore`) are not in this table. They're skipped — left on the production fork as-is, regenerated by the build.
+With a database, finding the fork point is a single indexed lookup — milliseconds.
 
-### Content Merge (diff3)
+### Stacked Merge + Rebuild Flow (End-to-End)
 
-When both sides modified the same source file, attempt a three-way content merge:
-
-1. Fetch all three versions (base, ours, theirs) from the blob store
-2. If any version is binary → CONFLICT (can't merge binary files)
-3. Run the diff3 algorithm on the text content
-4. If diff3 produces a clean merge → take the merged content, hash it, store as new blob
-5. If diff3 has overlapping changes → CONFLICT
-
-diff3 is well-understood — it's the algorithm behind `git merge`, `diff3(1)`, and every version control system since RCS. Clean merges happen when changes touch different regions of the file. Conflicts happen when both sides changed the same lines.
-
-### Conflict Resolution
-
-When merge produces conflicts, the promotion stops and returns the conflicts to the caller:
-
-```json
-{
-  "merge_result": "conflicts",
-  "clean_changes": {
-    "take_theirs": 42,
-    "keep_ours": 15,
-    "content_merged": 3
-  },
-  "conflicts": [
-    {
-      "path": "src/config.rs",
-      "type": "both_modified",
-      "base_hash": "blake3:aabb...",
-      "ours_hash": "blake3:ccdd...",
-      "theirs_hash": "blake3:eeff...",
-      "markers": "<<<<<<< production\nlet port = 8080;\n=======\nlet port = 3000;\n>>>>>>> checkpoint"
-    },
-    {
-      "path": "src/legacy.rs",
-      "type": "delete_modify",
-      "detail": "Deleted in production, modified in checkpoint."
-    }
-  ]
-}
-```
-
-Resolution options (chosen by the control plane or user, not by glidefs):
-
-1. **Manual**: Human or agent resolves conflicts, creates a new checkpoint, re-promotes.
-2. **Theirs wins**: Accept all of the checkpoint's versions for conflicting files.
-3. **Ours wins**: Keep all of production's versions for conflicting files.
-4. **Mixed**: Per-file resolution (take theirs for config.rs, keep ours for legacy.rs).
-
-The merge engine (in the control plane) computes the result and reports it. It does NOT auto-resolve. Resolution policy is also a control plane concern.
-
-### Merge + Rebuild Flow (End-to-End)
-
-The control plane computes the merge and produces a write plan. glidefs executes it.
+The control plane decomposes the agent's work, classifies files, and produces a write plan. glidefs executes it.
 
 ```mermaid
 sequenceDiagram
@@ -781,56 +759,59 @@ sequenceDiagram
     participant GFS as glidefs (host)
     participant AGT as glidefs-agent (new VM)
 
-    CP->>S3: Walk parent pointers to find common ancestor
+    CP->>S3: GET fork point manifest + current production manifest
+    CP->>CP: Compute production_delta (files changed since fork)
 
-    CP->>S3: GET 3 manifests (base, ours, theirs)
-    CP->>CP: Read .gitignore, filter to source files
-    CP->>CP: Three-way merge on source files only
+    CP->>CP: Fetch changesets from checkpoint DAG (precomputed)
+    CP->>CP: Classify each changed file: clean or overlapping
 
-    alt Has conflicts
-        Note over CP: Surface conflicts to user/agent for resolution
-    else Clean merge
-        CP->>S3: Fetch blob triples for diff3 cases
-        CP->>CP: Run diff3, produce merged content
-        CP->>S3: PUT merged blobs
-
-        CP->>GFS: POST /api/exports/{name}/fork (Glide v2)
-        Note over GFS: Fork production block device
-
-        Note over GFS: Boot new VM on fork
-
-        CP->>GFS: POST /api/exports/{name}/write-files<br/>{ writes: [(path, blob_hash)], deletes: [path] }
-        GFS->>S3: Fetch blobs by hash
-        GFS->>AGT: WRITE_FILES (stream content via vsock)
-        GFS->>AGT: DELETE_FILES
-        AGT-->>GFS: WRITE_DONE, DELETE_DONE
-        GFS-->>CP: done
-
-        Note over CP: Run setup_command (npm install)<br/>Reconciles deps with merged package.json/lockfile
-
-        Note over CP: Run build_command (npm run build)<br/>Regenerates build output from merged source.<br/>Cache is warm from production fork.
-
-        Note over CP: Run start_command (npm start)
-
-        CP->>GFS: POST /api/exports/{name}/checkpoint
-        Note over GFS: Checkpoint new production<br/>(becomes "ours" for future merges)
+    alt All clean (common case)
+        Note over CP: No overlapping files.<br/>Collect all file changes into write plan.
+    else Some overlapping files
+        CP->>GFS: Request agent re-apply for overlapping files
+        GFS->>AGT: Provide production file state + changeset diffs
+        AGT-->>GFS: Re-applied file content
+        GFS->>S3: PUT re-applied blobs
+        GFS-->>CP: Re-applied blob hashes
+        Note over CP: Add re-applied files to write plan.
     end
+
+    CP->>GFS: POST /api/exports/{name}/fork (Glide v2)
+    Note over GFS: Fork production block device
+    Note over GFS: Boot new VM on fork
+
+    CP->>GFS: POST /api/exports/{name}/write-files<br/>{ writes: [(path, blob_hash)], deletes: [path] }
+    GFS->>S3: Fetch blobs by hash
+    GFS->>AGT: WRITE_FILES (stream content via vsock)
+    GFS->>AGT: DELETE_FILES
+    AGT-->>GFS: WRITE_DONE, DELETE_DONE
+    GFS-->>CP: done
+
+    Note over CP: Run setup_command (npm install)<br/>Reconciles deps with merged source files.
+
+    Note over CP: Run build_command (npm run build)<br/>Regenerates build output from merged source.<br/>Cache is warm from production fork.
+
+    Note over CP: Run start_command (npm start)
+
+    CP->>GFS: POST /api/exports/{name}/checkpoint
+    Note over GFS: Checkpoint new production
 ```
 
-**The key split:** The control plane decides *what* to write (merge computation). glidefs decides *how* to write it (fetch from S3, stream to agent via vsock). glidefs receives a write plan — a list of `(path, blob_hash)` pairs — and doesn't know or care that it came from a merge. It's just "put these blobs at these paths."
+**The common path (no overlapping files) requires zero agent involvement.** The control plane computes the write plan from manifests and precomputed changesets alone. Only when the same file was modified by both the agent and a concurrent promotion does the agent get involved — and even then, it's re-applying a tiny changeset, not merging hours of work.
+
+**The key split:** The control plane decides *what* to write (changeset classification + write plan). glidefs decides *how* to write it (fetch from S3, stream to agent via vsock). glidefs receives a write plan — a list of `(path, blob_hash)` pairs — and doesn't know or care that it came from a merge. It's just "put these blobs at these paths."
 
 **Why the build step matters:** The merge only touches source files. Dependencies and build output are left from the production fork. `setup_command` (`npm install`) sees the merged `package.json` and installs any new dependencies. `build_command` compiles from the merged source. This is the same build pipeline as any promotion — the merge just changes which source files land before the build runs.
 
-### Build Failure After Clean Merge
+### Build Failure
 
-The most common real-world failure isn't merge conflicts — it's a clean merge that produces semantically broken code. Two agents both add different versions of the same dependency. diff3 merges `package.json` fine (different lines), but `npm install` chokes on the conflicting version constraints. Or the merged source compiles but crashes at runtime.
+The most common real-world failure isn't overlapping files — it's a clean merge that produces semantically broken code. Two agents both add different versions of the same dependency. The file-level merge applies both changes cleanly (they edited different files), but `npm install` chokes on the conflicting version constraints. Or the merged source compiles but crashes at runtime.
 
 **The rule: nothing changes until everything succeeds.** The promote flow operates on a fresh fork of production, not on production itself. If any step fails — `setup_command`, `build_command`, `start_command`, or health check — the fork is killed. Production is untouched. The caller gets an error with the build output:
 
 ```json
 {
   "result": "build_failed",
-  "merge": "clean",
   "failed_step": "setup_command",
   "command": "npm install",
   "exit_code": 1,
@@ -839,29 +820,31 @@ The most common real-world failure isn't merge conflicts — it's a clean merge 
 }
 ```
 
-**The promotion is atomic from the outside.** Either the full pipeline succeeds (merge + install + build + start + health check → swap traffic to new VM → checkpoint) or nothing happens. The fork is a scratch space. This is the same atomicity guarantee as a normal (non-merge) promotion — the merge just adds one more step that can fail before the point of no return.
+**The promotion is atomic from the outside.** Either the full pipeline succeeds (apply changesets + install + build + start + health check → swap traffic to new VM → checkpoint) or nothing happens. The fork is a scratch space. This is the same atomicity guarantee as a normal (non-merge) promotion — the merge just adds one more step that can fail before the point of no return.
 
 ### Prerequisites
 
-For merge to work, the system must maintain:
+For stacked merge to work, the system must maintain:
 
-1. **Production checkpointed after each promotion.** The "ours" manifest comes from current production. Step 6 above ensures every promotion creates a checkpoint. Without this, there's no "ours" to merge against.
+1. **Checkpoint chain retained for active previews.** The full chain from fork point to promotion checkpoint must exist — retention compaction must not collapse intermediate checkpoints while the preview VM is live. After promotion or VM death, the chain can be compacted normally. If the chain has been partially compacted (VM idle for weeks), fall back to a coarser stack — fewer, larger changesets. Still works, just less granular for overlap resolution.
 
-2. **Source checkpoint tracked on fork.** When creating a preview, the control plane records `source_checkpoint_id` — the production checkpoint the preview was forked from. This becomes the "base" for any future merge.
+2. **Production checkpointed after each promotion.** The production manifest is needed to compute `production_delta`. The final step in the flow above ensures every promotion creates a checkpoint.
 
-3. **Ancestor manifests retained.** If B forked from P0 three weeks ago, P0's manifest must still exist when B promotes. Retention policy: keep any manifest that is an ancestor of a live VM's source checkpoint. GC skips it.
+3. **Source checkpoint tracked on fork.** When creating a preview, the control plane records `source_checkpoint_id` — the production checkpoint the preview was forked from. This is the base for `production_delta`.
+
+4. **Fork point manifest retained.** If B forked from P0 three weeks ago, P0's manifest must still exist when B promotes. Retention policy: keep any manifest that is a source checkpoint of a live VM. GC skips it.
 
 ### When Merge Is NOT Needed
 
 If the checkpoint being promoted is a direct descendant of current production (no concurrent changes happened), it's a straight restore — no merge required. The control plane detects this:
 
 ```
-checkpoint's ancestor chain includes current production?
-  YES → simple restore (just write theirs, no merge)
-  NO  → three-way merge
+production_delta is empty? (no changes since fork)
+  YES → simple restore (apply final checkpoint, no merge)
+  NO  → stacked merge
 ```
 
-This is the common case for solo developers or sequential promotions. Merge only kicks in when there's been concurrent work.
+This is the common case for solo developers or sequential promotions. Stacked merge only kicks in when there's been concurrent work.
 
 ---
 
@@ -896,7 +879,7 @@ Both options exist and serve different purposes:
 | **Use case** | Promotion, selective rollback | Full VM rollback to exact state |
 | **OS/runtime** | Untouched (from production fork) | Restored to snapshot state |
 | **Speed** | Proportional to changed files | Instant (swap block map) |
-| **Merge possible** | Yes (three-way) | No (whole-disk replacement) |
+| **Merge possible** | Yes (stacked merge) | No (whole-disk replacement) |
 
 ---
 
@@ -946,7 +929,8 @@ At 60 checkpoints/hour, an active AI agent produces 400+ checkpoints in a workda
 | 1-7 days | Keep 1 per hour |
 | 7+ days | Keep 1 per day |
 | Labeled (user-created) | Keep forever (until explicitly deleted) |
-| Source ancestors of live VMs | Keep forever (needed for future merges) |
+| Full chain for active preview VMs | Keep all (needed for stacked merge at promotion) |
+| Source ancestors of live VMs | Keep forever (needed for production_delta at merge) |
 
 **Compaction:** The control plane runs compaction periodically (every hour). It deletes auto-checkpoints that exceed the density for their age bracket. The checkpoint's manifest is deleted from S3. Orphaned blobs (referenced only by deleted manifests) are cleaned by blob GC on the next sweep.
 
@@ -1081,33 +1065,48 @@ Intelligence-level operations that live on the control plane, not glidefs.
 | GET | `/api/checkpoints/{id}` | Checkpoint metadata + manifest |
 | GET | `/api/checkpoints/{a}/diff/{b}` | File-level diff between two checkpoints |
 | POST | `/api/exports/{name}/restore` | Compute restore plan, send to glidefs for execution |
-| POST | `/api/exports/{name}/promote` | Fork + three-way merge + write plan + build |
-| POST | `/api/merge` | Dry-run three-way merge (result without applying) |
+| POST | `/api/exports/{name}/promote` | Fork + stacked merge + write plan + build |
+| POST | `/api/merge` | Dry-run stacked merge (result without applying) |
 
 ```
 POST /api/merge
 {
-  "base_checkpoint": "chk_P0",
-  "ours_checkpoint": "chk_P1",
-  "theirs_checkpoint": "chk_B3"
+  "fork_checkpoint": "chk_P0",
+  "production_checkpoint": "chk_P1",
+  "promote_checkpoint": "chk_B3"
 }
 
-→ 200 OK (clean merge)
+→ 200 OK
 {
   "result": "clean",
+  "changesets": 5,
   "changes": {
-    "take_theirs": 42,
-    "keep_ours": 15,
-    "content_merged": 3,
+    "apply_theirs": 42,
+    "keep_production": 15,
     "deletes": 1,
-    "unchanged": 4939
+    "unchanged": 4942,
+    "overlapping": 0
   }
 }
 
-→ 409 Conflict (has conflicts)
+→ 200 OK (with overlapping files)
 {
-  "result": "conflicts",
-  "conflicts": [ ... ]
+  "result": "needs_reapply",
+  "changesets": 5,
+  "changes": {
+    "apply_theirs": 41,
+    "keep_production": 15,
+    "deletes": 1,
+    "unchanged": 4942,
+    "overlapping": 1
+  },
+  "overlapping_files": [
+    {
+      "path": "src/main.rs",
+      "changeset_count": 2,
+      "detail": "Modified in changesets Δ3, Δ4 and in production."
+    }
+  ]
 }
 ```
 
@@ -1194,11 +1193,11 @@ On SIGTERM:
 | **Manifest store** | S3 | `checkpoints/{tenant}/{id}.manifest.lz4` — file-level manifests. |
 | **Blob store** | S3 | `blobs/{tenant}/{prefix}/{hash}` — file content, content-addressed. |
 | **Diff engine** | Control plane | Compares two manifests, fetches blobs, generates unified diffs. |
-| **Merge engine** | Control plane | Three-way manifest merge + diff3 content merge. Reports conflicts. |
+| **Merge engine** | Control plane | Stacked changeset classification + write plan. Delegates overlapping files to agent re-apply. |
 | **Auto-checkpoint scheduler** | Control plane | Debounce + rate limit on FILE_CHANGED → tells glidefs to checkpoint. |
 | **Promotion orchestrator** | Control plane | Fork + merge + write plan + build + checkpoint. |
 | **Blob GC** | Control plane | Mark-and-sweep alongside Glide v2 tenant GC. |
-| **Checkpoint DAG** | Control plane database | Parent pointers, labels, timestamps, common ancestor queries. |
+| **Checkpoint DAG** | Control plane database | Parent pointers, labels, timestamps, changesets, fork point queries. |
 
 ---
 
@@ -1211,7 +1210,8 @@ F = total_files (files in /repo, typical 5K-50K)
 C = changed_files (files changed since last checkpoint, typical ~100)
 M = manifest_entries (= F, one per file)
 B = blobs_to_upload (= C or less, after dedup)
-D = diff3_files (files needing content merge, typically <10)
+K = checkpoint_chain_length (checkpoints between fork and promote)
+O_f = overlapping_files (files changed by both agent and production, typically 0-2)
 R = restore_files (files in write plan)
 N = checkpoints_in_DAG (per export)
 ```
@@ -1249,20 +1249,18 @@ N = checkpoints_in_DAG (per export)
 
 **Verdict: O(F) for manifest comparison, O(C_source) for content diffing.** F is bounded at ~50K (typical repo). Entire diff completes in 100-300ms.
 
-### Three-Way Merge (Control Plane)
+### Stacked Merge (Control Plane)
 
 | Operation | Time | Space | Bottleneck? | Notes |
 |-----------|------|-------|-------------|-------|
-| **Find common ancestor** | O(depth) | O(1) | No | DB recursive CTE, milliseconds |
-| **Fetch 3 manifests from S3** | O(1) | O(3F) | No | Three GETs |
-| **Classify source vs generated** | O(F) | O(F) | No | Apply .gitignore |
-| **Per-path merge decision** | O(F) | O(F) | No | Hash comparison across three manifests |
-| **Fetch blob triples (diff3 cases)** | O(D) | O(D × avg_size) | No | Only files modified by both sides, typically <10 |
-| **diff3 content merge** | O(D × file_size) | O(file_size) | No | Per-file |
-| **Store merged blobs** | O(D) | — | No | S3 PUTs for merged content |
-| **Produce write plan** | O(R) | O(R) | No | List of (path, hash) pairs |
+| **Fetch fork point + production manifests** | O(1) | O(2F) | No | Two S3 GETs |
+| **Compute production_delta** | O(F) | O(F) | No | Hash comparison, two manifests |
+| **Fetch changesets from DB** | O(K) | O(K × C_avg) | No | K = chain length, changesets precomputed and small |
+| **Classify files (clean vs overlap)** | O(Σ C_i) | O(F) | No | Check each changed file against production_delta |
+| **Agent re-apply (if overlap)** | O(overlap) | O(file_size) | No | Seconds per file, typically 0-2 files |
+| **Produce write plan** | O(R) | O(R) | No | Collect all unique file changes |
 
-**Verdict: O(F) for manifest merge, O(D) for content merge.** D (files both sides modified) is almost always <10. The merge is dominated by manifest fetch latency, not computation.
+**Verdict: O(F) for production_delta, O(Σ C_i) for changeset classification.** No content-level merging. Agent re-apply is rare (requires same file modified by both sides) and operates on tiny changesets (a few lines from a ~5-second window). The common path — no overlapping files — is fully automated with zero agent involvement.
 
 ### Restore / Write Plan Execution
 
@@ -1319,7 +1317,7 @@ No unbounded structures. Everything is either bounded by configuration (rate lim
 Checkpoint (fast path): O(C) identify + O(F) enumerate + O(C) hash/upload
 Checkpoint (fallback):  O(F) stat walk + O(C) hash/upload
 Diff:                   O(F) manifest compare + O(C_source) content diff
-Merge:                  O(F) manifest merge + O(D) content merge, D ≪ F
+Merge:                  O(F) production delta + O(Σ C_i) classify + O(overlap) re-apply
 Restore:                O(R) proportional to changed files only
 Auto-checkpoint:        O(1) per event (fanotify + debounce)
 Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
@@ -1338,7 +1336,7 @@ Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
 | `git add` + `git commit` | Auto-checkpoint (invisible) | No ceremony. Agent doesn't need to understand git. Save points just happen. |
 | `git branch` | Fork VM (Glide v2) | A branch is a full running environment, not just a pointer to a commit. |
 | `git diff` | Checkpoint diff (control plane) | Same output, but diffing environments — includes deps, build output, everything in /repo. |
-| `git merge` | Three-way merge on promote | Same algorithm (diff3), but operates on sandboxes, not repositories. |
+| `git merge` | Stacked merge on promote | Decomposes work into small changesets (auto-checkpoints), applies file-by-file. Overlapping files resolved by AI agent re-applying intent — no line-level merge artifacts. |
 | `git push` + CI/CD pipeline | Promote checkpoint | No artifact upload, no CI runner, no separate deploy. The checkpoint IS the deployable. |
 | `git stash` | Checkpoint + restore | Named save points in the DAG, not a fragile stack. |
 | `git blame` | Checkpoint metadata | Who made each checkpoint (agent or human), when, with what label. |
@@ -1355,7 +1353,7 @@ Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
 
 4. **Diff for binary files** — Currently "binary file changed (size delta)." Could generate image diffs for common formats (PNG, JPG), or show hex diffs, or nothing. This is a frontend concern — the diff engine just reports the hash change.
 
-5. **Custom merge strategies** — The default per-path strategies (lockfiles → take theirs, everything else → diff3) cover common cases. Should we support user-configurable merge drivers like git's `.gitattributes`? Probably not initially — add if users hit recurring conflicts on specific file types.
+5. **Agent re-apply latency budget** — When overlapping files require agent re-apply, how long do we wait? Seconds is fine for a few files. If an agent takes 30+ seconds, the promotion feels slow. Options: timeout with fallback to "take theirs" (lossy but fast), or let the caller set a deadline. Most promotions have zero overlapping files, so this is the uncommon path.
 
 6. **Checkpoint portability** — Can a checkpoint from a Node 18 base image be restored onto a Node 20 base image? The checkpoint only covers /repo, so yes — but `node_modules` may contain native binaries compiled for Node 18. The build step after restore handles this (`npm install` rebuilds native modules). Document: "Checkpoints are portable across base image versions. Rebuild may be required."
 

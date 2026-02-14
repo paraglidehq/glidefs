@@ -240,13 +240,17 @@ Content-addressing means ten preview VMs of the same app share 100% of their blo
 
 ### Blob GC
 
-Same approach as Glide v2: mark-and-sweep with a grace period.
+Same event-driven refcount pattern as Glide v2 pack GC — O(1) per lifecycle event, not O(N manifests).
 
-1. **Mark:** Walk all live checkpoint manifests for the tenant. Collect referenced hashes.
-2. **Sweep:** LIST blobs in tenant namespace. Delete unreferenced blobs older than 15 minutes.
-3. **Frequency:** Runs alongside Glide v2's tenant GC (daily or every few hours).
+**Primary: refcounts in the control plane DB.** Each blob hash has a reference count, updated transactionally with checkpoint manifest writes and retention compaction deletes. Blob with refcount 0 + grace period → delete.
 
-The grace period protects against races: a checkpoint in progress has uploaded blobs but hasn't written its manifest yet. No blob younger than 15 minutes is ever deleted. (A checkpoint takes <500ms end-to-end. 15 minutes covers network partitions, retries, and slow S3 uploads with margin to spare.)
+- **Checkpoint write:** increment refcount for new blob hashes.
+- **Manifest delete (retention compaction):** decrement refcount for hashes unique to the deleted manifest.
+- **Refcount → 0:** enqueue blob for deletion after 15-minute grace period.
+
+**Safety net: monthly mark-and-sweep reconciliation.** Walk all live checkpoint manifests, compare against blob refcounts in DB, correct any drift. Same pattern as Glide v2.
+
+The grace period (15 minutes, shorter than Glide v2's 24 hours) protects against races: a checkpoint in progress has uploaded blobs but hasn't written its manifest yet. A checkpoint takes <500ms end-to-end. 15 minutes covers network partitions, retries, and slow S3 uploads with margin to spare.
 
 ---
 
@@ -1195,6 +1199,135 @@ On SIGTERM:
 | **Promotion orchestrator** | Control plane | Fork + merge + write plan + build + checkpoint. |
 | **Blob GC** | Control plane | Mark-and-sweep alongside Glide v2 tenant GC. |
 | **Checkpoint DAG** | Control plane database | Parent pointers, labels, timestamps, common ancestor queries. |
+
+---
+
+## Algorithmic Complexity Analysis
+
+Systematic analysis of every operation. Variables:
+
+```
+F = total_files (files in /repo, typical 5K-50K)
+C = changed_files (files changed since last checkpoint, typical ~100)
+M = manifest_entries (= F, one per file)
+B = blobs_to_upload (= C or less, after dedup)
+D = diff3_files (files needing content merge, typically <10)
+R = restore_files (files in write plan)
+N = checkpoints_in_DAG (per export)
+```
+
+### Hot Path (Checkpoint — Most Frequent Operation)
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **Glide v2 snapshot** | O(1) | — | No | Atomic sequence number read |
+| **Identify changed files (fast path)** | O(C) | O(C) | No | Drain fanotify dirty set |
+| **Identify changed files (fallback)** | O(F) | O(F) | **Watch** | Full stat walk, mtime comparison |
+| **Hash changed files** | O(C × avg_file_size) | O(max_file_size) | No | BLAKE3, ~1GB/s |
+| **Build full manifest** | O(F) | O(F) | **Watch** | Must enumerate all paths for self-contained manifest |
+| **Determine new blobs** | O(C) | — | No | Compare hashes against parent manifest (HashMap lookup) |
+| **vsock transfer (manifest)** | O(F) | O(F) | No | ~50K entries at ~150 bytes = ~7.5MB, <10ms at >1GB/s |
+| **vsock transfer (blobs)** | O(B × avg_file_size) | O(max_file_size) | No | Streaming, ~100 files ≈ 1MB |
+| **S3 blob upload** | O(B) | — | No | Parallel PUTs, idempotent (content-addressed) |
+| **S3 manifest upload** | O(1) | — | No | Single object, ~3MB compressed |
+| **DB checkpoint record** | O(1) | — | No | One INSERT into checkpoint DAG |
+
+**Watch: full manifest build is O(F).** Even with the dirty set fast path (O(C) for identifying changes), the agent must still walk /repo to enumerate all paths for the self-contained manifest. This is O(F) — stat walk of 50K files takes 20-50ms. Not a bottleneck in absolute terms, but it's the one operation that scales with repo size rather than change size.
+
+**Optimization opportunity:** Cache the full path list between checkpoints. On checkpoint, start with the cached list, add paths from fanotify CREATE events, remove paths from DELETE events. Only do a full walk on agent restart or after a restore. This would make manifest build O(C) instead of O(F) for the common case.
+
+### Diff (Control Plane)
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **Fetch 2 manifests from S3** | O(1) | O(2F) | No | Two GETs, ~3MB each |
+| **Parse manifests** | O(F) | O(F) | No | MessagePack decode |
+| **Classify source vs generated** | O(F) | O(F) | No | Apply .gitignore patterns |
+| **Compute file-level diff** | O(F) | O(F) | No | Hash comparison across union of both manifests |
+| **Fetch blob pairs (modified source)** | O(C_source) | O(C_source × avg_size) | No | Parallel S3 GETs, only source files |
+| **Generate unified diffs** | O(C_source × file_size) | O(file_size) | No | Per-file, streaming |
+
+**Verdict: O(F) for manifest comparison, O(C_source) for content diffing.** F is bounded at ~50K (typical repo). Entire diff completes in 100-300ms.
+
+### Three-Way Merge (Control Plane)
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **Find common ancestor** | O(depth) | O(1) | No | DB recursive CTE, milliseconds |
+| **Fetch 3 manifests from S3** | O(1) | O(3F) | No | Three GETs |
+| **Classify source vs generated** | O(F) | O(F) | No | Apply .gitignore |
+| **Per-path merge decision** | O(F) | O(F) | No | Hash comparison across three manifests |
+| **Fetch blob triples (diff3 cases)** | O(D) | O(D × avg_size) | No | Only files modified by both sides, typically <10 |
+| **diff3 content merge** | O(D × file_size) | O(file_size) | No | Per-file |
+| **Store merged blobs** | O(D) | — | No | S3 PUTs for merged content |
+| **Produce write plan** | O(R) | O(R) | No | List of (path, hash) pairs |
+
+**Verdict: O(F) for manifest merge, O(D) for content merge.** D (files both sides modified) is almost always <10. The merge is dominated by manifest fetch latency, not computation.
+
+### Restore / Write Plan Execution
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **Compute write plan** | O(F) | O(F) | No | Diff current manifest vs target |
+| **Fetch blobs from S3** | O(R) | O(R × avg_size) | No | Parallel GETs, only changed files |
+| **Stream to agent (vsock)** | O(R × avg_size) | O(max_file_size) | No | >1GB/s vsock throughput |
+| **Agent writes files** | O(R × avg_size) | O(max_file_size) | No | write → fsync → rename per file |
+
+**Verdict: O(R) — proportional to files being restored.** For a promotion merge with 50 changed source files, this is <1 second.
+
+### Blob Store & GC
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **Blob PUT (checkpoint)** | O(1) per blob | O(file_size) | No | Content-addressed, idempotent |
+| **Blob GET (diff/restore)** | O(1) per blob | O(file_size) | No | Direct S3 GET by hash |
+| **Blob GC mark** | O(live_checkpoints × F) | O(unique_hashes) | **Watch** | Walk all live manifests |
+| **Blob GC sweep** | O(total_blobs) | — | **Watch** | LIST all blobs, check against live set |
+
+**Watch: blob GC is O(live_checkpoints × F).** With retention compaction, live checkpoints per export are bounded (~84 after a week). At 1000 exports × 84 checkpoints × 50K files = 4.2B manifest entries to scan. This is the same pattern as Glide v2's reconciliation.
+
+**Fix: apply the same event-driven refcount pattern.** Track blob references in the control plane DB — increment on manifest write, decrement on manifest delete (retention compaction). Blob with refcount 0 + grace period → delete. Same O(1) per lifecycle event. Mark-and-sweep becomes a monthly safety net.
+
+### Auto-Checkpoint Scheduling
+
+| Operation | Time | Space | Bottleneck? | Notes |
+|-----------|------|-------|-------------|-------|
+| **fanotify event** | O(1) | O(1) | No | Kernel delivers events, no polling |
+| **Dirty set insert** | O(1) | O(C) | No | HashSet insert per event |
+| **FILE_CHANGED notification** | O(1) | — | No | Content-free signal over vsock |
+| **Debounce timer** | O(1) | O(1) | No | Reset on each notification |
+| **Retention compaction** | O(N) | O(N) | No | Walk checkpoint DAG, delete expired. N bounded by rate limit. |
+
+**Verdict: all O(1).** fanotify + dirty set + debounce = no polling, no scanning, no scaling concerns.
+
+### Space Complexity
+
+| Structure | Size | Bounded by | Notes |
+|-----------|------|-----------|-------|
+| **Manifest (in memory)** | O(F) | Repo file count | ~150 bytes/entry. 50K files = ~7.5MB |
+| **mtime index (on disk)** | O(F) | Repo file count | ~60 bytes/entry. 50K files = ~3MB |
+| **Dirty set** | O(C) | Changed files between checkpoints | Drained on checkpoint |
+| **Checkpoint DAG** | O(N) per export | Rate limit (60/hr) + retention compaction | ~84 retained per export after a week |
+| **Blob store (S3)** | O(unique files) | Content-addressed dedup | Shared across forks, compacted with retention |
+| **Manifest store (S3)** | O(retained checkpoints × F) | Retention policy | ~250MB per export per week |
+
+No unbounded structures. Everything is either bounded by configuration (rate limits, retention) or by the repo itself (file count, which the user controls).
+
+### Summary
+
+```
+Checkpoint (fast path): O(C) identify + O(F) enumerate + O(C) hash/upload
+Checkpoint (fallback):  O(F) stat walk + O(C) hash/upload
+Diff:                   O(F) manifest compare + O(C_source) content diff
+Merge:                  O(F) manifest merge + O(D) content merge, D ≪ F
+Restore:                O(R) proportional to changed files only
+Auto-checkpoint:        O(1) per event (fanotify + debounce)
+Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
+```
+
+**The dominant term is O(F) — repo file count.** This appears in manifest enumeration, diff, and merge. At 50K files, it's microseconds to milliseconds. At 500K files (large monorepo), it's milliseconds. The design explicitly defers Merkle trees until F > 500K, which is the right call — the constant factors matter more than the algorithmic complexity at these sizes.
+
+**Nothing scales with fleet size.** Checkpoint, diff, merge, and restore are all per-VM operations. Blob GC needs event-driven refcounts (same pattern as Glide v2 pack GC) to avoid scanning all manifests. The checkpoint DAG is per-export in the control plane DB, queried with indexed lookups.
 
 ---
 

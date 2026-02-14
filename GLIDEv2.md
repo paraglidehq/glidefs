@@ -85,7 +85,7 @@ graph TB
         MANIFESTS["manifests/{tenant}/{vm-id}<br/>Block maps + pack index"]
     end
 
-    DB["Control Plane DB<br/>(pack refcounts, manifest_packs)"]
+    DB["Control Plane DB<br/>(pack refcounts)"]
 
     CACHE -->|"demand-driven flush<br/>(fork, sleep, promote, migrate)"| PACKS
     BR -->|"cache miss → lazy pull"| PACKS
@@ -733,6 +733,15 @@ S3 flush:    dirty_store.remove(hash) → insert into clean cache
 
 Dirty blocks are served directly from the dirty store on read (~100ns, in-memory). When flushed to S3, they move to the clean cache and become evictable.
 
+**Dirty block budget.** Each VM has a configurable dirty data budget (default: 5GB). When dirty data exceeds the budget, the daemon flushes the oldest dirty blocks to S3 until back under budget — even in demand-driven mode. This bounds memory/SSD consumption, bounds migration latency (at most `budget` bytes to flush), and keeps demand-driven as the default without risking unbounded growth.
+
+```
+dirty_data < budget    → pure demand-driven, zero S3 traffic
+dirty_data ≥ budget    → flush oldest dirty blocks until under budget
+```
+
+The budget is a per-VM setting, configured at export creation (`dirty_budget_gb`, default 5). The daemon checks on every write (O(1) — compare counter against threshold). Forced flushes are identical to normal flushes — same pack assembly, same refcount updates, same code path.
+
 ### Clean Block Cache (S3-FIFO)
 
 Clean blocks (backed by S3, safe to evict and re-fetch) use a two-tier cache with S3-FIFO eviction.
@@ -948,7 +957,7 @@ sequenceDiagram
     D->>S3: PUT manifest
 
     D->>DB: BEGIN
-    Note over DB: Update manifest_packs:<br/>delete old pack refs, insert new<br/>Adjust pack_refcounts:<br/>increment new, decrement dropped
+    Note over DB: Adjust pack_refcounts:<br/>increment new packs, decrement dropped
     D->>DB: COMMIT
 
     Note over DB: Refcount hits 0?<br/>→ enqueue pack for deletion<br/>→ delete after grace period
@@ -959,37 +968,35 @@ sequenceDiagram
 | Event | Refcount operations | Cost |
 |-------|-------------------|------|
 | Flush (continuous, ~5s) | Increment new packs, decrement overwritten (~2-5 packs) | O(1) |
-| Fork | Copy manifest_packs rows for new manifest, increment refcounts | O(packs in manifest) — one-time |
-| VM delete | Delete manifest_packs rows, decrement refcounts | O(packs in manifest) — one-time |
+| Fork | Read pack list from S3 manifest, increment refcounts | O(packs in manifest) — one-time |
+| VM delete | Read pack list from S3 manifest, decrement refcounts | O(packs in manifest) — one-time |
 | Refcount → 0 | Enqueue pack for deletion after grace period | O(1) |
 
 Steady-state operations (flush) touch a handful of rows per transaction. Lifecycle operations (fork, delete) are proportional to the VM's pack count (~3,200 for a 10GB VM) but happen once per VM lifetime. None scale with fleet size.
 
 ### The Transaction
 
-The manifest record and pack references live in the control plane database. The full manifest (block map + pack index) lives in S3. The DB tracks *which packs* each manifest references — not the full block map.
+Pack refcounts live in the control plane database. The full manifest (block map + pack index) lives in S3. The DB tracks pack refcounts only — no per-manifest pack lists. The S3 manifest is the source of truth for which packs a VM references.
 
 ```sql
--- Manifest write (flush)
-BEGIN;
-  -- Compute delta: new packs added, old packs dropped
-  -- (daemon sends the diff, not the full set)
-  DELETE FROM manifest_packs
-    WHERE manifest_id = $1 AND pack_id = ANY($dropped);
+-- Flush (daemon sends the delta: packs added, packs dropped)
+UPDATE pack_refcounts SET refcount = refcount + 1
+  WHERE pack_id = ANY($added);
+UPDATE pack_refcounts SET refcount = refcount - 1,
+  last_decremented = now()
+  WHERE pack_id = ANY($dropped);
 
-  INSERT INTO manifest_packs (manifest_id, pack_id)
-    SELECT $1, unnest($added::text[]);
+-- Fork (pack list read from S3 manifest, already in hand)
+UPDATE pack_refcounts SET refcount = refcount + 1
+  WHERE pack_id = ANY($all_packs);
 
-  UPDATE pack_refcounts SET refcount = refcount - 1,
-    last_decremented = now()
-    WHERE pack_id = ANY($dropped);
-
-  UPDATE pack_refcounts SET refcount = refcount + 1
-    WHERE pack_id = ANY($added);
-COMMIT;
+-- VM delete (pack list from S3 manifest — one GET)
+UPDATE pack_refcounts SET refcount = refcount - 1,
+  last_decremented = now()
+  WHERE pack_id = ANY($all_packs);
 ```
 
-For a continuous flush that wrote 2 new packs and overwrote blocks in 1 old pack: 1 delete + 2 inserts + 3 refcount updates. Six rows touched regardless of whether the fleet has 100 VMs or 10 million.
+For a continuous flush that wrote 2 new packs and overwrote blocks in 1 old pack: 3 refcount updates. For fork or delete: one S3 GET (manifest, ~1MB) + one bulk UPDATE (~3,200 rows). No join table, no 3.2B-row manifest_packs table at scale.
 
 ### Pack Deletion
 
@@ -1017,7 +1024,7 @@ At 1M VMs this takes ~60 minutes. At 10M VMs, a few hours. Acceptable for a mont
 ### Safety Rails
 
 - **Grace period (24 hours):** Packs with refcount 0 are not deleted until 24 hours after the last decrement. Protects against races: flush creates packs not yet referenced by a manifest, fork copies a manifest while blocks are in flight.
-- **Transactional updates:** Refcount and manifest_packs are updated in the same DB transaction. No drift window.
+- **Atomic refcount updates:** Refcount increments/decrements are applied in a single DB transaction per event. Flush sends only the delta (added/dropped packs). Fork and delete read the full pack list from the S3 manifest.
 - **Max deletions per cycle:** Cap the number of packs deleted per deletion worker cycle. Limits blast radius.
 - **Dry-run mode:** Log what would be deleted without deleting. Validate before enabling in production.
 - **Failure mode:** Always conservative. Transaction failure → no refcount change → orphans survive. Deletion worker crash → orphans survive until next cycle. Never deletes live data.
@@ -1073,7 +1080,7 @@ Content-addressing gives free integrity checks.
 
 | Component | Role | Implementation Notes |
 |-----------|------|---------------------|
-| **NBD Device** | 1:1 per VM, block device interface | Linux kernel NBD, socket pair to daemon |
+| **NBD Device** | 1:1 per VM, block device interface | Linux kernel NBD, socket pair to daemon. Tune `nbds_max` for VM density and per-device I/O depth (default is low — set to 32-128 in-flight requests to match daemon throughput). |
 | **NBD Daemon** | Single process, multiplexes all VMs | Event loop, resolves offsets via block maps, no QoS logic |
 | **Flush Scheduler** | Controls when blocks go to S3 | Demand-driven (default) or continuous (production). Per-VM policy. |
 | **WAL** | Local crash recovery (bridges last ~5s before local persist) | Append-only on local SSD, sequence-numbered, truncated on persist |
@@ -1087,7 +1094,7 @@ Content-addressing gives free integrity checks.
 | **TRIM Handler** | Reclaim deleted blocks | Reset to zero-block hash. Metadata-only. Orphans cleaned by GC. |
 | **Compression** | LZ4 at S3 boundary | Hash raw → compress → pack → S3. ~1.5-2x ratio. |
 | **Base Image Pipeline** | Base image ingestion | Offline CLI pipeline (`glidefs bless`). Uploads to global block store. Deduped naturally. |
-| **Pack Refcounts** | Track pack liveness | Transactional with manifest updates in control plane DB. O(1) per flush. No drift. |
+| **Pack Refcounts** | Track pack liveness | Event-driven updates in control plane DB. O(1) per flush, O(P) per fork/delete. Pack lists read from S3 manifests — no join table. |
 | **Pack Deletion Worker** | Delete orphaned packs | Processes refcount-0 packs after 24h grace period. Index scan, continuous. |
 | **GC Reconciliation** | Correctness safety net | Monthly mark-and-sweep across all manifests. Corrects any drift. Incremental at scale. |
 | **cgroup v2 I/O** | Per-VM IOPS/throughput limits | Kernel-level, configured by control plane |
@@ -1139,7 +1146,7 @@ K = pack_size (blocks per pack, default 25)
 | **Host pack index update** | O(D') | — | No | DashMap inserts |
 | **Manifest serialization** | O(B) | O(B) | **Watch** | Must serialize full block map + derive pack index |
 | **Manifest S3 PUT** | O(1) | — | No | Single object |
-| **Refcount DB transaction** | O(Δ packs) | — | No | Only changed packs, ~2-5 for steady-state flush |
+| **Refcount DB update** | O(Δ packs) | — | No | Only changed packs, ~2-5 for steady-state flush. No join table. |
 
 **Bottleneck found and fixed: dirty block collection.**
 
@@ -1154,10 +1161,9 @@ The doc said "scan block map for dirty entries" — that's O(B) per flush, scann
 | Operation | Time | Space | Bottleneck? | Notes |
 |-----------|------|-------|-------------|-------|
 | **Fork: S3 manifest copy** | O(B) | O(B) | No | Serialize + PUT. One-time per fork. |
-| **Fork: DB manifest_packs copy** | O(P) | O(P) | No | `INSERT ... SELECT` — one SQL query, ~3,200 rows |
-| **Fork: refcount increment** | O(P) | — | No | One UPDATE with `WHERE pack_id IN (...)` |
+| **Fork: refcount increment** | O(P) | — | No | Pack list from S3 manifest (already in hand). One UPDATE, ~3,200 rows. |
 | **Fork: host overlay setup** | O(1) | O(1) | No | Arc clone + empty HashMap |
-| **VM delete: DB cleanup** | O(P) | — | No | Delete manifest_packs + decrement refcounts. Async. |
+| **VM delete: refcount decrement** | O(P) | — | No | Read pack list from S3 manifest (one GET), decrement refcounts. Async. |
 | **VM delete: local cleanup** | O(1) | — | No | Drop block map, release cache entries lazily |
 | **Same-host wake** | O(B) | O(B) | No | Load block map from local file |
 | **Cross-host wake** | O(B) | O(B) | No | GET manifest from S3 + parse |
@@ -1187,19 +1193,14 @@ The doc said "scan block map for dirty entries" — that's O(B) per flush, scann
 | Structure | Size | Bounded by | Growth pattern |
 |-----------|------|-----------|---------------|
 | **Block maps** | O(V × B) | VM count × disk size | Static per VM. Fork overlay reduces by ~95%. |
-| **Dirty block store** | O(Σ dirty blocks) | **Unbounded** | **Grows until flush.** See below. |
+| **Dirty block store** | O(Σ dirty blocks) | Per-VM budget (default 5GB) | Bounded. Forced partial flush at budget. |
 | **Memory cache** | Configured | `memory_cache_gb` setting | Fixed. Eviction handles pressure. |
 | **SSD cache** | Configured | Available SSD | Fixed. Eviction handles pressure. |
 | **WAL** | O(write_rate × 5s) | Persist interval | Truncated every ~5s. ~1.4GB worst case. |
 | **Host pack index** | O(unique blocks on host) | VM count × data per VM | Rebuilt on lifecycle events. |
 | **Sequential detector** | O(V) | VM count | Ring buffer per VM. Negligible. |
 
-**Bottleneck: dirty block store growth.** In demand-driven mode, dirty blocks accumulate indefinitely — they're pinned (not evictable) because the SSD cache is the only local copy after WAL truncation. A build VM writing 50GB over 8 hours pins 50GB. At 50 VMs with heavy writes, aggregate pinned data could exhaust SSD capacity.
-
-**Fix options** (open question #6):
-1. **Back-pressure:** Slow writes when pinned blocks exceed X% of SSD. Guest sees higher latency, not errors.
-2. **Forced partial flush:** Flush oldest dirty blocks to S3 even in demand-driven mode when pinned data exceeds a threshold. Turns pure demand-driven into a hybrid.
-3. **Dirty block budget per VM:** Hard cap on pinned data. Flush triggered at threshold.
+**Dirty block store is bounded.** Each VM has a dirty block budget (default 5GB). When exceeded, the daemon flushes the oldest dirty blocks to S3 — even in demand-driven mode. At 50 VMs, worst-case aggregate dirty data is 50 × 5GB = 250GB, well within SSD capacity on a 2TB NVMe host.
 
 ### Fleet-Level Operations
 
@@ -1211,9 +1212,6 @@ The doc said "scan block map for dirty entries" — that's O(B) per flush, scann
 | **S3 PUTs (aggregate)** | O(fleet write rate / K) | Fleet write rate | Infra cost, not algorithmic |
 | **S3 GETs (aggregate)** | O(fleet cache misses) | Cache hit rate | Infra cost, not algorithmic |
 | **Reconciliation** | O(N × B) | Fleet size | Monthly. Incremental. |
-| **manifest_packs table** | — | O(N × P) rows | **Watch** |
-
-**Watch: manifest_packs table size.** At 1M VMs × 3,200 packs = 3.2B rows. PostgreSQL handles this with partitioning (by tenant_id or manifest_id hash). Query patterns are single-manifest (insert/delete on flush, fork, VM delete) — partition-local operations. No cross-partition joins needed.
 
 ### Summary
 
@@ -1253,10 +1251,10 @@ Host operations:   O(V × B) on lifecycle        ~ bounded by host density
 3. **cgroup I/O limits by tier** — What are the actual IOPS/throughput numbers per tier?
 4. **GC grace period tuning** — 24 hours is conservative. Could be shorter if we can bound the max time between block creation and manifest update.
 5. **Sub-chunk dirty tracking** — Deferred until write amplification is a measured problem.
-6. **Pinned dirty block pressure** — In demand-driven mode, dirty blocks accumulate in the dirty store for hours. A write-heavy VM active for 8 hours could pin tens of GB. At 50 VMs, aggregate pinned data could consume a meaningful fraction of SSD. Need a policy: back-pressure writes when pinned blocks exceed X% of SSD? Force a partial S3 flush? This is the real SSD capacity concern — the steady growth of data that *can't* be evicted.
+6. ~~**Pinned dirty block pressure**~~ — **Resolved.** Per-VM dirty block budget (default 5GB) with forced partial flush. See Dirty Block Store section.
 7. **Pack size** — 25 blocks (3.2MB) matches v1. Profile to find the sweet spot between S3 ops and mixed-pack waste.
 8. **Demand-driven for production** — Should production default to demand-driven (flush on fork request) instead of continuous? Saves S3 traffic at the cost of 1-5 seconds of fork latency. Depends on preview creation frequency.
 9. **Fork overlay flattening threshold** — 50% divergence is the starting heuristic for flattening a fork overlay into a standalone block map. May need tuning based on read path overhead vs memory savings.
-10. **manifest_packs table size** — At 1M VMs × ~3,200 packs per VM = ~3.2B rows. PostgreSQL handles this with partitioning (by manifest_id or tenant_id). Monitor and partition proactively.
+10. ~~**manifest_packs table size**~~ — **Resolved.** Eliminated the table entirely. Pack lists are read from S3 manifests on fork/delete (one GET, ~1MB). Refcounts are the only DB state. No 3.2B-row join table at scale.
 11. **Per-tenant KMS keys (future)** — If an enterprise customer requires customer-managed keys, add per-tenant encryption as an opt-in. Blocks for that tenant don't dedup cross-tenant. Additive change — no architectural rework needed.
 12. **Reconciliation scheduling at extreme scale** — At 10M+ VMs, full reconciliation takes hours. Incremental approach (rotate through tenant subsets) keeps individual runs bounded. Determine the right rotation period.

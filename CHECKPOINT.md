@@ -8,7 +8,7 @@
 
 A thin file-level layer on top of Glide v2 that gives Boxes version control semantics — automatic save points, file-level diffs, branching, and stacked merge for promotion. No git ceremony.
 
-**Core insight: Glide v2 sees blocks, not files.** It can snapshot, fork, and restore a block device instantly — but it can't tell you which *files* changed, or merge two developers' changes to the same codebase. A lightweight guest agent bridges this gap by giving glidefs file-level visibility through vsock.
+**Core insight: Glide v2 sees blocks, not files.** It can snapshot, fork, and restore a block device instantly — but it can't tell you which _files_ changed, or merge two developers' changes to the same codebase. A lightweight guest agent bridges this gap by giving glidefs file-level visibility through vsock.
 
 **Why a guest agent:** glidefs runs on the host. The VM's filesystem (ext4) lives on the block device that glidefs serves via NBD. To see files, glidefs would need to parse ext4 from raw blocks — complex, brittle, and coupled to a specific filesystem. A small agent running inside the VM has native filesystem access through the kernel's VFS. It works with any filesystem, requires no parsing, and communicates over vsock (host↔guest virtio socket — fast, no network stack, no TCP overhead).
 
@@ -30,7 +30,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 **Instant save points.** The Glide v2 snapshot is the save point — taken in <1ms. The file manifest is built in the background. The agent never waits.
 
-**Sub-second diff.** Comparing two checkpoints with 50K files takes <1ms (hash comparison). Fetching content for ~100 changed files takes 50-200ms. Total: well under a second for any realistic codebase.
+**Sub-second diff.** Comparing two checkpoints with ~5-10K source files takes <1ms (hash comparison). Fetching content for ~100 changed files takes 50-200ms. Total: well under a second for any realistic codebase.
 
 **Safe concurrent development.** Two agents (or an agent and a developer) can fork from the same production, work independently, and both promote. Stacked merge decomposes each agent's work into its natural stack of small changesets (auto-checkpoints) and applies them individually — overlapping files are re-applied by the agent with full semantic understanding, not merged mechanically at the text level.
 
@@ -52,7 +52,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 **No atomic multi-file restore.** Individual files are atomically replaced (write to temp, fsync, rename). But the restore as a whole is not atomic across files. A crash mid-restore leaves /repo in a mixed state. Mitigation: re-trigger restore (idempotent — same inputs, same result). For promotion, the VM isn't serving traffic until build succeeds, so partial state during restore is never user-visible.
 
-**Flat manifests don't scale past ~500K files.** At 50K files (typical), manifest comparison is microseconds. At 500K files (large monorepo), it's milliseconds — still fine. If someone has millions of files in /repo, add Merkle trees then. No one will.
+**Flat manifests don't scale past ~500K files.** At ~5-10K source files (typical), manifest comparison is microseconds. At 500K files (large monorepo), it's milliseconds — still fine. If someone has millions of source files in /repo, add Merkle trees then. No one will.
 
 ---
 
@@ -126,23 +126,26 @@ The manifest is a flat map of every file in the checkpointed directory (default:
 
 ```json
 {
-  "src/main.rs":            { "hash": "blake3:2b4c...", "size": 2048, "mode": "0644" },
-  "src/lib.rs":             { "hash": "blake3:9e1d...", "size": 512,  "mode": "0644" },
-  "package.json":           { "hash": "blake3:7f3a...", "size": 1024, "mode": "0644" },
-  "node_modules/react/index.js": { "hash": "blake3:ab12...", "size": 4096, "mode": "0644" },
-  "scripts/deploy.sh":     { "hash": "blake3:cd34...", "size": 256,  "mode": "0755" },
-  "assets/logo.png":       { "hash": "blake3:ef56...", "size": 8192, "mode": "0644" }
+  "src/main.rs": { "hash": "blake3:2b4c...", "size": 2048, "mode": "0644" },
+  "src/lib.rs": { "hash": "blake3:9e1d...", "size": 512, "mode": "0644" },
+  "package.json": { "hash": "blake3:7f3a...", "size": 1024, "mode": "0644" },
+  "scripts/deploy.sh": {
+    "hash": "blake3:cd34...",
+    "size": 256,
+    "mode": "0755"
+  },
+  "assets/logo.png": { "hash": "blake3:ef56...", "size": 8192, "mode": "0644" }
 }
 ```
 
 **Per-entry fields:**
 
-| Field | Description |
-|-------|-------------|
+| Field    | Description                                                             |
+| -------- | ----------------------------------------------------------------------- |
 | **path** | Relative to checkpoint root (/repo). Forward slashes, no leading slash. |
-| **hash** | BLAKE3-128 of raw file content. 16 bytes, hex-encoded. |
-| **size** | File size in bytes. |
-| **mode** | Permission bits (0777 mask, octal string). |
+| **hash** | BLAKE3-128 of raw file content. 16 bytes, hex-encoded.                  |
+| **size** | File size in bytes.                                                     |
+| **mode** | Permission bits (0777 mask, octal string).                              |
 
 **What's NOT recorded:**
 
@@ -164,20 +167,21 @@ Same hash as Glide v2 block addressing. 128-bit truncation of BLAKE3.
 
 ### Why Flat (Not a Merkle Tree)
 
-A Merkle tree gives O(changes) diff by skipping shared subtrees. But /repo typically has 5K-50K files. Comparing two flat manifests by hash is microseconds. The Merkle tree adds tree objects, recursive hashing, tree deduplication, and tree-aware GC — real implementation complexity — for a performance improvement that doesn't matter at this scale.
+A Merkle tree gives O(changes) diff by skipping shared subtrees. But /repo typically has ~5-10K source files (after `.checkpointignore` excludes deps/build output). Comparing two flat manifests by hash is microseconds. The Merkle tree adds tree objects, recursive hashing, tree deduplication, and tree-aware GC — real implementation complexity — for a performance improvement that doesn't matter at this scale.
 
 If /repo grows to millions of files, add Merkle trees then. The manifest format can evolve without changing the agent protocol or the checkpoint model.
 
 ### Manifest Size
 
-| Repo size | Files | Manifest (uncompressed) | Manifest (LZ4) |
-|-----------|-------|-------------------------|-----------------|
-| Small (web app) | 500 | ~60KB | ~30KB |
-| Medium (monolith) | 5,000 | ~600KB | ~300KB |
-| Large (monorepo) | 50,000 | ~6MB | ~3MB |
-| Huge | 500,000 | ~60MB | ~30MB |
+| Repo size         | Files   | Manifest (uncompressed) | Manifest (LZ4) |
+| ----------------- | ------- | ----------------------- | -------------- |
+| Small (web app)   | 500     | ~60KB                   | ~30KB          |
+| Medium (monolith) | 5,000   | ~600KB                  | ~300KB         |
+| Large (monorepo)  | 50,000  | ~6MB                    | ~3MB           |
+| Typical app       | 5-10K   | ~1.2MB                  | ~600KB         |
+| Huge              | 500,000 | ~60MB                   | ~30MB          |
 
-Manifests are serialized as MessagePack + LZ4. Same serialization as the vsock protocol (`rmp-serde`) — zero additional dependencies. Faster to parse than JSON at 50K entries, and smaller on the wire. Nobody reads raw manifests out of S3 anyway (they're LZ4-compressed).
+Manifests are serialized as MessagePack + LZ4. Same serialization as the vsock protocol (`rmp-serde`) — zero additional dependencies. Faster to parse than JSON, and smaller on the wire. Nobody reads raw manifests out of S3 anyway (they're LZ4-compressed).
 
 Each checkpoint has one file in S3:
 
@@ -231,13 +235,13 @@ Sharded by first four hex characters of hash (256 x 256 = 65K prefix buckets) to
 
 **Deduplication:**
 
-Content-addressing means ten preview VMs of the same app share 100% of their blobs. Dependencies (node_modules) are identical across forks — stored once, referenced by every manifest. Only genuinely unique files (an agent's code edits) add storage.
+Content-addressing means ten preview VMs of the same app share 100% of their source blobs. Only genuinely unique files (an agent's code edits) add storage. Dependencies (`node_modules`, build output) are handled by the block layer — GlideFS deduplicates them across forks at the block level.
 
-| Scenario | Unique blobs | S3 storage |
-|----------|-------------|------------|
-| Single app, 5K files, 200MB total | 5,000 | ~120MB (LZ4) |
-| Same app, 100 checkpoints, ~10% file churn | ~5K base + ~50K deltas | ~150MB total |
-| 10 preview VMs forked from same production | ~0 additional | ~0 additional |
+| Scenario                                   | Unique blobs          | S3 storage    |
+| ------------------------------------------ | --------------------- | ------------- |
+| Single app, ~5K source files, ~50MB total  | ~5,000                | ~30MB (LZ4)   |
+| Same app, 100 checkpoints, ~10% file churn | ~5K base + ~5K deltas | ~35MB total   |
+| 10 preview VMs forked from same production | ~0 additional         | ~0 additional |
 
 ### Blob GC
 
@@ -247,11 +251,11 @@ Same event-driven refcount pattern as Glide v2 pack GC — O(1) per lifecycle ev
 
 - **Checkpoint write:** increment refcount for new blob hashes.
 - **Manifest delete (retention compaction):** decrement refcount for hashes unique to the deleted manifest.
-- **Refcount → 0:** enqueue blob for deletion after 15-minute grace period.
+- **Refcount → 0:** enqueue blob for deletion after 24-hour grace period.
 
 **Safety net: monthly mark-and-sweep reconciliation.** Walk all live checkpoint manifests, compare against blob refcounts in DB, correct any drift. Same pattern as Glide v2.
 
-The grace period (15 minutes, shorter than Glide v2's 24 hours) protects against races: a checkpoint in progress has uploaded blobs but hasn't written its manifest yet. A checkpoint takes <500ms end-to-end. 15 minutes covers network partitions, retries, and slow S3 uploads with margin to spare.
+The 24-hour grace period (matching Glide v2) protects against races: a checkpoint in progress has uploaded blobs but hasn't written its manifest yet. Grace periods are sized for the unhappy path — interrupted uploads, retried checkpoints, crash recovery, network partitions. A checkpoint takes <500ms end-to-end in the happy case, but 24 hours covers everything that can go wrong with margin to spare.
 
 ---
 
@@ -261,13 +265,13 @@ Communication between glidefs (host) and glidefs-agent (guest) over virtio-vsock
 
 ### Connection
 
-| Property | Value |
-|----------|-------|
-| **Transport** | AF_VSOCK, SOCK_STREAM |
-| **Guest CID** | Assigned by Firecracker at VM creation (known to glidefs) |
-| **Agent port** | 10842 (fixed) |
-| **Direction** | Host-initiated (glidefs connects to agent) |
-| **Reconnect** | glidefs retries on connection failure (agent may not be started yet) |
+| Property       | Value                                                                |
+| -------------- | -------------------------------------------------------------------- |
+| **Transport**  | AF_VSOCK, SOCK_STREAM                                                |
+| **Guest CID**  | Assigned by Firecracker at VM creation (known to glidefs)            |
+| **Agent port** | 10842 (fixed)                                                        |
+| **Direction**  | Host-initiated (glidefs connects to agent)                           |
+| **Reconnect**  | glidefs retries on connection failure (agent may not be started yet) |
 
 ### Framing
 
@@ -286,27 +290,27 @@ MessagePack for the payload — compact binary, fast to encode/decode, libraries
 
 **Host → Agent:**
 
-| Type | Name | Payload | Description |
-|------|------|---------|-------------|
-| 0x01 | CHECKPOINT | `{ parent_manifest_hash }` | Request file manifest + new blobs |
-| 0x02 | WRITE_FILES | stream of `(path, mode, content)` | Write files to /repo |
-| 0x03 | DELETE_FILES | `{ paths: [string] }` | Delete files from /repo |
-| 0x04 | READ_FILES | `{ paths: [string] }` | Read specific file contents |
-| 0x05 | PING | `{}` | Health check |
+| Type | Name         | Payload                           | Description                       |
+| ---- | ------------ | --------------------------------- | --------------------------------- |
+| 0x01 | CHECKPOINT   | `{ parent_manifest_hash }`        | Request file manifest + new blobs |
+| 0x02 | WRITE_FILES  | stream of `(path, mode, content)` | Write files to /repo              |
+| 0x03 | DELETE_FILES | `{ paths: [string] }`             | Delete files from /repo           |
+| 0x04 | READ_FILES   | `{ paths: [string] }`             | Read specific file contents       |
+| 0x05 | PING         | `{}`                              | Health check                      |
 
 **Agent → Host:**
 
-| Type | Name | Payload | Description |
-|------|------|---------|-------------|
-| 0x81 | MANIFEST_ENTRY | `(path, hash, size, mode)` | One file entry (streamed) |
-| 0x82 | BLOB | `(hash, content)` | File content for a new blob |
-| 0x83 | CHECKPOINT_DONE | `{ total_files, new_blobs, elapsed_ms }` | End of checkpoint stream |
-| 0x84 | WRITE_DONE | `{ written, errors: [(path, error)] }` | Write result |
-| 0x85 | DELETE_DONE | `{ deleted, errors: [(path, error)] }` | Delete result |
-| 0x86 | FILE_CONTENT | `(path, content)` | Requested file content |
-| 0x87 | FILE_CHANGED | `{ }` | Notification: something changed in /repo |
-| 0x88 | PONG | `{ uptime_ms }` | Health response |
-| 0xFF | ERROR | `{ code, message }` | Error response |
+| Type | Name            | Payload                                  | Description                              |
+| ---- | --------------- | ---------------------------------------- | ---------------------------------------- |
+| 0x81 | MANIFEST_ENTRY  | `(path, hash, size, mode)`               | One file entry (streamed)                |
+| 0x82 | BLOB            | `(hash, content)`                        | File content for a new blob              |
+| 0x83 | CHECKPOINT_DONE | `{ total_files, new_blobs, elapsed_ms }` | End of checkpoint stream                 |
+| 0x84 | WRITE_DONE      | `{ written, errors: [(path, error)] }`   | Write result                             |
+| 0x85 | DELETE_DONE     | `{ deleted, errors: [(path, error)] }`   | Delete result                            |
+| 0x86 | FILE_CONTENT    | `(path, content)`                        | Requested file content                   |
+| 0x87 | FILE_CHANGED    | `{ }`                                    | Notification: something changed in /repo |
+| 0x88 | PONG            | `{ uptime_ms }`                          | Health response                          |
+| 0xFF | ERROR           | `{ code, message }`                      | Error response                           |
 
 ### Checkpoint Protocol Flow
 
@@ -317,7 +321,7 @@ glidefs (host)                          glidefs-agent (guest)
      ├──────────────────────────────────────►│
      │                                       │
      │                                       │ 1. Load mtime index
-     │                                       │ 2. Walk /repo (skip .checkpointignore)
+     │                                       │ 2. Walk /repo (skip .gitignore + .checkpointignore)
      │                                       │ 3. For each file:
      │                                       │    stat() → compare to mtime index
      │                                       │    unchanged? reuse cached hash
@@ -340,7 +344,7 @@ glidefs (host)                          glidefs-agent (guest)
      │                                       │
 ```
 
-The agent sends the **full manifest** (all files, not just changes) so the host has a self-contained snapshot. But it only sends **blob content for new hashes** — files whose hash differs from the parent manifest. For a typical checkpoint with ~100 changed files out of 50K, this means 50K small manifest entries (~7.5MB over vsock at >1 GB/s = ~7ms) plus ~100 blob payloads (~1MB).
+The agent sends the **full manifest** (all source files, not just changes) so the host has a self-contained snapshot. But it only sends **blob content for new hashes** — files whose hash differs from the parent manifest. For a typical checkpoint with ~100 changed files out of ~5-10K source files, this means ~5-10K small manifest entries (~1MB over vsock at >1 GB/s = ~1ms) plus ~100 blob payloads (~1MB).
 
 ### Restore Protocol Flow
 
@@ -413,7 +417,7 @@ Between checkpoints, fanotify `FAN_CLOSE_WRITE` events accumulate a dirty set of
 
 Used on first checkpoint or after agent restart (dirty set lost):
 
-1. Walk /repo (respecting .checkpointignore)
+1. Walk /repo (respecting .gitignore + .checkpointignore)
 2. For each file, `stat()` to get (mtime, size, inode)
 3. If all three match index entry → reuse cached hash (no read, no hash)
 4. If any differ or entry missing → read file, hash it, update index entry
@@ -430,7 +434,7 @@ The three-field comparison (mtime + size + inode) is the same approach git uses 
 
 ## File Filtering
 
-Three filters control what gets stored, what gets shown, and what gets merged. Each serves a different purpose.
+File-level checkpoints store what git tracks. The boundary between the two layers is `.gitignore` — which every repo already has, every developer already understands, and which already excludes exactly the right things (deps, build output, caches).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -438,56 +442,50 @@ Three filters control what gets stored, what gets shown, and what gets merged. E
 │                                                                      │
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │  Checkpointed (stored in manifest + blob store)               │  │
-│  │  = everything NOT matched by .checkpointignore                │  │
+│  │  = what git would track                                       │  │
+│  │  = NOT matched by .gitignore, .checkpointignore, or hardcoded │  │
 │  │                                                               │  │
-│  │  ┌───────────────────────────────────────────────────────┐    │  │
-│  │  │  Source files (shown in diffs, merged file-by-file)   │    │  │
-│  │  │  = checkpointed files NOT matched by .gitignore       │    │  │
-│  │  │                                                       │    │  │
-│  │  │  src/main.rs, package.json, Makefile, etc.            │    │  │
-│  │  └───────────────────────────────────────────────────────┘    │  │
-│  │                                                               │  │
-│  │  Generated files (stored but hidden from diffs/merge)         │  │
-│  │  = checkpointed files matched by .gitignore                   │  │
-│  │                                                               │  │
-│  │  node_modules/, dist/, .next/, build/, vendor/                │  │
+│  │  src/main.rs, package.json, Makefile, etc.                    │  │
 │  └───────────────────────────────────────────────────────────────┘  │
 │                                                                      │
-│  Excluded (not stored at all)                                        │
-│  = matched by .checkpointignore or hardcoded                         │
+│  Block layer only (not in file-level checkpoints)                    │
+│  = matched by .gitignore                                             │
 │                                                                      │
-│  *.log, .env.local, .git/, *.sock, *.pid                            │
+│  node_modules/, dist/, .next/, build/, vendor/, target/              │
+│                                                                      │
+│  Additional exclusions (.checkpointignore)                           │
+│  .env.local, *.log, __pycache__/, .idea/, coverage/                  │
+│                                                                      │
+│  Hardcoded exclusions (never stored)                                 │
+│  .git/, *.sock, *.pid                                                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-| Filter | Controls | Purpose | Who reads it |
-|--------|----------|---------|--------------|
-| **Hardcoded** | Storage | Always excluded, can't override. `.git/`, `*.sock`, `*.pid`. | Agent |
-| **`.checkpointignore`** | Storage | Excluded from checkpoints entirely. Truly useless files — logs, secrets, machine-specific caches. | Agent |
-| **`.gitignore`** | Display + merge | Already exists in every repo. Defines "source" vs "generated." Generated files are checkpointed (for dedup and warm restores) but hidden from diffs and skipped during merge. Rebuilt by `setup_command` + `build_command`. | Control plane |
+| Filter                  | Controls | Purpose                                                                                                                                                    | Who reads it |
+| ----------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| **`.gitignore`**        | Storage  | Primary filter. Already excludes deps, build output, caches. Already exists in every repo. The file-level checkpoint stores what git tracks.               | Agent        |
+| **`.checkpointignore`** | Storage  | Additive exclusions on top of `.gitignore`. Secrets, logs, IDE state, machine-specific caches — things that might be in git but shouldn't be checkpointed. | Agent        |
+| **Hardcoded**           | Storage  | Always excluded, can't override. `.git/`, `*.sock`, `*.pid`.                                                                                               | Agent        |
 
-### Why three filters?
+### Why `.gitignore` is the right boundary
 
-**`.checkpointignore` exists because `.gitignore` is wrong for storage.** `.gitignore` excludes `node_modules/` and `dist/` — but those are the most valuable things to checkpoint. Dependencies are the biggest dedup win (100 preview VMs sharing one copy of `node_modules`). Build caches make restores fast. Excluding them from storage would defeat the purpose.
+`.gitignore` already defines "source files vs everything else" in every repo. `node_modules/`, `dist/`, `.next/`, `build/`, `vendor/`, `target/` — all excluded by `.gitignore`. The block layer (GlideFS) handles these at the block level, deduplicating them across forks. Duplicating that at the file level stores the same information twice for zero benefit.
 
-**`.gitignore` exists because showing 4,000 dependency file changes in a diff is useless.** When a human reviews what an agent did, they want to see source code changes — not that `node_modules/react/cjs/react.development.js` has a different timestamp. `.gitignore` already defines this boundary in every repo. We just reuse it.
+Since file-level checkpoints contain only what git tracks, every checkpointed file is meaningful. No display filtering needed — diffs and merges operate on everything in the manifest.
 
 **`.gitignore` edge cases:**
 
-- **No `.gitignore` present:** Treat all checkpointed files as source files. Diffs and merges operate on everything. This is safe — it's just noisier. The common case (most repos have a `.gitignore`) optimizes for signal.
-- **Nested `.gitignore` files:** Full gitignore semantics apply — a `.gitignore` in a subdirectory scopes to that subtree, child rules override parent rules, negation (`!`) works. This is hairy to implement correctly from scratch. Use the `ignore` crate (from ripgrep) on the Rust side — it handles the full spec including nested files, negation, and directory-only patterns. Don't hand-roll this.
-- **`.gitignore` changes between checkpoints:** Use the `.gitignore` from the target checkpoint (for diffs) or production (for merges). A file that was generated in the base and is now source (removed from `.gitignore`) gets included in the merge as a new source file.
-
-**Hardcoded exclusions exist because some things are never useful.** `.git/` internals, Unix sockets, PID files. Not configurable because there's no reason to checkpoint them.
+- **No `.gitignore` present:** Checkpoint everything (minus hardcoded and `.checkpointignore`). Safe — just more files. The common case (most repos have a `.gitignore`) is well-scoped.
+- **Nested `.gitignore` files:** Full gitignore semantics. Use the `ignore` crate (from ripgrep) — it handles nested files, negation, directory-only patterns. Don't hand-roll this.
 
 ### .checkpointignore
 
-Gitignore-compatible file at `/repo/.checkpointignore`. Same glob syntax, same semantics (negation with `!`, directory matching with trailing `/`).
+Additive exclusions on top of `.gitignore`. Gitignore-compatible syntax. For things that git tracks but shouldn't be in file-level checkpoints.
 
 ```
 # .checkpointignore
 
-# Secrets
+# Secrets (may not be in .gitignore)
 .env.local
 .env*.local
 
@@ -505,18 +503,15 @@ Thumbs.db
 *.swp
 *.swo
 
-# Language caches (machine-specific, not useful across VMs)
+# Language caches
 __pycache__/
 *.pyc
 .pytest_cache/
-node_modules/.cache/
 .turbo/
 coverage/
 ```
 
 If `.checkpointignore` doesn't exist, the agent generates a default one on first checkpoint with the patterns above. If it exists, it's the source of truth — the agent doesn't add defaults.
-
-**What's NOT in .checkpointignore:** `node_modules/`, `dist/`, `.next/`, `build/`, `vendor/`, `target/`. Those are generated but valuable — stored for dedup and warm restores, filtered out of diffs and merges by `.gitignore`.
 
 ---
 
@@ -550,17 +545,17 @@ sequenceDiagram
     Note over CP: Record in checkpoint DAG:<br/>{ id, parent_id, box_id, snapshot_id, label, timestamp }
 ```
 
-**Timing for a typical checkpoint (50K files, 100 changed):**
+**Timing for a typical checkpoint (~5-10K source files, 100 changed):**
 
-| Step | Fast path (dirty set) | Fallback (full walk) |
-|------|-----------------------|----------------------|
-| Glide v2 snapshot | <1ms | <1ms |
-| Agent identifies changed files | <1ms (dirty set) | 50-200ms (stat walk 50K files) |
-| Agent hash changed files (100 files, ~1MB) | 5-20ms | 5-20ms |
-| Agent walk for full manifest (paths only) | 20-50ms | (already done) |
-| vsock transfer (full manifest + new blobs) | 10-50ms | 10-50ms |
-| S3 uploads (manifest + ~100 blobs, parallel) | 50-200ms | 50-200ms |
-| **Total** | **~90-320ms** | **~120-470ms** |
+| Step                                         | Fast path (dirty set) | Fallback (full walk)             |
+| -------------------------------------------- | --------------------- | -------------------------------- |
+| Glide v2 snapshot                            | <1ms                  | <1ms                             |
+| Agent identifies changed files               | <1ms (dirty set)      | 10-50ms (stat walk source files) |
+| Agent hash changed files (100 files, ~1MB)   | 5-20ms                | 5-20ms                           |
+| Agent walk for full manifest (paths only)    | 20-50ms               | (already done)                   |
+| vsock transfer (full manifest + new blobs)   | 10-50ms               | 10-50ms                          |
+| S3 uploads (manifest + ~100 blobs, parallel) | 50-200ms              | 50-200ms                         |
+| **Total**                                    | **~90-320ms**         | **~120-470ms**                   |
 
 The Glide v2 snapshot is the save point. Everything after is metadata enrichment that happens in the background — the agent (or developer) never waits. If the host dies between the snapshot and the manifest upload, the block-level snapshot exists and the file manifest can be rebuilt by triggering a full checkpoint on the recovered VM.
 
@@ -572,17 +567,15 @@ Comparing two checkpoints at the file level. Computed by the control plane.
 
 ### Algorithm
 
-Diffs only show source files by default (see File Filtering). Generated files are counted but not diffed.
+Manifests contain only source files (see File Filtering), so diffs are clean by default — no filtering needed.
 
 1. Fetch manifest A and manifest B from S3
-2. Read `.gitignore` — classify each path as **source** or **generated**
-3. For source files in the union of both manifests:
+2. For each path in the union of both manifests:
    - Present in A only → deleted
    - Present in B only → added
    - Present in both, same hash → unchanged (skip)
    - Present in both, different hash → modified
-5. For modified source files: fetch both blob versions from S3, generate unified diff
-6. For generated files: count changes but don't fetch content or generate diffs
+3. For modified files: fetch both blob versions from S3, generate unified diff
 
 ### Output
 
@@ -602,27 +595,28 @@ Diffs only show source files by default (see File Filtering). Generated files ar
       "diff": "@@ -10,3 +10,5 @@\n fn main() {\n-    println!(\"hello\");\n+    println!(\"hello world\");\n+    run_server();\n }"
     }
   ],
-  "filtered": {
-    "paths_changed": 4247,
-    "top_dirs": { "node_modules/": 4200, "dist/": 42, ".next/cache/": 5 }
-  },
-  "stats": { "added": 1, "deleted": 1, "modified": 1, "unchanged": 4997, "filtered": 4247 }
+  "stats": {
+    "added": 1,
+    "deleted": 1,
+    "modified": 1,
+    "unchanged": 4997
+  }
 }
 ```
 
-The `filtered` summary tells the reviewer "4,247 dependency/build files also changed" without showing the noise. If someone needs the full unfiltered diff (debugging a weird `node_modules` issue), pass `?exclude=` with an empty value.
+Every file in the diff is meaningful — no filtering layer needed because `.checkpointignore` already excluded deps and build output at checkpoint time.
 
 ### Performance
 
-| Step | Latency |
-|------|---------|
-| Fetch 2 manifests from S3 | 20-50ms |
-| Compare manifests (50K entries) | <1ms |
-| Fetch blob pairs for modified source files (100 files, parallel) | 50-200ms |
-| Generate unified diffs | 10-50ms |
-| **Total** | **~100-300ms** |
+| Step                                                             | Latency        |
+| ---------------------------------------------------------------- | -------------- |
+| Fetch 2 manifests from S3                                        | 20-50ms        |
+| Compare manifests (~5-10K source files)                          | <1ms           |
+| Fetch blob pairs for modified source files (100 files, parallel) | 50-200ms       |
+| Generate unified diffs                                           | 10-50ms        |
+| **Total**                                                        | **~100-300ms** |
 
-The diff engine skips fetching blob content for generated files entirely. The expensive part (blob fetch + diff generation) only runs on source files that actually changed.
+The expensive part (blob fetch + diff generation) only runs on files that actually changed. Since manifests contain only source files, there's no wasted work.
 
 **Binary file detection:** If a blob contains null bytes in the first 8KB, treat as binary. Show "Binary file changed (8192 → 8448 bytes)" instead of a unified diff.
 
@@ -685,7 +679,7 @@ Single manifest comparison — O(F), cached by the control plane.
 
 ### Merge Algorithm
 
-For each changeset Δ_i in order, for each **source file** (not matched by `.gitignore`) in Δ_i:
+For each changeset Δ_i in order, for each file in Δ_i:
 
 ```
 File in Δ_i?   File in production_delta?   Action
@@ -703,13 +697,9 @@ The question per file is: **did production also change this file since the fork?
 
 **Write plan construction:** Process the stack from last to first. For each file, keep the latest version. If a file appears in multiple changesets (e.g., `src/main.rs` in Δ3 and Δ4) and doesn't overlap with production, use the final checkpoint's version directly — no need to replay intermediate states. Only overlapping files need changeset-level granularity.
 
-Generated files (matched by `.gitignore`) are skipped entirely — left on the production fork as-is, regenerated by the build.
-
 ### Merge Scope: Source Files Only
 
-Like diffs, merges only operate on source files (see File Filtering). Generated files (`node_modules/`, `dist/`, etc.) are left as-is from the production fork and regenerated by `setup_command` + `build_command` after the merge.
-
-This matters because merging generated files file-by-file is wrong. Two agents both running `npm install` produce subtly different `node_modules/` trees (non-deterministic file ordering, timestamps, platform-specific binaries). Merging 40,000 node_modules files produces thousands of spurious "conflicts" that are meaningless. Merging source files and rebuilding everything else avoids this entirely.
+Merges only operate on source files — which is everything in the manifest, since `.checkpointignore` already excluded deps and build output at checkpoint time. Dependencies and build artifacts live on the production fork's block device (COW clone), untouched by the merge. After the write plan applies source changes, `setup_command` + `build_command` regenerate everything else.
 
 ### Agent Re-Apply
 
@@ -721,18 +711,18 @@ When a changeset overlaps with production (same file modified by both sides), th
 2. The changeset diff (what the agent changed — typically a few lines)
 3. The surrounding codebase context
 
-**Why this works:** The changeset is tiny — 1-3 files from a ~5-second window. Re-applying a small, specific change is trivial for an AI agent. The agent understands *what it was trying to do* and applies it to whatever the file looks like now. If production refactored the function the agent was editing, the agent applies its change to the refactored version correctly — something line-level merge algorithms cannot do.
+**Why this works:** The changeset is tiny — 1-3 files from a ~5-second window. Re-applying a small, specific change is trivial for an AI agent. The agent understands _what it was trying to do_ and applies it to whatever the file looks like now. If production refactored the function the agent was editing, the agent applies its change to the refactored version correctly — something line-level merge algorithms cannot do.
 
 **Why it's better than diff3:**
 
-| | diff3 (git-style) | Agent re-apply |
-|---|---|---|
-| **Granularity** | Line-level text matching | Semantic understanding |
-| **Handles refactors** | Conflict (lines moved) | Clean (intent preserved) |
-| **Structured files** | False conflicts (JSON, YAML) | Correct merge (understands structure) |
-| **Result quality** | Syntactically merged, possibly semantically wrong | Semantically correct (agent verifies) |
-| **Speed** | Milliseconds | Seconds |
-| **Requires agent** | No | Yes |
+|                       | diff3 (git-style)                                 | Agent re-apply                        |
+| --------------------- | ------------------------------------------------- | ------------------------------------- |
+| **Granularity**       | Line-level text matching                          | Semantic understanding                |
+| **Handles refactors** | Conflict (lines moved)                            | Clean (intent preserved)              |
+| **Structured files**  | False conflicts (JSON, YAML)                      | Correct merge (understands structure) |
+| **Result quality**    | Syntactically merged, possibly semantically wrong | Semantically correct (agent verifies) |
+| **Speed**             | Milliseconds                                      | Seconds                               |
+| **Requires agent**    | No                                                | Yes                                   |
 
 **Fallback (no agent available):** If a human developer is promoting manually and there are overlapping files, show a unified diff for manual resolution. This is the traditional workflow — less common on a platform built for AI agents.
 
@@ -799,7 +789,7 @@ sequenceDiagram
 
 **The common path (no overlapping files) requires zero agent involvement.** The control plane computes the write plan from manifests and precomputed changesets alone. Only when the same file was modified by both the agent and a concurrent promotion does the agent get involved — and even then, it's re-applying a tiny changeset, not merging hours of work.
 
-**The key split:** The control plane decides *what* to write (changeset classification + write plan). glidefs decides *how* to write it (fetch from S3, stream to agent via vsock). glidefs receives a write plan — a list of `(path, blob_hash)` pairs — and doesn't know or care that it came from a merge. It's just "put these blobs at these paths."
+**The key split:** The control plane decides _what_ to write (changeset classification + write plan). glidefs decides _how_ to write it (fetch from S3, stream to agent via vsock). glidefs receives a write plan — a list of `(path, blob_hash)` pairs — and doesn't know or care that it came from a merge. It's just "put these blobs at these paths."
 
 **Why the build step matters:** The merge only touches source files. Dependencies and build output are left from the production fork. `setup_command` (`npm install`) sees the merged `package.json` and installs any new dependencies. `build_command` compiles from the merged source. This is the same build pipeline as any promotion — the merge just changes which source files land before the build runs.
 
@@ -873,13 +863,13 @@ This is the default behavior — the manifest only covers /repo, so restore natu
 
 Both options exist and serve different purposes:
 
-| | File-level restore (this doc) | Block-level restore (Glide v2) |
-|---|---|---|
-| **Scope** | /repo only | Entire block device |
-| **Use case** | Promotion, selective rollback | Full VM rollback to exact state |
-| **OS/runtime** | Untouched (from production fork) | Restored to snapshot state |
-| **Speed** | Proportional to changed files | Instant (swap block map) |
-| **Merge possible** | Yes (stacked merge) | No (whole-disk replacement) |
+|                    | File-level restore (this doc)    | Block-level restore (Glide v2)  |
+| ------------------ | -------------------------------- | ------------------------------- |
+| **Scope**          | /repo only                       | Entire block device             |
+| **Use case**       | Promotion, selective rollback    | Full VM rollback to exact state |
+| **OS/runtime**     | Untouched (from production fork) | Restored to snapshot state      |
+| **Speed**          | Proportional to changed files    | Instant (swap block map)        |
+| **Merge possible** | Yes (stacked merge)              | No (whole-disk replacement)     |
 
 ---
 
@@ -891,7 +881,7 @@ Both options exist and serve different purposes:
 1. Set up fanotify on /repo filesystem
    Single mark: FAN_CLOSE_WRITE | FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO
    FAN_UNLIMITED_QUEUE — never overflows (requires CAP_SYS_ADMIN, agent has it)
-   Filter events to /repo prefix in userspace, respect .checkpointignore
+   Filter events to /repo prefix in userspace, respect .gitignore + .checkpointignore
 
 2. On any event:
    Buffer for 500ms (coalesce rapid edits)
@@ -922,15 +912,15 @@ At 60 checkpoints/hour, an active AI agent produces 400+ checkpoints in a workda
 
 **Default policy (per export):**
 
-| Age | Retention |
-|-----|-----------|
-| Last 1 hour | Keep all (full resolution) |
-| 1-24 hours | Keep 1 per 10 minutes (compact) |
-| 1-7 days | Keep 1 per hour |
-| 7+ days | Keep 1 per day |
-| Labeled (user-created) | Keep forever (until explicitly deleted) |
-| Full chain for active preview VMs | Keep all (needed for stacked merge at promotion) |
-| Source ancestors of live VMs | Keep forever (needed for production_delta at merge) |
+| Age                               | Retention                                           |
+| --------------------------------- | --------------------------------------------------- |
+| Last 1 hour                       | Keep all (full resolution)                          |
+| 1-24 hours                        | Keep 1 per 10 minutes (compact)                     |
+| 1-7 days                          | Keep 1 per hour                                     |
+| 7+ days                           | Keep 1 per day                                      |
+| Labeled (user-created)            | Keep forever (until explicitly deleted)             |
+| Full chain for active preview VMs | Keep all (needed for stacked merge at promotion)    |
+| Source ancestors of live VMs      | Keep forever (needed for production_delta at merge) |
 
 **Compaction:** The control plane runs compaction periodically (every hour). It deletes auto-checkpoints that exceed the density for their age bracket. The checkpoint's manifest is deleted from S3. Orphaned blobs (referenced only by deleted manifests) are cleaned by blob GC on the next sweep.
 
@@ -1014,11 +1004,11 @@ Manifests are stored in S3 with SSE-KMS using the tenant's key (same encryption 
 
 New endpoints on glidefs alongside the existing Glide v2 block-level API. These are execution-level — glidefs does what it's told.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/exports/{name}/checkpoint` | Glide v2 snapshot + file manifest + blob upload |
-| POST | `/api/exports/{name}/write-files` | Execute a write plan: fetch blobs from S3, stream to agent |
-| PUT | `/api/exports/{name}` | Export config (checkpoint root, auto-checkpoint flag) |
+| Method | Path                              | Description                                                |
+| ------ | --------------------------------- | ---------------------------------------------------------- |
+| POST   | `/api/exports/{name}/checkpoint`  | Glide v2 snapshot + file manifest + blob upload            |
+| POST   | `/api/exports/{name}/write-files` | Execute a write plan: fetch blobs from S3, stream to agent |
+| PUT    | `/api/exports/{name}`             | Export config (checkpoint root, auto-checkpoint flag)      |
 
 ```
 POST /api/exports/{name}/checkpoint
@@ -1060,13 +1050,13 @@ POST /api/exports/{name}/write-files
 
 Intelligence-level operations that live on the control plane, not glidefs.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/checkpoints/{id}` | Checkpoint metadata + manifest |
-| GET | `/api/checkpoints/{a}/diff/{b}` | File-level diff between two checkpoints |
-| POST | `/api/exports/{name}/restore` | Compute restore plan, send to glidefs for execution |
-| POST | `/api/exports/{name}/promote` | Fork + stacked merge + write plan + build |
-| POST | `/api/merge` | Dry-run stacked merge (result without applying) |
+| Method | Path                            | Description                                         |
+| ------ | ------------------------------- | --------------------------------------------------- |
+| GET    | `/api/checkpoints/{id}`         | Checkpoint metadata + manifest                      |
+| GET    | `/api/checkpoints/{a}/diff/{b}` | File-level diff between two checkpoints             |
+| POST   | `/api/exports/{name}/restore`   | Compute restore plan, send to glidefs for execution |
+| POST   | `/api/exports/{name}/promote`   | Fork + stacked merge + write plan + build           |
+| POST   | `/api/merge`                    | Dry-run stacked merge (result without applying)     |
 
 ```
 POST /api/merge
@@ -1140,14 +1130,14 @@ It reads files, hashes files, writes files, and reports changes. The host tells 
 
 ### Implementation
 
-| Property | Value |
-|----------|-------|
-| **Language** | Rust (shared types with glidefs for manifest/protocol) |
-| **Binary size** | ~2-5MB static |
+| Property          | Value                                                                                                                                                     |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Language**      | Rust (shared types with glidefs for manifest/protocol)                                                                                                    |
+| **Binary size**   | ~2-5MB static                                                                                                                                             |
 | **Lines of code** | ~2000-3000 (gitignore-compatible glob parsing, fanotify filesystem watching, atomic writes with error propagation, mtime index with corruption detection) |
-| **Memory usage** | ~10-50MB (mtime index + vsock buffers) |
-| **CPU usage** | Negligible except during checkpoint (hashing) |
-| **Dependencies** | blake3, rmp-serde (MessagePack), vsock, ignore (gitignore-compatible glob matching for .checkpointignore) |
+| **Memory usage**  | ~10-50MB (mtime index + vsock buffers)                                                                                                                    |
+| **CPU usage**     | Negligible except during checkpoint (hashing)                                                                                                             |
+| **Dependencies**  | blake3, rmp-serde (MessagePack), vsock, ignore (gitignore-compatible glob matching for .checkpointignore)                                                 |
 
 ### File Ownership
 
@@ -1184,20 +1174,20 @@ On SIGTERM:
 
 ## Component Summary
 
-| Component | Location | Role |
-|-----------|----------|------|
-| **glidefs-agent** | Guest VM (~2000-3000 LOC) | File I/O — walk, hash, read, write. vsock client. fanotify watcher. |
-| **vsock server** | glidefs host daemon | Connects to agent, sends requests, receives manifests and blobs. |
-| **Checkpoint coordinator** | glidefs host daemon | Orchestrates: Glide v2 snapshot → agent manifest → blob upload → S3 store. |
-| **Write plan executor** | glidefs host daemon | Fetches blobs from S3 by hash, streams to agent via vsock. |
-| **Manifest store** | S3 | `checkpoints/{tenant}/{id}.manifest.lz4` — file-level manifests. |
-| **Blob store** | S3 | `blobs/{tenant}/{prefix}/{hash}` — file content, content-addressed. |
-| **Diff engine** | Control plane | Compares two manifests, fetches blobs, generates unified diffs. |
-| **Merge engine** | Control plane | Stacked changeset classification + write plan. Delegates overlapping files to agent re-apply. |
-| **Auto-checkpoint scheduler** | Control plane | Debounce + rate limit on FILE_CHANGED → tells glidefs to checkpoint. |
-| **Promotion orchestrator** | Control plane | Fork + merge + write plan + build + checkpoint. |
-| **Blob GC** | Control plane | Mark-and-sweep alongside Glide v2 tenant GC. |
-| **Checkpoint DAG** | Control plane database | Parent pointers, labels, timestamps, changesets, fork point queries. |
+| Component                     | Location                  | Role                                                                                          |
+| ----------------------------- | ------------------------- | --------------------------------------------------------------------------------------------- |
+| **glidefs-agent**             | Guest VM (~2000-3000 LOC) | File I/O — walk, hash, read, write. vsock client. fanotify watcher.                           |
+| **vsock server**              | glidefs host daemon       | Connects to agent, sends requests, receives manifests and blobs.                              |
+| **Checkpoint coordinator**    | glidefs host daemon       | Orchestrates: Glide v2 snapshot → agent manifest → blob upload → S3 store.                    |
+| **Write plan executor**       | glidefs host daemon       | Fetches blobs from S3 by hash, streams to agent via vsock.                                    |
+| **Manifest store**            | S3                        | `checkpoints/{tenant}/{id}.manifest.lz4` — file-level manifests.                              |
+| **Blob store**                | S3                        | `blobs/{tenant}/{prefix}/{hash}` — file content, content-addressed.                           |
+| **Diff engine**               | Control plane             | Compares two manifests, fetches blobs, generates unified diffs.                               |
+| **Merge engine**              | Control plane             | Stacked changeset classification + write plan. Delegates overlapping files to agent re-apply. |
+| **Auto-checkpoint scheduler** | Control plane             | Debounce + rate limit on FILE_CHANGED → tells glidefs to checkpoint.                          |
+| **Promotion orchestrator**    | Control plane             | Fork + merge + write plan + build + checkpoint.                                               |
+| **Blob GC**                   | Control plane             | Mark-and-sweep alongside Glide v2 tenant GC.                                                  |
+| **Checkpoint DAG**            | Control plane database    | Parent pointers, labels, timestamps, changesets, fork point queries.                          |
 
 ---
 
@@ -1206,7 +1196,7 @@ On SIGTERM:
 Systematic analysis of every operation. Variables:
 
 ```
-F = total_files (files in /repo, typical 5K-50K)
+F = total_source_files (source files in /repo after .checkpointignore, typical ~5-10K)
 C = changed_files (files changed since last checkpoint, typical ~100)
 M = manifest_entries (= F, one per file)
 B = blobs_to_upload (= C or less, after dedup)
@@ -1218,104 +1208,104 @@ N = checkpoints_in_DAG (per export)
 
 ### Hot Path (Checkpoint — Most Frequent Operation)
 
-| Operation | Time | Space | Bottleneck? | Notes |
-|-----------|------|-------|-------------|-------|
-| **Glide v2 snapshot** | O(1) | — | No | Atomic sequence number read |
-| **Identify changed files (fast path)** | O(C) | O(C) | No | Drain fanotify dirty set |
-| **Identify changed files (fallback)** | O(F) | O(F) | **Watch** | Full stat walk, mtime comparison |
-| **Hash changed files** | O(C × avg_file_size) | O(max_file_size) | No | BLAKE3, ~1GB/s |
-| **Build full manifest** | O(F) | O(F) | **Watch** | Must enumerate all paths for self-contained manifest |
-| **Determine new blobs** | O(C) | — | No | Compare hashes against parent manifest (HashMap lookup) |
-| **vsock transfer (manifest)** | O(F) | O(F) | No | ~50K entries at ~150 bytes = ~7.5MB, <10ms at >1GB/s |
-| **vsock transfer (blobs)** | O(B × avg_file_size) | O(max_file_size) | No | Streaming, ~100 files ≈ 1MB |
-| **S3 blob upload** | O(B) | — | No | Parallel PUTs, idempotent (content-addressed) |
-| **S3 manifest upload** | O(1) | — | No | Single object, ~3MB compressed |
-| **DB checkpoint record** | O(1) | — | No | One INSERT into checkpoint DAG |
+| Operation                              | Time                 | Space            | Bottleneck? | Notes                                                   |
+| -------------------------------------- | -------------------- | ---------------- | ----------- | ------------------------------------------------------- |
+| **Glide v2 snapshot**                  | O(1)                 | —                | No          | Atomic sequence number read                             |
+| **Identify changed files (fast path)** | O(C)                 | O(C)             | No          | Drain fanotify dirty set                                |
+| **Identify changed files (fallback)**  | O(F)                 | O(F)             | **Watch**   | Full stat walk, mtime comparison                        |
+| **Hash changed files**                 | O(C × avg_file_size) | O(max_file_size) | No          | BLAKE3, ~1GB/s                                          |
+| **Build full manifest**                | O(F)                 | O(F)             | **Watch**   | Must enumerate all paths for self-contained manifest    |
+| **Determine new blobs**                | O(C)                 | —                | No          | Compare hashes against parent manifest (HashMap lookup) |
+| **vsock transfer (manifest)**          | O(F)                 | O(F)             | No          | ~5-10K entries at ~150 bytes = ~1MB, <1ms at >1GB/s     |
+| **vsock transfer (blobs)**             | O(B × avg_file_size) | O(max_file_size) | No          | Streaming, ~100 files ≈ 1MB                             |
+| **S3 blob upload**                     | O(B)                 | —                | No          | Parallel PUTs, idempotent (content-addressed)           |
+| **S3 manifest upload**                 | O(1)                 | —                | No          | Single object, ~3MB compressed                          |
+| **DB checkpoint record**               | O(1)                 | —                | No          | One INSERT into checkpoint DAG                          |
 
-**Watch: full manifest build is O(F).** Even with the dirty set fast path (O(C) for identifying changes), the agent must still walk /repo to enumerate all paths for the self-contained manifest. This is O(F) — stat walk of 50K files takes 20-50ms. Not a bottleneck in absolute terms, but it's the one operation that scales with repo size rather than change size.
+**Path cache makes manifest build O(C).** The agent maintains an in-memory path list, updated incrementally by fanotify CREATE/DELETE events. On checkpoint, the agent starts from the cached list rather than walking /repo. Full stat walk only happens on cold start (agent restart or post-restore). This is not an optimization — it's the difference between the most frequent operation being O(C) and O(F).
 
-**Optimization opportunity:** Cache the full path list between checkpoints. On checkpoint, start with the cached list, add paths from fanotify CREATE events, remove paths from DELETE events. Only do a full walk on agent restart or after a restore. This would make manifest build O(C) instead of O(F) for the common case.
+Without the path cache, every checkpoint requires a full stat walk of /repo to enumerate all source file paths for the self-contained manifest. At ~5-10K source files that's fast, but unnecessary. The fanotify watcher is already running; feeding CREATE/DELETE events into a path set is trivial additional work that eliminates the walk entirely for the steady-state case.
 
 ### Diff (Control Plane)
 
-| Operation | Time | Space | Bottleneck? | Notes |
-|-----------|------|-------|-------------|-------|
-| **Fetch 2 manifests from S3** | O(1) | O(2F) | No | Two GETs, ~3MB each |
-| **Parse manifests** | O(F) | O(F) | No | MessagePack decode |
-| **Classify source vs generated** | O(F) | O(F) | No | Apply .gitignore patterns |
-| **Compute file-level diff** | O(F) | O(F) | No | Hash comparison across union of both manifests |
-| **Fetch blob pairs (modified source)** | O(C_source) | O(C_source × avg_size) | No | Parallel S3 GETs, only source files |
-| **Generate unified diffs** | O(C_source × file_size) | O(file_size) | No | Per-file, streaming |
+| Operation                              | Time                    | Space                  | Bottleneck? | Notes                                            |
+| -------------------------------------- | ----------------------- | ---------------------- | ----------- | ------------------------------------------------ |
+| **Fetch 2 manifests from S3**          | O(1)                    | O(2F)                  | No          | Two GETs, ~3MB each                              |
+| **Parse manifests**                    | O(F)                    | O(F)                   | No          | MessagePack decode                               |
+| ~~Classify source vs generated~~       | ~~O(F)~~                | ~~O(F)~~               | No          | Not needed — manifests contain only source files |
+| **Compute file-level diff**            | O(F)                    | O(F)                   | No          | Hash comparison across union of both manifests   |
+| **Fetch blob pairs (modified source)** | O(C_source)             | O(C_source × avg_size) | No          | Parallel S3 GETs, only source files              |
+| **Generate unified diffs**             | O(C_source × file_size) | O(file_size)           | No          | Per-file, streaming                              |
 
-**Verdict: O(F) for manifest comparison, O(C_source) for content diffing.** F is bounded at ~50K (typical repo). Entire diff completes in 100-300ms.
+**Verdict: O(F) for manifest comparison, O(C) for content diffing.** F is ~5-10K source files (typical app). Entire diff completes in 100-300ms.
 
 ### Stacked Merge (Control Plane)
 
-| Operation | Time | Space | Bottleneck? | Notes |
-|-----------|------|-------|-------------|-------|
-| **Fetch fork point + production manifests** | O(1) | O(2F) | No | Two S3 GETs |
-| **Compute production_delta** | O(F) | O(F) | No | Hash comparison, two manifests |
-| **Fetch changesets from DB** | O(K) | O(K × C_avg) | No | K = chain length, changesets precomputed and small |
-| **Classify files (clean vs overlap)** | O(Σ C_i) | O(F) | No | Check each changed file against production_delta |
-| **Agent re-apply (if overlap)** | O(overlap) | O(file_size) | No | Seconds per file, typically 0-2 files |
-| **Produce write plan** | O(R) | O(R) | No | Collect all unique file changes |
+| Operation                                   | Time       | Space        | Bottleneck? | Notes                                              |
+| ------------------------------------------- | ---------- | ------------ | ----------- | -------------------------------------------------- |
+| **Fetch fork point + production manifests** | O(1)       | O(2F)        | No          | Two S3 GETs                                        |
+| **Compute production_delta**                | O(F)       | O(F)         | No          | Hash comparison, two manifests                     |
+| **Fetch changesets from DB**                | O(K)       | O(K × C_avg) | No          | K = chain length, changesets precomputed and small |
+| **Classify files (clean vs overlap)**       | O(Σ C_i)   | O(F)         | No          | Check each changed file against production_delta   |
+| **Agent re-apply (if overlap)**             | O(overlap) | O(file_size) | No          | Seconds per file, typically 0-2 files              |
+| **Produce write plan**                      | O(R)       | O(R)         | No          | Collect all unique file changes                    |
 
 **Verdict: O(F) for production_delta, O(Σ C_i) for changeset classification.** No content-level merging. Agent re-apply is rare (requires same file modified by both sides) and operates on tiny changesets (a few lines from a ~5-second window). The common path — no overlapping files — is fully automated with zero agent involvement.
 
 ### Restore / Write Plan Execution
 
-| Operation | Time | Space | Bottleneck? | Notes |
-|-----------|------|-------|-------------|-------|
-| **Compute write plan** | O(F) | O(F) | No | Diff current manifest vs target |
-| **Fetch blobs from S3** | O(R) | O(R × avg_size) | No | Parallel GETs, only changed files |
-| **Stream to agent (vsock)** | O(R × avg_size) | O(max_file_size) | No | >1GB/s vsock throughput |
-| **Agent writes files** | O(R × avg_size) | O(max_file_size) | No | write → fsync → rename per file |
+| Operation                   | Time            | Space            | Bottleneck? | Notes                             |
+| --------------------------- | --------------- | ---------------- | ----------- | --------------------------------- |
+| **Compute write plan**      | O(F)            | O(F)             | No          | Diff current manifest vs target   |
+| **Fetch blobs from S3**     | O(R)            | O(R × avg_size)  | No          | Parallel GETs, only changed files |
+| **Stream to agent (vsock)** | O(R × avg_size) | O(max_file_size) | No          | >1GB/s vsock throughput           |
+| **Agent writes files**      | O(R × avg_size) | O(max_file_size) | No          | write → fsync → rename per file   |
 
 **Verdict: O(R) — proportional to files being restored.** For a promotion merge with 50 changed source files, this is <1 second.
 
 ### Blob Store & GC
 
-| Operation | Time | Space | Bottleneck? | Notes |
-|-----------|------|-------|-------------|-------|
-| **Blob PUT (checkpoint)** | O(1) per blob | O(file_size) | No | Content-addressed, idempotent |
-| **Blob GET (diff/restore)** | O(1) per blob | O(file_size) | No | Direct S3 GET by hash |
-| **Blob GC mark** | O(live_checkpoints × F) | O(unique_hashes) | **Watch** | Walk all live manifests |
-| **Blob GC sweep** | O(total_blobs) | — | **Watch** | LIST all blobs, check against live set |
+| Operation                   | Time                    | Space            | Bottleneck? | Notes                                  |
+| --------------------------- | ----------------------- | ---------------- | ----------- | -------------------------------------- |
+| **Blob PUT (checkpoint)**   | O(1) per blob           | O(file_size)     | No          | Content-addressed, idempotent          |
+| **Blob GET (diff/restore)** | O(1) per blob           | O(file_size)     | No          | Direct S3 GET by hash                  |
+| **Blob GC mark**            | O(live_checkpoints × F) | O(unique_hashes) | **Watch**   | Walk all live manifests                |
+| **Blob GC sweep**           | O(total_blobs)          | —                | **Watch**   | LIST all blobs, check against live set |
 
-**Watch: blob GC is O(live_checkpoints × F).** With retention compaction, live checkpoints per export are bounded (~84 after a week). At 1000 exports × 84 checkpoints × 50K files = 4.2B manifest entries to scan. This is the same pattern as Glide v2's reconciliation.
+**Watch: blob GC is O(live_checkpoints × F).** With retention compaction, live checkpoints per export are bounded (~84 after a week). At 1000 exports × 84 checkpoints × 10K source files = 840M manifest entries to scan. Event-driven refcounts avoid this entirely.
 
 **Fix: apply the same event-driven refcount pattern.** Track blob references in the control plane DB — increment on manifest write, decrement on manifest delete (retention compaction). Blob with refcount 0 + grace period → delete. Same O(1) per lifecycle event. Mark-and-sweep becomes a monthly safety net.
 
 ### Auto-Checkpoint Scheduling
 
-| Operation | Time | Space | Bottleneck? | Notes |
-|-----------|------|-------|-------------|-------|
-| **fanotify event** | O(1) | O(1) | No | Kernel delivers events, no polling |
-| **Dirty set insert** | O(1) | O(C) | No | HashSet insert per event |
-| **FILE_CHANGED notification** | O(1) | — | No | Content-free signal over vsock |
-| **Debounce timer** | O(1) | O(1) | No | Reset on each notification |
-| **Retention compaction** | O(N) | O(N) | No | Walk checkpoint DAG, delete expired. N bounded by rate limit. |
+| Operation                     | Time | Space | Bottleneck? | Notes                                                         |
+| ----------------------------- | ---- | ----- | ----------- | ------------------------------------------------------------- |
+| **fanotify event**            | O(1) | O(1)  | No          | Kernel delivers events, no polling                            |
+| **Dirty set insert**          | O(1) | O(C)  | No          | HashSet insert per event                                      |
+| **FILE_CHANGED notification** | O(1) | —     | No          | Content-free signal over vsock                                |
+| **Debounce timer**            | O(1) | O(1)  | No          | Reset on each notification                                    |
+| **Retention compaction**      | O(N) | O(N)  | No          | Walk checkpoint DAG, delete expired. N bounded by rate limit. |
 
 **Verdict: all O(1).** fanotify + dirty set + debounce = no polling, no scanning, no scaling concerns.
 
 ### Space Complexity
 
-| Structure | Size | Bounded by | Notes |
-|-----------|------|-----------|-------|
-| **Manifest (in memory)** | O(F) | Repo file count | ~150 bytes/entry. 50K files = ~7.5MB |
-| **mtime index (on disk)** | O(F) | Repo file count | ~60 bytes/entry. 50K files = ~3MB |
-| **Dirty set** | O(C) | Changed files between checkpoints | Drained on checkpoint |
-| **Checkpoint DAG** | O(N) per export | Rate limit (60/hr) + retention compaction | ~84 retained per export after a week |
-| **Blob store (S3)** | O(unique files) | Content-addressed dedup | Shared across forks, compacted with retention |
-| **Manifest store (S3)** | O(retained checkpoints × F) | Retention policy | ~250MB per export per week |
+| Structure                 | Size                        | Bounded by                                | Notes                                         |
+| ------------------------- | --------------------------- | ----------------------------------------- | --------------------------------------------- |
+| **Manifest (in memory)**  | O(F)                        | Source file count                         | ~150 bytes/entry. 10K files = ~1.5MB          |
+| **mtime index (on disk)** | O(F)                        | Source file count                         | ~60 bytes/entry. 10K files = ~600KB           |
+| **Dirty set**             | O(C)                        | Changed files between checkpoints         | Drained on checkpoint                         |
+| **Checkpoint DAG**        | O(N) per export             | Rate limit (60/hr) + retention compaction | ~84 retained per export after a week          |
+| **Blob store (S3)**       | O(unique files)             | Content-addressed dedup                   | Shared across forks, compacted with retention |
+| **Manifest store (S3)**   | O(retained checkpoints × F) | Retention policy                          | ~250MB per export per week                    |
 
 No unbounded structures. Everything is either bounded by configuration (rate limits, retention) or by the repo itself (file count, which the user controls).
 
 ### Summary
 
 ```
-Checkpoint (fast path): O(C) identify + O(F) enumerate + O(C) hash/upload
-Checkpoint (fallback):  O(F) stat walk + O(C) hash/upload
+Checkpoint (fast path): O(C) identify + O(C) enumerate (path cache) + O(C) hash/upload
+Checkpoint (cold start): O(F) stat walk + O(C) hash/upload
 Diff:                   O(F) manifest compare + O(C_source) content diff
 Merge:                  O(F) production delta + O(Σ C_i) classify + O(overlap) re-apply
 Restore:                O(R) proportional to changed files only
@@ -1323,7 +1313,7 @@ Auto-checkpoint:        O(1) per event (fanotify + debounce)
 Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
 ```
 
-**The dominant term is O(F) — repo file count.** This appears in manifest enumeration, diff, and merge. At 50K files, it's microseconds to milliseconds. At 500K files (large monorepo), it's milliseconds. The design explicitly defers Merkle trees until F > 500K, which is the right call — the constant factors matter more than the algorithmic complexity at these sizes.
+**The dominant term is O(F) — source file count.** This appears in diff, merge, and cold-start checkpoint. With the path cache, steady-state checkpoints are O(C) end-to-end. F is ~5-10K for a typical app (after `.checkpointignore` excludes deps and build output), so O(F) operations are microseconds. At 500K source files (large monorepo), it's milliseconds. The design explicitly defers Merkle trees until F > 500K, which is the right call — the constant factors matter more than the algorithmic complexity at these sizes.
 
 **Nothing scales with fleet size.** Checkpoint, diff, merge, and restore are all per-VM operations. Blob GC needs event-driven refcounts (same pattern as Glide v2 pack GC) to avoid scanning all manifests. The checkpoint DAG is per-export in the control plane DB, queried with indexed lookups.
 
@@ -1331,15 +1321,15 @@ Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
 
 ## What This Replaces
 
-| Traditional Tool | Replacement | Why It's Better |
-|-----------------|-------------|-----------------|
-| `git add` + `git commit` | Auto-checkpoint (invisible) | No ceremony. Agent doesn't need to understand git. Save points just happen. |
-| `git branch` | Fork VM (Glide v2) | A branch is a full running environment, not just a pointer to a commit. |
-| `git diff` | Checkpoint diff (control plane) | Same output, but diffing environments — includes deps, build output, everything in /repo. |
-| `git merge` | Stacked merge on promote | Decomposes work into small changesets (auto-checkpoints), applies file-by-file. Overlapping files resolved by AI agent re-applying intent — no line-level merge artifacts. |
-| `git push` + CI/CD pipeline | Promote checkpoint | No artifact upload, no CI runner, no separate deploy. The checkpoint IS the deployable. |
-| `git stash` | Checkpoint + restore | Named save points in the DAG, not a fragile stack. |
-| `git blame` | Checkpoint metadata | Who made each checkpoint (agent or human), when, with what label. |
+| Traditional Tool            | Replacement                     | Why It's Better                                                                                                                                                            |
+| --------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `git add` + `git commit`    | Auto-checkpoint (invisible)     | No ceremony. Agent doesn't need to understand git. Save points just happen.                                                                                                |
+| `git branch`                | Fork VM (Glide v2)              | A branch is a full running environment, not just a pointer to a commit.                                                                                                    |
+| `git diff`                  | Checkpoint diff (control plane) | Same output, but diffing environments — includes deps, build output, everything in /repo.                                                                                  |
+| `git merge`                 | Stacked merge on promote        | Decomposes work into small changesets (auto-checkpoints), applies file-by-file. Overlapping files resolved by AI agent re-applying intent — no line-level merge artifacts. |
+| `git push` + CI/CD pipeline | Promote checkpoint              | No artifact upload, no CI runner, no separate deploy. The checkpoint IS the deployable.                                                                                    |
+| `git stash`                 | Checkpoint + restore            | Named save points in the DAG, not a fragile stack.                                                                                                                         |
+| `git blame`                 | Checkpoint metadata             | Who made each checkpoint (agent or human), when, with what label.                                                                                                          |
 
 ---
 
@@ -1355,6 +1345,6 @@ Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
 
 5. **Agent re-apply latency budget** — When overlapping files require agent re-apply, how long do we wait? Seconds is fine for a few files. If an agent takes 30+ seconds, the promotion feels slow. Options: timeout with fallback to "take theirs" (lossy but fast), or let the caller set a deadline. Most promotions have zero overlapping files, so this is the uncommon path.
 
-6. **Checkpoint portability** — Can a checkpoint from a Node 18 base image be restored onto a Node 20 base image? The checkpoint only covers /repo, so yes — but `node_modules` may contain native binaries compiled for Node 18. The build step after restore handles this (`npm install` rebuilds native modules). Document: "Checkpoints are portable across base image versions. Rebuild may be required."
+6. **Checkpoint portability** — Can a checkpoint from a Node 18 base image be restored onto a Node 20 base image? The file-level checkpoint covers only source files, so yes — source is portable. Dependencies and build output live at the block layer and are rebuilt by `setup_command` + `build_command` after restore.
 
 7. **Concurrent checkpoints** — What if auto-checkpoint fires while a manual checkpoint is in progress? Serialize — only one checkpoint at a time per export. Second request waits or is deduplicated if the first one covers the same state.
